@@ -1,0 +1,68 @@
+{
+  "license": "GPL-3.0-or-later",
+  "type": "receiver_2110_mtl",
+  "label": "receiver_2110_mtl",
+  "needs_nic": true,
+  "badge": {
+    "label": "MTL",
+    "class": "mode-receiver"
+  },
+  "nmos_role": "receiver",
+  "deploy_order": 0,
+  "version": "0.1.0",
+  "description": "Receiver ST 2110 via Media Transport Library (MTL/DPDK, kernel-bypass). Réception st20p/st30p écrite en zéro-copie dans le ring shared memory par un binaire C natif (libmtl), exposé en NMOS IS-04/05. Variante haute performance de receiver_2110 (mêmes shm produits). Mode simulation par slot tant que la source n'est pas activée.",
+  "nav": {
+    "section": "sources",
+    "label": "Sources",
+    "order": 11
+  },
+  "script_template": "script.py",
+  "control": {
+    "endpoints": {
+      "gen": {
+        "method": "POST",
+        "port": 8082,
+        "path": "/gen",
+        "desc": "Active/désactive la simulation d'un slot (placeholder MTL : bascule simu↔RX)."
+      }
+    }
+  },
+  "ui": {
+    "control_html": "control.html",
+    "control_js": "control.js",
+    "control_css": "control.css"
+  },
+  "deploy_defaults": {
+    "video_count": 1,
+    "audio_count": 0,
+    "width": 1280,
+    "height": 720,
+    "fps": 25,
+    "chroma": "422",
+    "smpte_2022_7": false
+  },
+  "config_schema": [
+    {
+      "key": "smpte_2022_7",
+      "type": "bool",
+      "label": "SMPTE 2022-7 (dual-path redondant)",
+      "default": false
+    }
+  ],
+  "wiring": {
+    "produces": [
+      {
+        "essence": "video",
+        "repeat": "video_count",
+        "shm": "{hostname}_{i}"
+      },
+      {
+        "essence": "audio",
+        "repeat": "audio_count",
+        "shm": "{hostname}_audio_{i}"
+      }
+    ],
+    "consumes": [],
+    "mode": "none"
+  }
+}

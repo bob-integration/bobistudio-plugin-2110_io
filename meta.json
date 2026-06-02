@@ -1,0 +1,13 @@
+{
+  "version": "0.1.0",
+  "date": "2026-06-03",
+  "changes": {
+    "Nouveautés": [
+      "Première version : scaffolding du receiver ST 2110 via MTL (libmtl/DPDK). Manifeste pur (needs_nic, nmos_role receiver), hooks topologie, script wrapper créant le ring shm au même format que receiver_2110 (profondeur/ring pilotés par les réglages MXL) + mode simulation. Ingest MTL natif (mtl_rx.c) : squelette, RX fonctionnelle en Phase C."
+    ],
+    "Corrections": [],
+    "Bugs connus": [
+      "Réception MTL réelle non encore implémentée (mtl_rx.c est un squelette) — mode simulation uniquement pour l'instant."
+    ]
+  }
+}
