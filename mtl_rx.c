@@ -56,6 +56,7 @@ struct rx_ctx {
     size_t      len;
   } fb[MAX_FB];
   int ext_idx;            /* prochain slot fourni à MTL (round-robin) */
+  int copy_mode;          /* 1 = frames internes MTL + memcpy → shm (PMD noyau af_xdp/kernel) */
   int plane_h;            /* hauteur des plans dans le buffer (champ si entrelacé) */
   enum st_frame_fmt out_fmt; /* format de la frame externe (sortie planar) */
   mtl_iova_t frames_iova; /* iova du début de la zone frames (dma_map) */
@@ -121,17 +122,24 @@ static void* rx_thread(void* arg) {
       continue;
     }
     if (!frame->addr[0]) { st20p_rx_put_frame(c->handle, frame); continue; }
-    /* la frame est DÉJÀ dans un slot du ring (zéro-copie). On calcule le slot réel à
-     * partir de l'adresse et on aligne frame_index dessus pour que les consommateurs
-     * lisent le bon slot (frame_index % ring). */
-    uint8_t* a = (uint8_t*)frame->addr[0];
-    long slot = (a >= c->frames_base && a < c->frames_base + (size_t)c->ring * c->framesize)
-                ? (a - c->frames_base) / (long)c->framesize
-                : (long)(c->frame_index % c->ring); /* garde-fou */
-    if (slot < 0 || slot >= c->ring) slot = c->frame_index % c->ring;
     uint64_t fi = c->frame_index;
-    if ((fi % c->ring) != (uint64_t)slot)
-      fi += ((uint64_t)slot - (fi % c->ring) + c->ring) % c->ring;
+    if (c->copy_mode) {
+      /* PMD noyau : la frame est dans un buffer interne MTL → on la COPIE dans le slot
+       * du ring (frame_index % ring). Le buffer planar de sortie est contigu (Y|U|V),
+       * de taille framesize. */
+      long slot = fi % c->ring;
+      memcpy(c->frames_base + (size_t)slot * c->framesize, frame->addr[0], c->framesize);
+    } else {
+      /* DPDK ext-frame : la frame est DÉJÀ dans un slot du ring (zéro-copie). On aligne
+       * frame_index sur le slot réel (déduit de l'adresse) pour les consommateurs. */
+      uint8_t* a = (uint8_t*)frame->addr[0];
+      long slot = (a >= c->frames_base && a < c->frames_base + (size_t)c->ring * c->framesize)
+                  ? (a - c->frames_base) / (long)c->framesize
+                  : (long)(fi % c->ring); /* garde-fou */
+      if (slot < 0 || slot >= c->ring) slot = fi % c->ring;
+      if ((fi % c->ring) != (uint64_t)slot)
+        fi += ((uint64_t)slot - (fi % c->ring) + c->ring) % c->ring;
+    }
     write_shm_header(c, fi);
     c->frame_index = fi + 1;
     c->frames_recv++;
@@ -156,14 +164,16 @@ static enum st_fps to_st_fps(double f) {
 
 static void usage(const char* p) {
   fprintf(stderr,
-    "usage: %s --pci <BDF> --sip <ip> --mcast <ip> --udp_port <p> --payload_type <pt>\n"
-    "          --width W --height H --fps F [--interlaced] --shm </dev/shm/x>\n"
-    "          --ring N --hdr 64 --lcores a,b,c [--stats_file /path]\n", p);
+    "usage: %s [--pmd dpdk|kernel|af_xdp] (--pci <BDF> | --iface <name>) --sip <ip>\n"
+    "          --mcast <ip> --udp_port <p> --payload_type <pt> --width W --height H --fps F\n"
+    "          [--interlaced] --shm </dev/shm/x> --ring N --hdr 64 --lcores a,b,c [--stats_file /path]\n"
+    "  pmd dpdk (défaut) : DPDK user, --pci BDF, zéro-copie ext-frame.\n"
+    "  pmd kernel|af_xdp : NIC sur driver noyau (IGMP par le noyau), --iface <netdev>, copie.\n", p);
 }
 
 int main(int argc, char** argv) {
   const char *pci = NULL, *sip = NULL, *mcast = NULL, *shm_path = NULL,
-             *lcores = NULL, *stats_file = NULL;
+             *lcores = NULL, *stats_file = NULL, *pmd_s = "dpdk", *iface = NULL;
   int udp_port = 0, payload_type = 96, width = 1920, height = 1080, ring = 10, hdr = 64;
   int interlaced = 0;
   double fps = 25.0;
@@ -173,7 +183,8 @@ int main(int argc, char** argv) {
     {"udp_port", 1, 0, 'u'}, {"payload_type", 1, 0, 't'}, {"width", 1, 0, 'W'},
     {"height", 1, 0, 'H'}, {"fps", 1, 0, 'F'}, {"interlaced", 0, 0, 'i'},
     {"shm", 1, 0, 'S'}, {"ring", 1, 0, 'R'}, {"hdr", 1, 0, 'D'},
-    {"lcores", 1, 0, 'l'}, {"stats_file", 1, 0, 'f'}, {0, 0, 0, 0}};
+    {"lcores", 1, 0, 'l'}, {"stats_file", 1, 0, 'f'},
+    {"pmd", 1, 0, 'M'}, {"iface", 1, 0, 'N'}, {0, 0, 0, 0}};
   int o;
   while ((o = getopt_long(argc, argv, "", opts, NULL)) != -1) {
     switch (o) {
@@ -191,10 +202,19 @@ int main(int argc, char** argv) {
       case 'D': hdr = atoi(optarg); break;
       case 'l': lcores = optarg; break;
       case 'f': stats_file = optarg; break;
+      case 'M': pmd_s = optarg; break;
+      case 'N': iface = optarg; break;
       default: usage(argv[0]); return 1;
     }
   }
-  if (!pci || !sip || !mcast || !udp_port || !shm_path) { usage(argv[0]); return 1; }
+  int use_kernel = (strcmp(pmd_s, "dpdk") != 0);   /* kernel | af_xdp → driver noyau */
+  const char* dev = use_kernel ? iface : pci;      /* identifiant device selon le mode */
+  if (!dev || !mcast || !udp_port || !shm_path) { usage(argv[0]); return 1; }
+  /* Nom de port MTL : préfixe selon le PMD (cf. mtl_api.h). */
+  char portname[MTL_PORT_MAX_LEN];
+  if (!strcmp(pmd_s, "af_xdp"))      snprintf(portname, sizeof(portname), "native_af_xdp:%s", iface);
+  else if (!strcmp(pmd_s, "kernel")) snprintf(portname, sizeof(portname), "kernel:%s", iface);
+  else                               snprintf(portname, sizeof(portname), "%s", pci);
   /* MTL st20 RX transport limite framebuff_cnt à [2:8] → on cale le ring du shm dessus.
    * (le ring « logique » du pipeline aval peut être plus grand côté consommateurs ; ici
    * c'est le nombre de slots que MTL remplit en zéro-copie). */
@@ -209,9 +229,9 @@ int main(int argc, char** argv) {
   struct mtl_init_params p;
   memset(&p, 0, sizeof(p));
   p.num_ports = 1;
-  snprintf(p.port[MTL_PORT_P], MTL_PORT_MAX_LEN, "%s", pci);
-  inet_pton(AF_INET, sip, p.sip_addr[MTL_PORT_P]);
-  p.pmd[MTL_PORT_P] = MTL_PMD_DPDK_USER;
+  snprintf(p.port[MTL_PORT_P], MTL_PORT_MAX_LEN, "%s", portname);
+  if (sip) inet_pton(AF_INET, sip, p.sip_addr[MTL_PORT_P]);
+  p.pmd[MTL_PORT_P] = mtl_pmd_by_port_name(portname);  /* dpdk_user | kernel | native_af_xdp */
   p.flags |= MTL_FLAG_DEV_AUTO_START_STOP;
   p.log_level = MTL_LOG_LEVEL_INFO;
   p.lcores = (char*)lcores;
@@ -224,6 +244,7 @@ int main(int argc, char** argv) {
   memset(&c, 0, sizeof(c));
   c.ring = ring;
   c.hdr = hdr;
+  c.copy_mode = use_kernel;   /* PMD noyau → frames internes + memcpy (pas de DMA ext-frame) */
 
   c.out_fmt = ST_FRAME_FMT_YUV422PLANAR10LE;
   c.plane_h = interlaced ? height / 2 : height;  /* buffer ext = 1 champ si entrelacé */
@@ -237,7 +258,7 @@ int main(int argc, char** argv) {
   ops.priv = &c;
   ops.port.num_port = 1;
   inet_pton(AF_INET, mcast, ops.port.ip_addr[MTL_SESSION_PORT_P]);
-  snprintf(ops.port.port[MTL_SESSION_PORT_P], MTL_PORT_MAX_LEN, "%s", pci);
+  snprintf(ops.port.port[MTL_SESSION_PORT_P], MTL_PORT_MAX_LEN, "%s", portname);
   ops.port.udp_port[MTL_SESSION_PORT_P] = udp_port;
   ops.port.payload_type = payload_type;
   ops.width = width;
@@ -249,8 +270,12 @@ int main(int argc, char** argv) {
   ops.device = ST_PLUGIN_DEVICE_AUTO;
   ops.framebuff_cnt = ring;
   ops.notify_frame_available = frame_available;
-  ops.query_ext_frame = query_ext_frame;
-  ops.flags |= ST20P_RX_FLAG_EXT_FRAME;
+  if (!c.copy_mode) {
+    /* DPDK : external frames → DMA zéro-copie dans les slots du ring shm. */
+    ops.query_ext_frame = query_ext_frame;
+    ops.flags |= ST20P_RX_FLAG_EXT_FRAME;
+  }
+  /* mode noyau (copy_mode) : frames internes MTL ; on memcpy vers le shm dans rx_thread. */
   /* pas de RECEIVE_INCOMPLETE : on ne veut que des frames complètes dans le shm */
 
   c.handle = st20p_rx_create(c.st, &ops);
@@ -269,22 +294,24 @@ int main(int argc, char** argv) {
   if (c.shm_base == MAP_FAILED) { perror("mmap"); return 1; }
   c.frames_base = c.shm_base + hdr;
 
-  /* DMA-map du mapping ENTIER (base alignée page) ; l'iova des frames = base + hdr */
-  c.frames_iova = mtl_dma_map(c.st, c.shm_base, c.shm_size);
-  if (c.frames_iova == MTL_BAD_IOVA) {
-    fprintf(stderr, "mtl_rx: mtl_dma_map fail (shm non DMA-mappable)\n");
-    return 1;
-  }
-  for (int i = 0; i < ring; i++) {
-    c.fb[i].addr = c.frames_base + (size_t)i * c.framesize;
-    c.fb[i].iova = c.frames_iova + (mtl_iova_t)hdr + (mtl_iova_t)i * c.framesize;
-    c.fb[i].len = c.framesize;
+  if (!c.copy_mode) {
+    /* DPDK ext-frame : DMA-map du mapping ENTIER (base alignée page) ; iova frames = base + hdr */
+    c.frames_iova = mtl_dma_map(c.st, c.shm_base, c.shm_size);
+    if (c.frames_iova == MTL_BAD_IOVA) {
+      fprintf(stderr, "mtl_rx: mtl_dma_map fail (shm non DMA-mappable)\n");
+      return 1;
+    }
+    for (int i = 0; i < ring; i++) {
+      c.fb[i].addr = c.frames_base + (size_t)i * c.framesize;
+      c.fb[i].iova = c.frames_iova + (mtl_iova_t)hdr + (mtl_iova_t)i * c.framesize;
+      c.fb[i].len = c.framesize;
+    }
   }
 
   fprintf(stderr,
-          "mtl_rx: started %dx%d%s fps=%.2f pt=%d mcast=%s:%d framesize=%zu ring=%d shm=%s\n",
+          "mtl_rx: started %dx%d%s fps=%.2f pt=%d mcast=%s:%d framesize=%zu ring=%d shm=%s pmd=%s dev=%s\n",
           width, height, interlaced ? "i" : "p", fps, payload_type, mcast, udp_port,
-          c.framesize, ring, shm_path);
+          c.framesize, ring, shm_path, pmd_s, dev);
 
   pthread_create(&c.thread, NULL, rx_thread, &c);
 
@@ -311,7 +338,7 @@ int main(int argc, char** argv) {
   g_stop = 1;
   pthread_join(c.thread, NULL);
   st20p_rx_free(c.handle);
-  mtl_dma_unmap(c.st, c.shm_base, c.frames_iova, c.shm_size);
+  if (!c.copy_mode) mtl_dma_unmap(c.st, c.shm_base, c.frames_iova, c.shm_size);
   munmap(c.shm_base, c.shm_size);
   mtl_uninit(c.st);
   return 0;
