@@ -1,13 +1,13 @@
 {
-  "version": "0.2.0",
+  "version": "0.3.0",
   "date": "2026-06-03",
   "changes": {
     "Nouveautés": [
-      "mtl_rx.c implémenté (C2) : réception ST 2110-20 via libmtl en st20p external-frames, écriture ZÉRO-COPIE directe dans le ring /dev/shm (header [u64 frame_index][u64 ns] comme receiver_2110). Validé en réel sur un flux 1080i25 422 10-bit (50 champs/s écrits dans le shm). Args : --pci/--sip/--mcast/--udp_port/--payload_type/--width/--height/--fps/--interlaced/--shm/--ring/--hdr/--lcores."
+      "Wrapper script.py (C3a) : à l'activation NMOS IS-05, parse le SDP poussé dans le container (/tmp/nmos_recv_v_{idx}.sdp → mcast/port/payload_type/format) et lance mtl_rx avec ces paramètres ; bascule SIMU ↔ mtl_rx selon présence d'un SDP ; :8080 agrège les stats mtl_rx. Validé en réel sur un flux 1080p25 422 10-bit (25 fps pleins écrits dans le shm)."
     ],
     "Corrections": [],
     "Bugs connus": [
-      "Ring MTL plafonné à 8 (limite transport st20). Lancement/scoping VF (rdma netns + cpuset) + câblage NMOS IS-05 = Phase C3 (le wrapper script.py tourne encore en simulation par défaut)."
+      "Params DPDK (vf_pci/vf_sip/lcores) et binaire mtl_rx encore fournis manuellement : automatisation au déploiement = C3b (deploy.py/nic_pool). Entrelacé : 1 champ/slot (weave à venir). Audio st30 différé."
     ]
   }
 }
