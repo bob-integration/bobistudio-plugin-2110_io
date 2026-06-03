@@ -25,7 +25,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
       libnuma-dev libssl-dev libjson-c-dev libpcap-dev rdma-core libibverbs-dev \
       libcap-ng-dev m4 sudo unzip cmake systemtap-sdt-dev libgtest-dev libgmock-dev \
       libxdp-dev libbpf-dev libelf-dev clang llvm gcc-multilib \
-      ca-certificates iproute2 ethtool \
+      ca-certificates iproute2 ethtool wget curl \
  && rm -rf /var/lib/apt/lists/*
 
 # Fix BPF/clang sur Debian multiarch : asm/ accessible (sinon mtl.xdp.c ne compile pas).
@@ -53,8 +53,9 @@ RUN cd /src/MTL/manager \
 COPY mtl_rx.c /src/mtl_rx.c
 RUN cc -O2 -o /usr/local/bin/mtl_rx /src/mtl_rx.c $(pkg-config --cflags --libs mtl) -lpthread -lm
 
-# 5) DDP comms (optionnel, mode PF-DPDK-in-container). Fourni dans le contexte de build si présent.
-COPY ice_comms-*.pkg /usr/local/share/mtl-ddp/ 2>/dev/null || true
+# 5) DDP comms : NON copié ici. En AF_XDP/kernel le DDP est chargé par le driver ice de l'HÔTE.
+#    Pour le mode PF-DPDK-in-container (plus tard), monter le .pkg via `docker run -v` à
+#    /usr/local/lib/bpf/... ou /lib/firmware/intel/ice/ddp/ice.pkg (évite de versionner un binaire Intel).
 
 # 6) Nettoyage de l'arbre source (les artefacts sont dans /usr/local).
 RUN rm -rf /src/MTL
