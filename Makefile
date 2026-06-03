@@ -6,8 +6,9 @@
 #         make clean
 
 CC      ?= cc
-CFLAGS  ?= -O2 -Wall -Wextra
-# Drapeaux libmtl/DPDK via pkg-config si disponible (Phase C) :
+CFLAGS  ?= -O2 -Wall
+# libmtl est installé sous /usr/local → exporter PKG_CONFIG_PATH si besoin :
+#   export PKG_CONFIG_PATH=/usr/local/lib/x86_64-linux-gnu/pkgconfig:/usr/local/lib/pkgconfig
 PKG     := $(shell pkg-config --exists mtl 2>/dev/null && echo yes)
 ifeq ($(PKG),yes)
   CFLAGS  += $(shell pkg-config --cflags mtl)
@@ -15,6 +16,7 @@ ifeq ($(PKG),yes)
 else
   LDLIBS  += -lmtl
 endif
+LDLIBS  += -lpthread -lm
 
 mtl_rx: mtl_rx.c
 	$(CC) $(CFLAGS) -o $@ $< $(LDLIBS)

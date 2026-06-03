@@ -1,13 +1,13 @@
 {
-  "version": "0.1.0",
+  "version": "0.2.0",
   "date": "2026-06-03",
   "changes": {
     "Nouveautés": [
-      "Première version : scaffolding du receiver ST 2110 via MTL (libmtl/DPDK). Manifeste pur (needs_nic, nmos_role receiver), hooks topologie, script wrapper créant le ring shm au même format que receiver_2110 (profondeur/ring pilotés par les réglages MXL) + mode simulation. Ingest MTL natif (mtl_rx.c) : squelette, RX fonctionnelle en Phase C."
+      "mtl_rx.c implémenté (C2) : réception ST 2110-20 via libmtl en st20p external-frames, écriture ZÉRO-COPIE directe dans le ring /dev/shm (header [u64 frame_index][u64 ns] comme receiver_2110). Validé en réel sur un flux 1080i25 422 10-bit (50 champs/s écrits dans le shm). Args : --pci/--sip/--mcast/--udp_port/--payload_type/--width/--height/--fps/--interlaced/--shm/--ring/--hdr/--lcores."
     ],
     "Corrections": [],
     "Bugs connus": [
-      "Réception MTL réelle non encore implémentée (mtl_rx.c est un squelette) — mode simulation uniquement pour l'instant."
+      "Ring MTL plafonné à 8 (limite transport st20). Lancement/scoping VF (rdma netns + cpuset) + câblage NMOS IS-05 = Phase C3 (le wrapper script.py tourne encore en simulation par défaut)."
     ]
   }
 }
