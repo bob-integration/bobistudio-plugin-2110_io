@@ -36,7 +36,19 @@ BIT_DEPTH = int(CONFIG.get("bit_depth") or 8)
 # Paramètres DPDK injectés par l'orchestrateur (vides → simu only)
 VF_PCI  = str(CONFIG.get("vf_pci") or "")
 VF_SIP  = str(CONFIG.get("vf_sip") or "")
-LCORES  = str(CONFIG.get("lcores") or "")
+
+def _auto_lcores():
+    # lcores = cpus du cpuset réel du container (≥4 imposé au déploiement), moins 1 cœur
+    # laissé aux threads de contrôle DPDK (sinon « Failed to create thread for interrupt »).
+    try:
+        cpus = sorted(os.sched_getaffinity(0))
+    except Exception:
+        cpus = list(range(os.cpu_count() or 1))
+    if len(cpus) > 1:
+        cpus = cpus[:-1]
+    return ",".join(str(c) for c in cpus[:3])
+
+LCORES  = str(CONFIG.get("lcores") or "") or _auto_lcores()
 # Binaire mtl_rx : poussé/prébuildé par le déploiement (C3b) ; surchargeable pour les tests.
 MTL_RX  = str(CONFIG.get("mtl_rx_bin") or "/opt/script/mtl_rx")
 V_RING  = min(int(CONFIG.get("shm_video_ring", 8) or 8), 8)   # MTL st20 : ring ≤ 8

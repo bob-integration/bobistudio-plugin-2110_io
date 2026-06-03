@@ -1,13 +1,14 @@
 {
-  "version": "0.3.0",
+  "version": "0.4.0",
   "date": "2026-06-03",
   "changes": {
     "Nouveautés": [
-      "Wrapper script.py (C3a) : à l'activation NMOS IS-05, parse le SDP poussé dans le container (/tmp/nmos_recv_v_{idx}.sdp → mcast/port/payload_type/format) et lance mtl_rx avec ces paramètres ; bascule SIMU ↔ mtl_rx selon présence d'un SDP ; :8080 agrège les stats mtl_rx. Validé en réel sur un flux 1080p25 422 10-bit (25 fps pleins écrits dans le shm)."
+      "C3b — automatisation du déploiement côté orchestrateur : flag manifeste needs_dpdk déclenche, au déploiement, la création de la VF + le déplacement de son device RDMA dans le netns du container (rdma dev set netns) + cpuset ≥4 + l'injection de vf_pci/vf_sip dans la CONFIG + le push du binaire mtl_rx (prébuildé/caché côté hôte). Plus aucune étape manuelle.",
+      "lcores auto-détectés par le wrapper (os.sched_getaffinity) — l'orchestrateur n'injecte plus les lcores."
     ],
     "Corrections": [],
     "Bugs connus": [
-      "Params DPDK (vf_pci/vf_sip/lcores) et binaire mtl_rx encore fournis manuellement : automatisation au déploiement = C3b (deploy.py/nic_pool). Entrelacé : 1 champ/slot (weave à venir). Audio st30 différé."
+      "Entrelacé : 1 champ/slot (weave à venir). Audio st30 différé. Préd infra hôte MTL (RDMA exclusive, template fat, cmdline IOMMU/hugepages) encore manuelle."
     ]
   }
 }
