@@ -26,6 +26,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
       libcap-ng-dev m4 sudo unzip cmake systemtap-sdt-dev libgtest-dev libgmock-dev \
       libxdp-dev libbpf-dev libelf-dev clang llvm gcc-multilib \
       ca-certificates iproute2 ethtool wget curl \
+      python3 python3-numpy \
  && rm -rf /var/lib/apt/lists/*
 
 # Fix BPF/clang sur Debian multiarch : asm/ accessible (sinon mtl.xdp.c ne compile pas).
@@ -59,6 +60,9 @@ RUN cc -O2 -o /usr/local/bin/mtl_rx /src/mtl_rx.c $(pkg-config --cflags --libs m
 
 # 6) Nettoyage de l'arbre source (les artefacts sont dans /usr/local).
 RUN rm -rf /src/MTL
+
+# 7) Contrôleur Python (rôle agent+contrôleur : :8080 métriques + :8081 nmos/subscribe + simu).
+COPY controller.py /usr/local/bin/controller.py
 
 COPY entrypoint.sh /usr/local/bin/entrypoint.sh
 RUN chmod +x /usr/local/bin/entrypoint.sh

@@ -1,14 +1,15 @@
 {
-  "version": "0.4.0",
+  "version": "0.5.0",
   "date": "2026-06-03",
   "changes": {
     "Nouveautés": [
-      "C3b — automatisation du déploiement côté orchestrateur : flag manifeste needs_dpdk déclenche, au déploiement, la création de la VF + le déplacement de son device RDMA dans le netns du container (rdma dev set netns) + cpuset ≥4 + l'injection de vf_pci/vf_sip dans la CONFIG + le push du binaire mtl_rx (prébuildé/caché côté hôte). Plus aucune étape manuelle.",
-      "lcores auto-détectés par le wrapper (os.sched_getaffinity) — l'orchestrateur n'injecte plus les lcores."
+      "Backend DOCKER (E810 + AF_XDP sur PF, --network host) : nouvelle image self-contained avec un contrôleur Python (docker/controller.py) qui joue le rôle agent+contrôleur — sert :8080 (métriques) et :8081 (/nmos/subscribe pour le SDP IS-05 + /status). À l'activation NMOS, il lance mtl_rx --pmd af_xdp --iface <PF> → shm zéro-copie. Sans SDP : simulation. Piloté par le nouveau driver app/docker_driver.py de l'orchestrateur (fondation cluster multi-nœud).",
+      "Aucune VF/SR-IOV/RDMA-netns pour le chemin AF_XDP : le PF reste kernel, PTP cohabite.",
+      "Teardown : l'orchestrateur force ip link set <iface> xdp off après stop/rm (MtlManager n'a pas le temps de détacher)."
     ],
     "Corrections": [],
     "Bugs connus": [
-      "Entrelacé : 1 champ/slot (weave à venir). Audio st30 différé. Préd infra hôte MTL (RDMA exclusive, template fat, cmdline IOMMU/hugepages) encore manuelle."
+      "v1 Docker = 1 session vidéo active par conteneur/port (un PF = un mtl_init) ; multi-session = plan de contrôle mtl_rx à venir. Audio st30 différé. Entrelacé : 1 champ/slot. Le détachement XDP fait fauter ptp4l ~15 s (auto-recovery)."
     ]
   }
 }
