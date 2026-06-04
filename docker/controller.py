@@ -295,6 +295,10 @@ class AgentHandler(BaseHTTPRequestHandler):
                 if "anc_mcast"   in body: t["anc_mcast"]   = body.get("anc_mcast") or None
                 if "anc_port"    in body: t["anc_port"]    = int(body.get("anc_port") or 0)
                 if "anc_pt"      in body: t["anc_pt"]      = int(body.get("anc_pt") or 97)
+                # scan/field_order : ne clobber QUE si fournis (le câblage :8082/input porte le
+                # format réel de la source ; un push /tx de dest seule ne doit pas les écraser).
+                if "scan"        in body: t["scan"]        = "i" if str(body.get("scan")).lower() == "i" else "p"
+                if "field_order" in body: t["field_order"] = "bff" if str(body.get("field_order")).lower() == "bff" else "tff"
                 for k_in, k_st in (("width","w"),("height","h"),("fps","fps"),("bit_depth","bd"),("ring","ring")):
                     if body.get(k_in):
                         t[k_st] = (float(body[k_in]) if k_st == "fps" else int(body[k_in]))
@@ -348,6 +352,9 @@ class ControlHandler(BaseHTTPRequestHandler):
                 if fmt.get("height"):    t["h"] = int(fmt["height"])
                 if fmt.get("bit_depth"): t["bd"] = int(fmt["bit_depth"])
                 if fmt.get("fps"):       t["fps"] = float(fmt["fps"])
+                # Mode de balayage de la SOURCE → passthrough entrelacé (émis tel quel en 2110-20).
+                if "scan" in fmt:        t["scan"] = "i" if str(fmt.get("scan")).lower() == "i" else "p"
+                if fmt.get("field_order"): t["field_order"] = "bff" if str(fmt["field_order"]).lower() == "bff" else "tff"
             return self._json(200, {"ok": True})
 
         try:
@@ -504,6 +511,7 @@ _fail_streak = 0             # échecs rapides consécutifs (backoff)
 # shm_in (non câblé) ou désactivé n'émet pas.
 _tx = [{"enabled": False, "mcast": None, "udp_port": 0, "pt": 96, "shm_in": None,
         "w": WIDTH, "h": HEIGHT, "fps": FPS, "bd": BIT_DEPTH, "ring": V_RING,
+        "scan": "p", "field_order": "tff",   # passthrough entrelacé : suit le format de la source câblée
         "audio_mcast": None, "audio_port": 0, "audio_pt": 97,
         "anc_mcast": None, "anc_port": 0, "anc_pt": 97}
        for _ in range(N_TX)]
@@ -556,10 +564,13 @@ def _video_session(info, idxs):
     """Une session = un flux réseau décodé UNE fois (un flow RX), fan-out vers tous les slots
     `idxs` qui demandent cette même source (mcast:port). Évite le conflit AF_XDP « même 5-tuple,
     2 files RX » : un seul flow, recopie interne par mtl_rx vers chaque cible."""
+    # Ordre de champ : pas porté par le SDP 2110-20 → défaut par résolution (1080i=TFF, 576i=BFF),
+    # même règle que le helper orchestrateur. mtl_rx s'en sert pour la parité du merge RX.
+    fo = "bff" if 0 < int(info.get("height") or 0) <= 576 else "tff"
     return {"kind": "video",
             "mcast": info["mcast"], "udp_port": info["port"], "payload_type": info["pt"],
             "width": info["width"], "height": info["height"], "fps": info["fps"],
-            "interlaced": bool(info.get("interlaced")), "bit_depth": BIT_DEPTH,
+            "interlaced": bool(info.get("interlaced")), "field_order": fo, "bit_depth": BIT_DEPTH,
             "ring": V_RING, "hdr": HDR,
             "targets": [_video_target(i) for i in idxs]}
 
@@ -575,7 +586,9 @@ def _tx_session(idx, t):
     return {"kind": "video", "role": "tx",
             "mcast": t["mcast"], "udp_port": t["udp_port"], "payload_type": t["pt"],
             "width": t["w"], "height": t["h"], "fps": t["fps"],
-            "interlaced": False, "bit_depth": t["bd"], "ring": t["ring"], "hdr": HDR,
+            # Passthrough du balayage : on ré-émet en entrelacé si la source câblée l'est.
+            "interlaced": (t.get("scan") == "i"), "field_order": t.get("field_order") or "tff",
+            "bit_depth": t["bd"], "ring": t["ring"], "hdr": HDR,
             "targets": [{"idx": idx, "shm": shm, "stats": "/tmp/mtl_tx{}.json".format(idx)}]}
 
 
@@ -588,7 +601,10 @@ def _fps_str(fps):
 
 def _tx_sdp(i, t):
     """SDP ST 2110-20 d'un slot TX. Transport = 422-10 (depth=10 même si le shm est en 8 bits).
-    sip = IP du PF (source des paquets). L'orchestrateur ajoute ts-refclk (PTP) au fetch."""
+    sip = IP du PF (source des paquets). L'orchestrateur ajoute ts-refclk (PTP) au fetch.
+    Entrelacé : flag `interlace` dans le fmtp (passthrough) ; exactframerate = cadence reçue
+    (fps de la source câblée), conservée telle quelle pour rester aligné sur le flux source."""
+    scan = "interlace; " if t.get("scan") == "i" else ""
     return (
         "v=0\r\n"
         "o=- 0 0 IN IP4 {sip}\r\n"
@@ -599,12 +615,12 @@ def _tx_sdp(i, t):
         "a=source-filter: incl IN IP4 {mcast} {sip}\r\n"
         "a=rtpmap:{pt} raw/90000\r\n"
         "a=fmtp:{pt} sampling=YCbCr-4:2:2; width={w}; height={h}; exactframerate={fr}; depth=10; "
-        "colorimetry=BT709; PM=2110GPM; SSN=ST2110-20:2017; TP=2110TPN;\r\n"
+        "{scan}colorimetry=BT709; PM=2110GPM; SSN=ST2110-20:2017; TP=2110TPN;\r\n"
         "a=mediaclk:direct=0\r\n"
     ).format(sip=SIP or "0.0.0.0", hn=HOSTNAME, i=i,
              port=int(t.get("udp_port") or 0), pt=int(t.get("pt") or 96),
              mcast=t.get("mcast") or "0.0.0.0", w=int(t.get("w") or 1920),
-             h=int(t.get("h") or 1080), fr=_fps_str(t.get("fps")))
+             h=int(t.get("h") or 1080), fr=_fps_str(t.get("fps")), scan=scan)
 
 def _anc_sdp(i, t):
     """SDP ST 2110-40 (ANC / SMPTE 291) d'un slot TX. dest = anc_mcast/anc_port du slot."""

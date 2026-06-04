@@ -40,6 +40,8 @@ def topology_ports(hostname, params, ctx):
         "fps":    float(params.get("fps") or 0),
         "chroma": str(params.get("chroma") or "422"),
         "bit_depth": int(params.get("bit_depth") or 8),
+        "scan":   str(params.get("scan") or "p"),
+        "field_order": str(params.get("field_order") or ""),
     }
     audio_fmt = {"sample_rate": 48000, "channels": 8, "bit_depth": 24}
     produces  = [{"shm": f"{hostname}_{i}", "kind": "video", "format": video_fmt} for i in range(nv)]
