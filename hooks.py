@@ -13,9 +13,21 @@ from app.scripts import normalize_receiver_params
 
 
 def before_deploy(params, context):
-    """Normalise comptes vidéo/audio + slots de simulation (réutilise le receiver 2110).
-    Signature (params, context) — identique au hook before_deploy de receiver_2110."""
-    return normalize_receiver_params(params)
+    """Normalise comptes vidéo/audio + slots de simulation (réutilise le receiver 2110), puis
+    auto-alloue la destination (mcast/port) de chaque slot TX — un mcast distinct par slot pour
+    éviter le conflit de flow sur la même 5-uplet. Le shm d'entrée (tx{i}_shm) vient du câblage."""
+    params = normalize_receiver_params(params)
+    vmid = int(context.get("vmid", 0))
+    n_tx = int(params.get("tx_count") or 0)
+    slots = [dict(t or {}) for t in (params.get("tx_slots") or [])]
+    while len(slots) < n_tx:
+        slots.append({})
+    for i, t in enumerate(slots[:n_tx]):
+        t.setdefault("multicast_ip", f"239.10.30.{(vmid + i) % 254 + 1}")
+        t.setdefault("dest_port", 5000)
+        t.setdefault("payload_type", 96)
+    params["tx_slots"] = slots[:n_tx]
+    return params
 
 
 def topology_ports(hostname, params, ctx):
@@ -31,7 +43,16 @@ def topology_ports(hostname, params, ctx):
     audio_fmt = {"sample_rate": 48000, "channels": 8, "bit_depth": 24}
     produces  = [{"shm": f"{hostname}_{i}", "kind": "video", "format": video_fmt} for i in range(nv)]
     produces += [{"shm": f"{hostname}_audio_{i}", "kind": "audio", "format": audio_fmt} for i in range(na)]
-    return {"produces": produces, "consumes": []}
+    # Slots TX (émetteurs) = ports d'ENTRÉE câblables → destinations MXL à droite sur la page Câbles.
+    # Le shm câblé est persisté à plat dans deploy_config sous tx{i}_shm (state_field du manifeste).
+    consumes = []
+    for i in range(int(params.get("tx_count") or 0)):
+        shm = params.get(f"tx{i}_shm") or ""
+        port = {"kind": "video", "slot": i, "label": f"Émetteur 2110-20 #{i + 1}", "shm": shm}
+        if not shm:
+            port["disconnected"] = True
+        consumes.append(port)
+    return {"produces": produces, "consumes": consumes}
 
 
 def produced_flow_count(params, ctx):

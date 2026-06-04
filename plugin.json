@@ -11,7 +11,7 @@
   },
   "nmos_role": "both",
   "deploy_order": 0,
-  "version": "0.14.0",
+  "version": "0.14.1",
   "description": "Receiver ST 2110 via Media Transport Library (MTL/DPDK, kernel-bypass). Réception st20p/st30p écrite en zéro-copie dans le ring shared memory par un binaire C natif (libmtl), exposé en NMOS IS-04/05. Variante haute performance de receiver_2110 (mêmes shm produits). Mode simulation par slot tant que la source n'est pas activée.",
   "nav": {
     "section": "sources",
@@ -68,7 +68,15 @@
         "shm": "{hostname}_audio_{i}"
       }
     ],
-    "consumes": [],
-    "mode": "none"
+    "consumes": [
+      {
+        "essence": "video",
+        "repeat": "tx_count",
+        "label": "Émetteur 2110-20 #{i1}",
+        "state_field": "tx{i}_shm"
+      }
+    ],
+    "mode": "hot-wire",
+    "state_endpoint": "/state"
   }
 }
