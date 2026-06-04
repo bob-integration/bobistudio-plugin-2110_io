@@ -1,8 +1,11 @@
 {
-  "version": "0.5.0",
-  "date": "2026-06-03",
+  "version": "0.6.0",
+  "date": "2026-06-04",
   "changes": {
     "Nouveautés": [
+      "Type Docker-only : manifeste runtime:docker. Un receiver_2110_mtl se crée désormais en un coup sur un nœud Docker (create+deploy atomiques), plus sur un vaisseau LXC. L'orchestrateur refuse de créer un LXC pour ce type sans nœud (Déploiement → Nœuds)."
+    ],
+    "Nouveautés (0.5.0)": [
       "Backend DOCKER (E810 + AF_XDP sur PF, --network host) : nouvelle image self-contained avec un contrôleur Python (docker/controller.py) qui joue le rôle agent+contrôleur — sert :8080 (métriques) et :8081 (/nmos/subscribe pour le SDP IS-05 + /status). À l'activation NMOS, il lance mtl_rx --pmd af_xdp --iface <PF> → shm zéro-copie. Sans SDP : simulation. Piloté par le nouveau driver app/docker_driver.py de l'orchestrateur (fondation cluster multi-nœud).",
       "Aucune VF/SR-IOV/RDMA-netns pour le chemin AF_XDP : le PF reste kernel, PTP cohabite.",
       "Teardown : l'orchestrateur force ip link set <iface> xdp off après stop/rm (MtlManager n'a pas le temps de détacher)."
