@@ -46,9 +46,13 @@ def topology_ports(hostname, params, ctx):
     # Slots TX (émetteurs) = ports d'ENTRÉE câblables → destinations MXL à droite sur la page Câbles.
     # Le shm câblé est persisté à plat dans deploy_config sous tx{i}_shm (state_field du manifeste).
     consumes = []
+    txs = params.get("tx_slots") or []
     for i in range(int(params.get("tx_count") or 0)):
         shm = params.get(f"tx{i}_shm") or ""
-        port = {"kind": "video", "slot": i, "label": f"Émetteur 2110-20 #{i + 1}", "shm": shm}
+        t = txs[i] if i < len(txs) else {}
+        dest = "{}:{}".format(t.get("multicast_ip"), t.get("dest_port") or 5000) if t.get("multicast_ip") else ""
+        port = {"kind": "video", "slot": i, "label": f"Émetteur 2110-20 #{i + 1}",
+                "shm": shm, "dest": dest}   # dest = destination 2110-20 (éditable à chaud)
         if not shm:
             port["disconnected"] = True
         consumes.append(port)
