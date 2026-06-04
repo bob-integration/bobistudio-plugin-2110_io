@@ -352,15 +352,24 @@ def _kill_mtl():
     _mtl_proc = None
 
 
-def _video_session(idx, info):
-    return {"kind": "video", "idx": idx,
+def _video_target(idx):
+    """Une cible = un slot shm de sortie (avec son IDENT propre)."""
+    return {"idx": idx,
+            "shm": "/dev/shm/{}_{}".format(HOSTNAME, idx),
+            "stats": "/tmp/mtl_v{}.json".format(idx),
+            "ident_file": _ident_file(idx)}
+
+
+def _video_session(info, idxs):
+    """Une session = un flux réseau décodé UNE fois (un flow RX), fan-out vers tous les slots
+    `idxs` qui demandent cette même source (mcast:port). Évite le conflit AF_XDP « même 5-tuple,
+    2 files RX » : un seul flow, recopie interne par mtl_rx vers chaque cible."""
+    return {"kind": "video",
             "mcast": info["mcast"], "udp_port": info["port"], "payload_type": info["pt"],
             "width": info["width"], "height": info["height"], "fps": info["fps"],
             "interlaced": bool(info.get("interlaced")), "bit_depth": BIT_DEPTH,
             "ring": V_RING, "hdr": HDR,
-            "shm": "/dev/shm/{}_{}".format(HOSTNAME, idx),
-            "stats": "/tmp/mtl_v{}.json".format(idx),
-            "ident_file": _ident_file(idx)}
+            "targets": [_video_target(i) for i in idxs]}
 
 
 # ─── Simulation (mire numpy, mêmes en-têtes shm) — fallback sans SDP ou GÉN forcé ──
@@ -400,7 +409,10 @@ def _manager_loop():
     mtl_rx (config JSON) quand l'ensemble change. Met à jour la résolution par slot + _live."""
     global _mtl_proc, _cur_sig, _last_launch, _fail_streak
     while True:
-        sessions = []
+        # 1) résoudre le SDP de chaque slot + grouper les slots actifs par SOURCE (mcast:port).
+        #    Plusieurs slots sur la même source → UNE session (fan-out), pas N sessions réseau
+        #    (l'AF_XDP refuse 2 files RX sur le même 5-tuple).
+        groups = {}        # (mcast, port) → {"info": sdp, "idxs": [..]}
         for idx in range(N_VIDEO):
             sdp_path = "{}/nmos_recv_v_{}.sdp".format(SDP_DIR, idx)
             sdp = _parse_sdp(sdp_path) if os.path.exists(sdp_path) else None
@@ -409,7 +421,9 @@ def _manager_loop():
                 _slot_res[idx] = cur; _update_ident(idx)   # la taille IDENT suit la résolution
             _ctl[idx]["info"] = sdp
             if sdp and not _ctl[idx]["gen"]:                # GÉN forcé → reste en simu
-                sessions.append(_video_session(idx, sdp))
+                key = (sdp["mcast"], sdp["port"])
+                groups.setdefault(key, {"info": sdp, "idxs": []})["idxs"].append(idx)
+        sessions = [_video_session(g["info"], g["idxs"]) for g in groups.values()]
         sig = json.dumps(sessions, sort_keys=True)
         dead = (_mtl_proc is not None and _mtl_proc.poll() is not None)
         if not (sig != _cur_sig or dead):
@@ -423,7 +437,7 @@ def _manager_loop():
             time.sleep(wait)
         else:
             _fail_streak = 0
-        active = set(s["idx"] for s in sessions)
+        active = set(t["idx"] for s in sessions for t in s["targets"])
         for idx in range(N_VIDEO):
             _live[idx] = idx in active
         with _mtl_lock:

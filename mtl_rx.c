@@ -38,6 +38,7 @@
 
 #define MAX_FB    64
 #define MAX_SESS  16
+#define MAX_TG    16   /* cibles (shm de sortie) par session : fan-out même-source → N slots */
 
 enum sess_kind { K_VIDEO, K_AUDIO, K_DATA };   /* DATA = ST 2110-40, prêt mais non implémenté */
 
@@ -50,7 +51,19 @@ static uint64_t now_ns(void) {
   return (uint64_t)ts.tv_sec * 1000000000ULL + ts.tv_nsec;
 }
 
-/* Une session = une essence sur le mtl_handle partagé. Champs communs + spécifiques par type. */
+/* Une cible = un shm de sortie. Une session en porte 1..N (fan-out même-source → N slots).
+ * Chaque cible a son propre état d'écriture (index/recv) et son propre IDENT (par slot). */
+struct target {
+  int      idx;            /* slot d'origine (pour le log) */
+  char     shm_path[300], stats_path[300];
+  uint8_t* shm_base; size_t shm_size; uint8_t* frames_base;
+  uint64_t index;          /* frame_index (vidéo) / chunk_index (audio) */
+  uint64_t recv;           /* compteur reçu (pour le débit) */
+  char     ident_file[300]; int has_ident;
+  uint8_t* ident_patch; int id_bw, id_bh; long id_mtime;
+};
+
+/* Une session = un flux réseau décodé UNE fois sur le mtl_handle partagé, fan-out vers ses cibles. */
 struct sess {
   enum sess_kind kind;
   mtl_handle st;            /* partagé (mtl_init unique) */
@@ -58,13 +71,11 @@ struct sess {
   /* réseau */
   char mcast[64];
   int  udp_port, payload_type;
-  /* shm */
-  uint8_t* shm_base; size_t shm_size; uint8_t* frames_base;
+  /* décodage (partagé par toutes les cibles) */
   size_t   slotsize;       /* vidéo: framesize ; audio: 1152 (1 chunk 1ms) */
   int      ring, hdr;
-  char     shm_path[300], stats_path[300];
-  uint64_t index;          /* frame_index (vidéo) / chunk_index (audio) */
-  uint64_t recv;           /* compteur reçu (pour le débit) */
+  /* cibles (shm de sortie) */
+  struct target tg[MAX_TG]; int ntg;
   pthread_t thread; int started;
   int      copy_mode;      /* vidéo: 1=memcpy (af_xdp) ; audio: toujours 1 */
   /* ── vidéo ── */
@@ -72,54 +83,31 @@ struct sess {
   int      width, height, bit_depth, interlaced; double fps;
   size_t   src_framesize; int conv8;
   enum st_frame_fmt out_fmt; int plane_h;
-  struct { void* addr; mtl_iova_t iova; size_t len; } fb[MAX_FB];
-  int      ext_idx; mtl_iova_t frames_iova;
-  char     ident_file[300]; int has_ident;
-  uint8_t* ident_patch; int id_bw, id_bh; long id_mtime;
   /* ── audio ── */
   st30p_rx_handle ah;
   int      channels;
 };
 
-static void write_shm_header(struct sess* s, uint64_t i) {
-  uint64_t* h = (uint64_t*)s->shm_base;
+static void write_shm_header(struct target* t, uint64_t i) {
+  uint64_t* h = (uint64_t*)t->shm_base;
   h[0] = i; h[1] = now_ns();
 }
 
 /* ═══ VIDÉO ═══════════════════════════════════════════════════════════════════ */
 
-static int query_ext_frame(void* priv, struct st_ext_frame* ext_frame,
-                           struct st20_rx_frame_meta* meta) {
-  struct sess* s = priv;
-  int i = s->ext_idx;
-  enum st_frame_fmt fmt = s->out_fmt;
-  uint8_t planes = st_frame_fmt_planes(fmt);
-  uint8_t* addr = (uint8_t*)s->fb[i].addr;
-  uint32_t ph = s->plane_h ? (uint32_t)s->plane_h : meta->height;
-  ext_frame->size = s->fb[i].len;
-  for (int pl = 0; pl < planes; pl++) {
-    ext_frame->linesize[pl] = st_frame_least_linesize(fmt, meta->width, pl);
-    ext_frame->addr[pl] = addr;
-    if (pl == 0) ext_frame->iova[0] = s->fb[i].iova;
-    else ext_frame->iova[pl] = ext_frame->iova[pl - 1] + ext_frame->linesize[pl - 1] * ph;
-    addr += ext_frame->linesize[pl] * ph;
-  }
-  if (++s->ext_idx >= s->ring) s->ext_idx = 0;
-  return 0;
-}
-
 static int frame_available(void* priv) { (void)priv; return 0; }
 
-/* IDENT : recharge le patch (fichier écrit par le contrôleur) si mtime change. Coût ~nul si off. */
-static void load_ident_patch(struct sess* s) {
-  if (!s->has_ident) return;
+/* IDENT : recharge le patch (fichier écrit par le contrôleur) si mtime change. Coût ~nul si off.
+ * Le patch est PAR CIBLE (chaque slot a son propre IDENT, même quand la source est partagée). */
+static void load_ident_patch(struct target* t) {
+  if (!t->has_ident) return;
   struct stat st;
-  if (stat(s->ident_file, &st) != 0) {
-    if (s->ident_patch) { free(s->ident_patch); s->ident_patch = NULL; }
-    s->id_bw = s->id_bh = 0; s->id_mtime = 0; return;
+  if (stat(t->ident_file, &st) != 0) {
+    if (t->ident_patch) { free(t->ident_patch); t->ident_patch = NULL; }
+    t->id_bw = t->id_bh = 0; t->id_mtime = 0; return;
   }
-  if ((long)st.st_mtime == s->id_mtime && s->ident_patch) return;
-  FILE* f = fopen(s->ident_file, "rb");
+  if ((long)st.st_mtime == t->id_mtime && t->ident_patch) return;
+  FILE* f = fopen(t->ident_file, "rb");
   if (!f) return;
   uint32_t hdr[2];
   if (fread(hdr, sizeof(uint32_t), 2, f) != 2) { fclose(f); return; }
@@ -130,13 +118,13 @@ static void load_ident_patch(struct sess* s) {
   if (!p) { fclose(f); return; }
   if (fread(p, 1, n, f) != n) { free(p); fclose(f); return; }
   fclose(f);
-  if (s->ident_patch) free(s->ident_patch);
-  s->ident_patch = p; s->id_bw = bw; s->id_bh = bh; s->id_mtime = (long)st.st_mtime;
+  if (t->ident_patch) free(t->ident_patch);
+  t->ident_patch = p; t->id_bw = bw; t->id_bh = bh; t->id_mtime = (long)st.st_mtime;
 }
 
-static void overlay_ident(struct sess* s, uint8_t* dst) {
-  if (!s->ident_patch || s->id_bw <= 0) return;
-  int W = s->width, H = s->height, bw = s->id_bw, bh = s->id_bh;
+static void overlay_ident(struct sess* s, struct target* t, uint8_t* dst) {
+  if (!t->ident_patch || t->id_bw <= 0) return;
+  int W = s->width, H = s->height, bw = t->id_bw, bh = t->id_bh;
   if (bw > W || bh > H) return;
   int x0 = W - bw - 8, y0 = 8;
   x0 -= x0 & 1; y0 -= y0 & 1; if (x0 < 0) x0 = 0;
@@ -144,7 +132,7 @@ static void overlay_ident(struct sess* s, uint8_t* dst) {
   size_t ysz = (size_t)W * H, uvsz = (size_t)(W / 2) * H;
   int bps = deep ? 2 : 1;
   for (int r = 0; r < bh; r++) {
-    const uint8_t* p = s->ident_patch + (size_t)r * bw;
+    const uint8_t* p = t->ident_patch + (size_t)r * bw;
     if (deep) { uint16_t* y = (uint16_t*)dst + (size_t)(y0 + r) * W + x0;
                 for (int x = 0; x < bw; x++) y[x] = (uint16_t)p[x] << shift; }
     else      { uint8_t*  y = dst + (size_t)(y0 + r) * W + x0;
@@ -171,10 +159,12 @@ static void* video_rx_thread(void* arg) {
     struct st_frame* frame = st20p_rx_get_frame(s->vh);
     if (!frame) { usleep(1000); continue; }
     if (!frame->addr[0]) { st20p_rx_put_frame(s->vh, frame); continue; }
-    uint64_t fi = s->index;
-    if (s->copy_mode) {
-      long slot = fi % s->ring;
-      uint8_t* dst = s->frames_base + (size_t)slot * s->slotsize;
+    /* af_xdp/copy_mode : décodage unique → fan-out vers chaque cible (slot shm).
+     * Chaque cible a son propre ring/index + son propre IDENT. */
+    for (int ti = 0; ti < s->ntg; ti++) {
+      struct target* t = &s->tg[ti];
+      uint64_t fi = t->index;
+      uint8_t* dst = t->frames_base + (size_t)(fi % s->ring) * s->slotsize;
       if (s->conv8) {
         const uint16_t* src = (const uint16_t*)frame->addr[0];
         size_t n = s->slotsize;
@@ -182,20 +172,10 @@ static void* video_rx_thread(void* arg) {
       } else {
         memcpy(dst, frame->addr[0], s->slotsize);
       }
-    } else {
-      uint8_t* a = (uint8_t*)frame->addr[0];
-      long slot = (a >= s->frames_base && a < s->frames_base + (size_t)s->ring * s->slotsize)
-                  ? (a - s->frames_base) / (long)s->slotsize : (long)(fi % s->ring);
-      if (slot < 0 || slot >= s->ring) slot = fi % s->ring;
-      if ((fi % s->ring) != (uint64_t)slot)
-        fi += ((uint64_t)slot - (fi % s->ring) + s->ring) % s->ring;
+      if (t->has_ident) { load_ident_patch(t); overlay_ident(s, t, dst); }
+      write_shm_header(t, fi);
+      t->index = fi + 1; t->recv++;
     }
-    if (s->has_ident) {
-      load_ident_patch(s);
-      overlay_ident(s, s->frames_base + (size_t)(fi % s->ring) * s->slotsize);
-    }
-    write_shm_header(s, fi);
-    s->index = fi + 1; s->recv++;
     st20p_rx_put_frame(s->vh, frame);
   }
   return NULL;
@@ -209,14 +189,16 @@ static void* audio_rx_thread(void* arg) {
   while (!g_stop) {
     struct st30_frame* frame = st30p_rx_get_frame(s->ah);
     if (!frame) { usleep(500); continue; }
-    uint64_t ci = s->index;
-    long slot = ci % s->ring;
-    uint8_t* dst = s->frames_base + (size_t)slot * s->slotsize;   /* slotsize = 1152 */
     size_t n = frame->data_size < s->slotsize ? frame->data_size : s->slotsize;
-    memcpy(dst, frame->addr, n);
-    if (n < s->slotsize) memset(dst + n, 0, s->slotsize - n);
-    write_shm_header(s, ci);
-    s->index = ci + 1; s->recv++;
+    for (int ti = 0; ti < s->ntg; ti++) {        /* fan-out (même source audio → N slots) */
+      struct target* t = &s->tg[ti];
+      uint64_t ci = t->index;
+      uint8_t* dst = t->frames_base + (size_t)(ci % s->ring) * s->slotsize;   /* slotsize = 1152 */
+      memcpy(dst, frame->addr, n);
+      if (n < s->slotsize) memset(dst + n, 0, s->slotsize - n);
+      write_shm_header(t, ci);
+      t->index = ci + 1; t->recv++;
+    }
     st30p_rx_put_frame(s->ah, frame);
   }
   return NULL;
@@ -238,18 +220,26 @@ static enum st_fps to_st_fps(double f) {
   return ST_FPS_P25;
 }
 
-/* mmap (création + ftruncate) du shm de la session, header à l'offset 0. */
-static int open_shm(struct sess* s) {
+/* mmap (création + ftruncate) du shm d'une cible, header à l'offset 0. Taille = hdr + ring*slot
+ * (dimensions de la session, communes à toutes ses cibles). */
+static int open_shm(struct sess* s, struct target* t) {
   size_t raw = (size_t)s->hdr + (size_t)s->ring * s->slotsize;
   size_t pg = (size_t)sysconf(_SC_PAGESIZE);
-  s->shm_size = (raw + pg - 1) & ~(pg - 1);
-  int fd = open(s->shm_path, O_CREAT | O_RDWR, 0666);
+  t->shm_size = (raw + pg - 1) & ~(pg - 1);
+  int fd = open(t->shm_path, O_CREAT | O_RDWR, 0666);
   if (fd < 0) { perror("open shm"); return -1; }
-  if (ftruncate(fd, s->shm_size) < 0) { perror("ftruncate"); close(fd); return -1; }
-  s->shm_base = mmap(NULL, s->shm_size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+  if (ftruncate(fd, t->shm_size) < 0) { perror("ftruncate"); close(fd); return -1; }
+  t->shm_base = mmap(NULL, t->shm_size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
   close(fd);
-  if (s->shm_base == MAP_FAILED) { perror("mmap"); return -1; }
-  s->frames_base = s->shm_base + s->hdr;
+  if (t->shm_base == MAP_FAILED) { perror("mmap"); return -1; }
+  t->frames_base = t->shm_base + s->hdr;
+  return 0;
+}
+
+/* Ouvre toutes les cibles de la session (slotsize/ring/hdr déjà calculés). */
+static int open_targets(struct sess* s) {
+  for (int ti = 0; ti < s->ntg; ti++)
+    if (open_shm(s, &s->tg[ti]) != 0) return -1;
   return 0;
 }
 
@@ -281,10 +271,12 @@ static int setup_video(struct sess* s) {
   if (!s->vh) { fprintf(stderr, "mtl_rx: st20p_rx_create fail (video %s:%d)\n", s->mcast, s->udp_port); return -1; }
   s->src_framesize = st20p_rx_frame_size(s->vh);
   s->slotsize = s->conv8 ? s->src_framesize / 2 : s->src_framesize;
-  if (open_shm(s) != 0) return -1;
-  fprintf(stderr, "mtl_rx[video] %dx%d%s fps=%.2f pt=%d mc=%s:%d slot=%zu ring=%d shm=%s\n",
+  if (open_targets(s) != 0) return -1;
+  fprintf(stderr, "mtl_rx[video] %dx%d%s fps=%.2f pt=%d mc=%s:%d slot=%zu ring=%d → %d cible(s):",
           s->width, s->height, s->interlaced ? "i" : "p", s->fps, s->payload_type,
-          s->mcast, s->udp_port, s->slotsize, s->ring, s->shm_path);
+          s->mcast, s->udp_port, s->slotsize, s->ring, s->ntg);
+  for (int ti = 0; ti < s->ntg; ti++) fprintf(stderr, " %s", s->tg[ti].shm_path);
+  fprintf(stderr, "\n");
   return pthread_create(&s->thread, NULL, video_rx_thread, s) == 0 ? (s->started = 1, 0) : -1;
 }
 
@@ -311,9 +303,11 @@ static int setup_audio(struct sess* s) {
 
   s->ah = st30p_rx_create(s->st, &ops);
   if (!s->ah) { fprintf(stderr, "mtl_rx: st30p_rx_create fail (audio %s:%d)\n", s->mcast, s->udp_port); return -1; }
-  if (open_shm(s) != 0) return -1;
-  fprintf(stderr, "mtl_rx[audio] %dch L24/48k pt=%d mc=%s:%d slot=%zu ring=%d shm=%s\n",
-          s->channels, s->payload_type, s->mcast, s->udp_port, s->slotsize, s->ring, s->shm_path);
+  if (open_targets(s) != 0) return -1;
+  fprintf(stderr, "mtl_rx[audio] %dch L24/48k pt=%d mc=%s:%d slot=%zu ring=%d → %d cible(s):",
+          s->channels, s->payload_type, s->mcast, s->udp_port, s->slotsize, s->ring, s->ntg);
+  for (int ti = 0; ti < s->ntg; ti++) fprintf(stderr, " %s", s->tg[ti].shm_path);
+  fprintf(stderr, "\n");
   return pthread_create(&s->thread, NULL, audio_rx_thread, s) == 0 ? (s->started = 1, 0) : -1;
 }
 
@@ -329,6 +323,16 @@ static int jint(struct json_object* o, const char* k, int def) {
 static double jdbl(struct json_object* o, const char* k, double def) {
   struct json_object* v;
   return (json_object_object_get_ex(o, k, &v)) ? json_object_get_double(v) : def;
+}
+
+/* Remplit une cible depuis un objet JSON {idx, shm, stats, ident_file}. Renvoie 0 si shm valide. */
+static int parse_target(struct json_object* j, struct target* t) {
+  t->idx = jint(j, "idx", 0);
+  snprintf(t->shm_path, sizeof(t->shm_path), "%s", jstr(j, "shm", ""));
+  snprintf(t->stats_path, sizeof(t->stats_path), "%s", jstr(j, "stats", ""));
+  const char* idf = jstr(j, "ident_file", "");
+  if (idf && *idf) { snprintf(t->ident_file, sizeof(t->ident_file), "%s", idf); t->has_ident = 1; }
+  return t->shm_path[0] ? 0 : -1;
 }
 
 static void usage(const char* p) {
@@ -393,20 +397,26 @@ int main(int argc, char** argv) {
       snprintf(s->mcast,sizeof(s->mcast),"%s",jstr(j,"mcast",""));
       s->udp_port=jint(j,"udp_port",0); s->payload_type=jint(j,"payload_type",96);
       s->ring=jint(j,"ring", s->kind==K_AUDIO?100:8); s->hdr=jint(j,"hdr",64);
-      snprintf(s->shm_path,sizeof(s->shm_path),"%s",jstr(j,"shm",""));
-      snprintf(s->stats_path,sizeof(s->stats_path),"%s",jstr(j,"stats",""));
       if (s->kind == K_VIDEO) {
         s->width=jint(j,"width",1920); s->height=jint(j,"height",1080);
         s->fps=jdbl(j,"fps",25.0); s->interlaced=jint(j,"interlaced",0);
         s->bit_depth=jint(j,"bit_depth",10);
-        const char* idf=jstr(j,"ident_file",""); if (idf && *idf) { snprintf(s->ident_file,sizeof(s->ident_file),"%s",idf); s->has_ident=1; }
       } else if (s->kind == K_AUDIO) {
         s->channels=jint(j,"channels",8);
       } else {
         fprintf(stderr,"mtl_rx: session data (2110-40) pas encore implémentée, ignorée\n");
         continue;   /* point d'extension : setup_data() à venir */
       }
-      if (!s->mcast[0] || !s->udp_port || !s->shm_path[0]) {
+      /* cibles : soit un tableau "targets" (fan-out même-source → N slots), soit "shm" (1 cible). */
+      struct json_object* tgs;
+      if (json_object_object_get_ex(j,"targets",&tgs) && json_object_is_type(tgs,json_type_array)) {
+        int nt = json_object_array_length(tgs);
+        for (int ti = 0; ti < nt && s->ntg < MAX_TG; ti++)
+          if (parse_target(json_object_array_get_idx(tgs, ti), &s->tg[s->ntg]) == 0) s->ntg++;
+      } else {
+        if (parse_target(j, &s->tg[0]) == 0) s->ntg = 1;   /* compat : shm/stats/ident_file inline */
+      }
+      if (!s->mcast[0] || !s->udp_port || s->ntg <= 0) {
         fprintf(stderr,"mtl_rx: session %d incomplète, ignorée\n",k); continue; }
       ns++;
     }
@@ -418,9 +428,10 @@ int main(int argc, char** argv) {
     snprintf(s->mcast,sizeof(s->mcast),"%s",l_mcast);
     s->udp_port=l_port; s->payload_type=l_pt; s->ring=l_ring; s->hdr=l_hdr;
     s->width=l_w; s->height=l_h; s->fps=l_fps; s->interlaced=l_inter; s->bit_depth=l_bd;
-    snprintf(s->shm_path,sizeof(s->shm_path),"%s",l_shm);
-    if (l_stats) snprintf(s->stats_path,sizeof(s->stats_path),"%s",l_stats);
-    if (l_ident) { snprintf(s->ident_file,sizeof(s->ident_file),"%s",l_ident); s->has_ident=1; }
+    struct target* t = &s->tg[0]; s->ntg = 1;
+    snprintf(t->shm_path,sizeof(t->shm_path),"%s",l_shm);
+    if (l_stats) snprintf(t->stats_path,sizeof(t->stats_path),"%s",l_stats);
+    if (l_ident) { snprintf(t->ident_file,sizeof(t->ident_file),"%s",l_ident); t->has_ident=1; }
     ns = 1;
   }
   if (ns <= 0) { fprintf(stderr,"mtl_rx: aucune session valide\n"); return 1; }
@@ -458,8 +469,8 @@ int main(int argc, char** argv) {
   }
   if (!up) { fprintf(stderr, "mtl_rx: aucune session démarrée\n"); mtl_uninit(st); return 1; }
 
-  /* ── boucle de stats par session ── */
-  uint64_t last[MAX_SESS]; memset(last, 0, sizeof(last));
+  /* ── boucle de stats par CIBLE (un fichier de stats par slot shm) ── */
+  static uint64_t last[MAX_SESS][MAX_TG]; memset(last, 0, sizeof(last));
   time_t last_t = time(NULL);
   while (!g_stop) {
     /* dort ~2s MAIS réactif au SIGTERM (sinon mtl_uninit tarde → le manager SIGKILL →
@@ -469,12 +480,16 @@ int main(int argc, char** argv) {
     time_t now = time(NULL); double dt = difftime(now, last_t); last_t = now;
     for (int k = 0; k < ns; k++) {
       struct sess* s = &S[k];
-      if (!s->started || !s->stats_path[0]) continue;
-      double rate = dt > 0 ? (double)(s->recv - last[k]) / dt : 0.0;
-      last[k] = s->recv;
-      FILE* sf = fopen(s->stats_path, "w");
-      if (sf) { fprintf(sf, "{\"fps\": %.1f, \"frame_index\": %llu}\n", rate,
-                        (unsigned long long)s->index); fclose(sf); }
+      if (!s->started) continue;
+      for (int ti = 0; ti < s->ntg; ti++) {
+        struct target* t = &s->tg[ti];
+        if (!t->stats_path[0]) continue;
+        double rate = dt > 0 ? (double)(t->recv - last[k][ti]) / dt : 0.0;
+        last[k][ti] = t->recv;
+        FILE* sf = fopen(t->stats_path, "w");
+        if (sf) { fprintf(sf, "{\"fps\": %.1f, \"frame_index\": %llu}\n", rate,
+                          (unsigned long long)t->index); fclose(sf); }
+      }
     }
   }
 
@@ -484,8 +499,11 @@ int main(int argc, char** argv) {
     pthread_join(S[k].thread, NULL);
     if (S[k].kind == K_AUDIO) { if (S[k].ah) st30p_rx_free(S[k].ah); }
     else                      { if (S[k].vh) st20p_rx_free(S[k].vh); }
-    if (S[k].shm_base && S[k].shm_base != MAP_FAILED) munmap(S[k].shm_base, S[k].shm_size);
-    if (S[k].ident_patch) free(S[k].ident_patch);
+    for (int ti = 0; ti < S[k].ntg; ti++) {
+      struct target* t = &S[k].tg[ti];
+      if (t->shm_base && t->shm_base != MAP_FAILED) munmap(t->shm_base, t->shm_size);
+      if (t->ident_patch) free(t->ident_patch);
+    }
   }
   mtl_uninit(st);
   return 0;

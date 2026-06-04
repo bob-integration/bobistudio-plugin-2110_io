@@ -1,8 +1,11 @@
 {
-  "version": "0.10.1",
+  "version": "0.11.0",
   "date": "2026-06-04",
   "changes": {
     "Nouveautés": [
+      "Fan-out interne MÊME SOURCE → plusieurs slots : quand plusieurs récepteurs s'abonnent à la MÊME source (mcast:port identiques), l'AF_XDP refuse 2 files RX sur le même 5-tuple (rx_flow_create : socket add flow fail). On détecte le partage côté contrôleur (groupage des slots actifs par (mcast,port)) → UNE session MTL (un seul flow RX) décode la source UNE fois, et mtl_rx RECOPIE la frame décodée dans le shm de chaque slot (struct target[] : ring/index/IDENT propres par cible). Chaque slot reste un récepteur NMOS indépendant (GÉN/IDENT/monitoring propres) en partageant un unique décodage. Cas « 2 sources différentes » inchangé (2 sessions = 2 flows). Fan-out câblé aussi pour l'audio st30 (prêt pour la Phase B). Validé : 1 flow, 2 shm écrits en lockstep."
+    ],
+    "Nouveautés (0.10.1)": [
       "Robustesse multi-session : manager avec BACKOFF (plus de crash-loop/hammer si mtl_rx échoue) + arrêt GRACIEUX de mtl_rx (_kill_mtl : SIGTERM + attente du mtl_uninit → XDP détaché proprement, jamais de SIGKILL prématuré qui fait fuir le XDP et bloque MtlManager). mtl_rx : boucle de stats réactive au SIGTERM."
     ],
     "Nouveautés (0.10.0)": [
