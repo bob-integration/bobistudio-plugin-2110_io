@@ -3,8 +3,7 @@
   "date": "2026-06-04",
   "changes": {
     "Nouveautés": [
-      "mtl_rx MULTI-SESSION (Phase A, vidéo) : un seul mtl_init (un PF) héberge N sessions décrites par un config JSON (--config). Débloque video_count>1 (plusieurs vidéos par port). Architecture agnostique à l'essence (point d'extension audio st30 + data 2110-40 prêts). Contrôleur réécrit en gestionnaire de sessions central : écrit le config + (re)lance UN mtl_rx au changement d'ensemble actif ; simu par slot pour les slots inactifs. Compat : args legacy = 1 session vidéo.",
-      "Plus AUCUNE résolution figée : deploy_defaults ne porte plus width/height/fps/chroma. Le format de placeholder/simu + le deploy_config initial SUIVENT le réglage video_format_default (résolu depuis video_formats : w/h/fps/scan/chroma/bit_depth/colorimétrie). La réception réelle reste pilotée par le SDP. Côté orchestrateur (pas de rebuild image)."
+      "Robustesse multi-session : manager avec BACKOFF (plus de crash-loop/hammer si mtl_rx échoue) + arrêt GRACIEUX de mtl_rx (_kill_mtl : SIGTERM + attente du mtl_uninit → XDP détaché proprement, jamais de SIGKILL prématuré qui fait fuir le XDP et bloque MtlManager). mtl_rx : boucle de stats réactive au SIGTERM."
     ],
     "Nouveautés (0.10.0)": [
       "mtl_rx MULTI-SESSION (Phase A, vidéo) : un seul mtl_init (un PF) héberge N sessions décrites par un config JSON (--config). Débloque video_count>1 (plusieurs vidéos par port). Architecture agnostique à l'essence (point d'extension audio st30 + data 2110-40 prêts). Contrôleur réécrit en gestionnaire de sessions central : écrit le config + (re)lance UN mtl_rx au changement d'ensemble actif ; simu par slot pour les slots inactifs. Compat : args legacy = 1 session vidéo.",
