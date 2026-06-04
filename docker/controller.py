@@ -319,26 +319,26 @@ def _parse_sdp(path):
     return info
 
 
-def _launch_mtl_rx(idx, info):
-    shm = "/dev/shm/{}_{}".format(HOSTNAME, idx)
-    stats = "/tmp/mtl_rx_{}.json".format(idx)
-    try:
-        os.remove(stats)
-    except OSError:
-        pass
-    args = [MTL_RX, "--pmd", "af_xdp", "--iface", IFACE,
-            "--mcast", info["mcast"], "--udp_port", str(info["port"]),
-            "--payload_type", str(info["pt"]),
-            "--width", str(info["width"]), "--height", str(info["height"]),
-            "--fps", str(info["fps"]),
-            "--shm", shm, "--ring", str(V_RING), "--hdr", str(HDR),
-            "--bit_depth", str(BIT_DEPTH),   # conforme au pipeline MXL (force8 → 8)
-            "--ident_file", _ident_file(idx),  # incrustation IDENT live (Partie B)
-            "--lcores", LCORES, "--stats_file", stats]
-    if info.get("interlaced"):
-        args.append("--interlaced")
-    print("mtl_rx launch idx={}: {}".format(idx, " ".join(args)), flush=True)
-    return subprocess.Popen(args), stats
+# ─── Gestionnaire de sessions central ───────────────────────────────
+# UN SEUL mtl_rx multi-session (un mtl_init = un PF) sert TOUTES les sessions actives. Le manager
+# recalcule l'ensemble actif (slots avec SDP, pas GÉN) et (re)lance mtl_rx avec un config JSON
+# quand cet ensemble change. Les slots inactifs sont écrits en simu par leur _simu_loop.
+_CONFIG_PATH = "/tmp/mtl_config.json"
+_mtl_proc = None
+_mtl_lock = threading.Lock()
+_cur_sig = None
+_live = [False] * N_VIDEO     # slot vidéo idx actuellement servi par mtl_rx ?
+
+
+def _video_session(idx, info):
+    return {"kind": "video", "idx": idx,
+            "mcast": info["mcast"], "udp_port": info["port"], "payload_type": info["pt"],
+            "width": info["width"], "height": info["height"], "fps": info["fps"],
+            "interlaced": bool(info.get("interlaced")), "bit_depth": BIT_DEPTH,
+            "ring": V_RING, "hdr": HDR,
+            "shm": "/dev/shm/{}_{}".format(HOSTNAME, idx),
+            "stats": "/tmp/mtl_v{}.json".format(idx),
+            "ident_file": _ident_file(idx)}
 
 
 # ─── Simulation (mire numpy, mêmes en-têtes shm) — fallback sans SDP ou GÉN forcé ──
@@ -373,96 +373,97 @@ def _read_stats(stats_path):
         return None
 
 
-_procs = {}  # idx → Popen (pour le teardown SIGTERM)
-
-
-def video_slot(idx):
-    """Bascule SIMU ↔ mtl_rx selon la présence d'un SDP NMOS. Un seul producteur du shm à la fois."""
-    shm_path = "/dev/shm/{}_{}".format(HOSTNAME, idx)
-    sdp_path = "{}/nmos_recv_v_{}.sdp".format(SDP_DIR, idx)
-    proc = None
-    stats = None
-    cur_key = None
-    sim_mm = None
-    sim_res = None
-    fi = 0
-    prev_mode = None
+def _manager_loop():
+    """Recalcule l'ensemble des sessions vidéo ACTIVES (SDP présent, pas GÉN) et (re)lance UN
+    mtl_rx (config JSON) quand l'ensemble change. Met à jour la résolution par slot + _live."""
+    global _mtl_proc, _cur_sig
     while True:
-        gen = _ctl[idx]["gen"]   # GÉN forcé → mire locale même si un SDP est actif
-        # On parse TOUJOURS le SDP pour connaître la RÉSOLUTION LIVE (même sous GÉN) → la simu
-        # garde la même taille de shm que mtl_rx ⇒ pas de casse côté consommateurs au basculement.
-        sdp = _parse_sdp(sdp_path) if os.path.exists(sdp_path) else None
-        cur_w, cur_h = (sdp["width"], sdp["height"]) if sdp else (WIDTH, HEIGHT)
-        if _slot_res[idx] != [cur_w, cur_h]:
-            _slot_res[idx] = [cur_w, cur_h]
-            _update_ident(idx)               # la taille IDENT suit la résolution
-        info = None if gen else sdp
-        if info:
-            key = (info["mcast"], info["port"], info["pt"], info["width"],
-                   info["height"], info["fps"], info["interlaced"])
-            if key != cur_key or (proc and proc.poll() is not None):
-                if sim_mm is not None:
-                    sim_mm.close(); sim_mm = None; sim_res = None
-                if proc:
-                    proc.terminate()
-                    try: proc.wait(timeout=3)
-                    except Exception: proc.kill()
-                proc, stats = _launch_mtl_rx(idx, info)
-                _procs[idx] = proc
-                cur_key = key
-            _ctl[idx]["info"] = info
-            if prev_mode != "mtl":
-                _update_ident(idx); prev_mode = "mtl"
-            st = _read_stats(stats) if stats else None
+        sessions = []
+        for idx in range(N_VIDEO):
+            sdp_path = "{}/nmos_recv_v_{}.sdp".format(SDP_DIR, idx)
+            sdp = _parse_sdp(sdp_path) if os.path.exists(sdp_path) else None
+            cur = [sdp["width"], sdp["height"]] if sdp else [WIDTH, HEIGHT]
+            if _slot_res[idx] != cur:
+                _slot_res[idx] = cur; _update_ident(idx)   # la taille IDENT suit la résolution
+            _ctl[idx]["info"] = sdp
+            if sdp and not _ctl[idx]["gen"]:                # GÉN forcé → reste en simu
+                sessions.append(_video_session(idx, sdp))
+        sig = json.dumps(sessions, sort_keys=True)
+        dead = (_mtl_proc is not None and _mtl_proc.poll() is not None)
+        if dead:
+            print("mtl_rx mort — relance", flush=True)
+        if sig != _cur_sig or dead:
+            active = set(s["idx"] for s in sessions)
+            for idx in range(N_VIDEO):
+                _live[idx] = idx in active
+            with _mtl_lock:
+                if _mtl_proc:
+                    _mtl_proc.terminate()
+                    try: _mtl_proc.wait(timeout=3)
+                    except Exception: _mtl_proc.kill()
+                    _mtl_proc = None
+                if sessions:
+                    with open(_CONFIG_PATH, "w") as f:
+                        json.dump({"pmd": "af_xdp", "iface": IFACE, "lcores": LCORES,
+                                   "sessions": sessions}, f)
+                    print("mtl_rx (re)lance : {} session(s) active(s)".format(len(sessions)), flush=True)
+                    _mtl_proc = subprocess.Popen([MTL_RX, "--config", _CONFIG_PATH])
+            _cur_sig = sig
+        time.sleep(0.5)
+
+
+def _simu_loop(idx):
+    """Écrit la mire de simu dans le shm du slot TANT QU'IL N'EST PAS servi par mtl_rx (_live).
+    Quand le slot est live, mtl_rx possède le shm ; on ne fait que relayer ses stats sur :8080."""
+    shm_path = "/dev/shm/{}_{}".format(HOSTNAME, idx)
+    sim_mm = None; sim_res = None; fi = 0
+    while True:
+        if _live[idx]:
+            if sim_mm is not None:
+                sim_mm.close(); sim_mm = None; sim_res = None
+            st = _read_stats("/tmp/mtl_v{}.json".format(idx))
             with metrics_lock:
                 metrics[idx]["mode"] = "mtl"
                 if st:
-                    metrics[idx]["fps"] = st[0]
-                    metrics[idx]["frame_index"] = st[1]
-            time.sleep(1.0)
-        else:
-            if proc:
-                proc.terminate()
-                try: proc.wait(timeout=3)
-                except Exception: proc.kill()
-                proc = None; cur_key = None; _procs.pop(idx, None)
-            lay = _layout(cur_w, cur_h)
-            # (Ré)ouvre le shm à la RÉSOLUTION COURANTE (même taille que mtl_rx → pas de resize
-            # visible par les consommateurs ; un resize n'arrive que si la source change de res).
-            if sim_mm is None or sim_res != (cur_w, cur_h):
-                if sim_mm is not None:
-                    sim_mm.close()
-                sim_mm = _open_shm(shm_path, lay["total"]); sim_res = (cur_w, cur_h)
-            _ctl[idx]["info"] = sdp if gen else None
-            if prev_mode != "simu":
-                _update_ident(idx); prev_mode = "simu"
-            _simu_frame(sim_mm, fi, idx, lay)
-            fi += 1
-            if fi % 25 == 0:
-                with metrics_lock:
-                    metrics[idx]["mode"] = "simu"
-                    metrics[idx]["fps"] = 25.0
-                    metrics[idx]["frame_index"] = fi
-            time.sleep(1.0 / 25)
+                    metrics[idx]["fps"] = st[0]; metrics[idx]["frame_index"] = st[1]
+            time.sleep(0.5)
+            continue
+        w, h = _slot_res[idx]
+        lay = _layout(w, h)
+        # même taille de shm que mtl_rx (résolution live) → pas de resize visible au basculement.
+        if sim_mm is None or sim_res != (w, h):
+            if sim_mm is not None: sim_mm.close()
+            sim_mm = _open_shm(shm_path, lay["total"]); sim_res = (w, h)
+        _simu_frame(sim_mm, fi, idx, lay)
+        fi += 1
+        if fi % 25 == 0:
+            with metrics_lock:
+                metrics[idx]["mode"] = "simu"; metrics[idx]["fps"] = 25.0; metrics[idx]["frame_index"] = fi
+        time.sleep(1.0 / 25)
 
 
 def _cleanup(*a):
-    # Teardown gracieux : terminer les mtl_rx enfants. (Le détachement XDP est garanti côté
-    # orchestrateur par `ip link set <iface> xdp off` — MtlManager n'a pas le temps de le faire.)
-    for p in list(_procs.values()):
-        try: p.terminate()
-        except Exception: pass
+    # Teardown gracieux : terminer l'unique mtl_rx multi-session. (Le détachement XDP est garanti
+    # côté orchestrateur par `ip link set <iface> xdp off` — MtlManager n'a pas le temps.)
+    global _mtl_proc
+    with _mtl_lock:
+        if _mtl_proc:
+            try: _mtl_proc.terminate()
+            except Exception: pass
     raise SystemExit(0)
 
 
 signal.signal(signal.SIGTERM, _cleanup)
 signal.signal(signal.SIGINT, _cleanup)
 
+# Un thread de simu par slot vidéo (écrit le shm quand le slot n'est pas servi par mtl_rx) +
+# UN manager central qui pilote l'unique mtl_rx multi-session.
 for _i in range(N_VIDEO):
-    threading.Thread(target=video_slot, args=(_i,), daemon=True).start()
+    threading.Thread(target=_simu_loop, args=(_i,), daemon=True).start()
+threading.Thread(target=_manager_loop, daemon=True).start()
 
-print("receiver_2110_mtl (docker/af_xdp) : {}v iface={} lcores={} ring={} mtl_rx={}".format(
-    N_VIDEO, IFACE, LCORES, V_RING, MTL_RX), flush=True)
+print("receiver_2110_mtl (docker/af_xdp) multi-session : {}v iface={} lcores={} ring={}".format(
+    N_VIDEO, IFACE, LCORES, V_RING), flush=True)
 
 while True:
     time.sleep(3600)

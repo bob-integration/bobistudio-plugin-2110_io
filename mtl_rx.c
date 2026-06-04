@@ -3,18 +3,18 @@
 // Auteur : Cyril Mazouer, pour le compte de BOBI SAS
 // Distribué sous licence GNU GPL v3 (ou ultérieure) ; voir le fichier LICENSE.
 //
-// mtl_rx — receiver ST 2110-20 via Media Transport Library (libmtl/DPDK), écriture
-// ZÉRO-COPIE dans le ring shared memory de Bobi.Studio.
+// mtl_rx — receiver ST 2110 MULTI-SESSION via Media Transport Library (libmtl/DPDK).
 //
-// Modèle : app/sample/ext_frame/rx_st20_pipeline_dyn_ext_frame_sample.c de MTL, mais les
-// buffers d'external frames pointent directement sur les slots du ring /dev/shm (DMA mlx5
-// → shm, aucune copie). À chaque frame complète : on écrit le header (frame_index, time_ns)
-// au début du shm — MÊME layout que receiver_2110 (header 64o : [u64 frame_index][u64 ns],
-// puis ring de `ring` frames de `framesize`, à partir de l'offset `hdr`).
+// UN SEUL mtl_init (un PF = un MtlManager/XDP) héberge N sessions de tout type sur la même carte :
+//   - VIDEO (st20p, ST 2110-20) → ring /dev/shm/{hn}_{idx} (YUV422 planar, conv 10→8, overlay IDENT)
+//   - AUDIO (st30p, ST 2110-30) → ring /dev/shm/{hn}_audio_{idx} (chunks 1ms, L24 8ch, BIG-ENDIAN
+//     wire-native : on écrit le payload TEL QUEL, zéro conversion — le pipeline MXL audio est en BE)
+//   - DATA  (st40, ST 2110-40 ANC) → point d'extension prêt (non implémenté : pas de consommateur).
 //
-// Le scoping NIC (VF mlx5 dans le netns + RDMA exclusive), les hugepages, le cpuset/lcores
-// et le sizing sont fournis par l'orchestrateur (cf. plugin script.py / deploy). Ici on ne
-// fait que la RX MTL → shm.
+// Les sessions sont décrites par un fichier de config JSON (--config), écrit par le contrôleur.
+// Compat : sans --config, les args legacy construisent 1 session vidéo (tests manuels).
+//
+// Layout shm identique à receiver_2110 : header 64o [u64 index][u64 ns] puis ring de slots.
 
 #include <arpa/inet.h>
 #include <errno.h>
@@ -29,52 +29,20 @@
 #include <string.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
-#include <sys/stat.h>
 #include <time.h>
 #include <unistd.h>
 
 #include <mtl/st_pipeline_api.h>
+#include <mtl/st30_pipeline_api.h>
+#include <json-c/json.h>
 
-#define MAX_FB 64
+#define MAX_FB    64
+#define MAX_SESS  16
+
+enum sess_kind { K_VIDEO, K_AUDIO, K_DATA };   /* DATA = ST 2110-40, prêt mais non implémenté */
 
 static volatile int g_stop = 0;
 static void on_signal(int s) { (void)s; g_stop = 1; }
-
-struct rx_ctx {
-  mtl_handle st;
-  st20p_rx_handle handle;
-  /* shm */
-  uint8_t* shm_base;      /* début du mapping (header à l'offset 0) */
-  size_t   shm_size;
-  uint8_t* frames_base;   /* shm_base + hdr (début du 1er slot) */
-  size_t   framesize;     /* taille d'un slot SHM (8 bits si conv8, sinon = src_framesize) */
-  size_t   src_framesize; /* taille de la frame MTL reçue (planar 10 bits) */
-  int      conv8;         /* 1 = convertir 10→8 bits à la copie (libmtl n'a pas ce converter) */
-  int      ring;
-  int      hdr;
-  /* external frames pré-calculées (un par slot du ring) */
-  struct {
-    void*       addr;
-    mtl_iova_t  iova;
-    size_t      len;
-  } fb[MAX_FB];
-  int ext_idx;            /* prochain slot fourni à MTL (round-robin) */
-  int copy_mode;          /* 1 = frames internes MTL + memcpy → shm (PMD noyau af_xdp/kernel) */
-  int plane_h;            /* hauteur des plans dans le buffer (champ si entrelacé) */
-  enum st_frame_fmt out_fmt; /* format de la frame externe (sortie planar) */
-  int width, height;      /* géométrie de la frame (pour l'incrustation IDENT) */
-  int bit_depth;          /* profondeur du plan SHM (8|10|12) — pour le décalage de l'overlay */
-  /* IDENT (incrustation 3 lignes, rendue par le contrôleur dans un fichier, lue ici) */
-  const char* ident_file; /* fichier patch [u32 bw][u32 bh][bh*bw octets Y8], ou NULL */
-  uint8_t* ident_patch;   /* patch Y 8 bits chargé (bh*bw), ou NULL */
-  int id_bw, id_bh;       /* dims du patch */
-  long id_mtime;          /* mtime du fichier au dernier chargement (recharge si change) */
-  mtl_iova_t frames_iova; /* iova du début de la zone frames (dma_map) */
-  /* compteurs */
-  uint64_t frame_index;
-  uint64_t frames_recv;
-  pthread_t thread;
-};
 
 static uint64_t now_ns(void) {
   struct timespec ts;
@@ -82,58 +50,76 @@ static uint64_t now_ns(void) {
   return (uint64_t)ts.tv_sec * 1000000000ULL + ts.tv_nsec;
 }
 
-/* écrit l'en-tête du shm : [u64 frame_index][u64 time_ns] (little-endian natif x86) */
-static void write_shm_header(struct rx_ctx* c, uint64_t fi) {
-  uint64_t* h = (uint64_t*)c->shm_base;
-  h[0] = fi;
-  h[1] = now_ns();
+/* Une session = une essence sur le mtl_handle partagé. Champs communs + spécifiques par type. */
+struct sess {
+  enum sess_kind kind;
+  mtl_handle st;            /* partagé (mtl_init unique) */
+  char portname[MTL_PORT_MAX_LEN];
+  /* réseau */
+  char mcast[64];
+  int  udp_port, payload_type;
+  /* shm */
+  uint8_t* shm_base; size_t shm_size; uint8_t* frames_base;
+  size_t   slotsize;       /* vidéo: framesize ; audio: 1152 (1 chunk 1ms) */
+  int      ring, hdr;
+  char     shm_path[300], stats_path[300];
+  uint64_t index;          /* frame_index (vidéo) / chunk_index (audio) */
+  uint64_t recv;           /* compteur reçu (pour le débit) */
+  pthread_t thread; int started;
+  int      copy_mode;      /* vidéo: 1=memcpy (af_xdp) ; audio: toujours 1 */
+  /* ── vidéo ── */
+  st20p_rx_handle vh;
+  int      width, height, bit_depth, interlaced; double fps;
+  size_t   src_framesize; int conv8;
+  enum st_frame_fmt out_fmt; int plane_h;
+  struct { void* addr; mtl_iova_t iova; size_t len; } fb[MAX_FB];
+  int      ext_idx; mtl_iova_t frames_iova;
+  char     ident_file[300]; int has_ident;
+  uint8_t* ident_patch; int id_bw, id_bh; long id_mtime;
+  /* ── audio ── */
+  st30p_rx_handle ah;
+  int      channels;
+};
+
+static void write_shm_header(struct sess* s, uint64_t i) {
+  uint64_t* h = (uint64_t*)s->shm_base;
+  h[0] = i; h[1] = now_ns();
 }
 
-/* MTL nous demande où écrire la prochaine frame entrante → on lui donne un slot du ring */
+/* ═══ VIDÉO ═══════════════════════════════════════════════════════════════════ */
+
 static int query_ext_frame(void* priv, struct st_ext_frame* ext_frame,
                            struct st20_rx_frame_meta* meta) {
-  struct rx_ctx* c = priv;
-  int i = c->ext_idx;
-  /* La frame externe est le buffer de SORTIE (planar), pas le transport packé →
-   * calculer les plans selon le format de sortie. */
-  enum st_frame_fmt fmt = c->out_fmt;
+  struct sess* s = priv;
+  int i = s->ext_idx;
+  enum st_frame_fmt fmt = s->out_fmt;
   uint8_t planes = st_frame_fmt_planes(fmt);
-  uint8_t* addr = (uint8_t*)c->fb[i].addr;
-  /* Hauteur de plan = hauteur de CHAMP si entrelacé (le buffer ext = 1 champ, cf.
-   * st_frame_size(interlaced) = taille d'un champ). meta->width donne la largeur. */
-  uint32_t ph = c->plane_h ? (uint32_t)c->plane_h : meta->height;
-
-  ext_frame->size = c->fb[i].len;
+  uint8_t* addr = (uint8_t*)s->fb[i].addr;
+  uint32_t ph = s->plane_h ? (uint32_t)s->plane_h : meta->height;
+  ext_frame->size = s->fb[i].len;
   for (int pl = 0; pl < planes; pl++) {
     ext_frame->linesize[pl] = st_frame_least_linesize(fmt, meta->width, pl);
     ext_frame->addr[pl] = addr;
-    if (pl == 0)
-      ext_frame->iova[0] = c->fb[i].iova;
-    else
-      ext_frame->iova[pl] = ext_frame->iova[pl - 1] + ext_frame->linesize[pl - 1] * ph;
+    if (pl == 0) ext_frame->iova[0] = s->fb[i].iova;
+    else ext_frame->iova[pl] = ext_frame->iova[pl - 1] + ext_frame->linesize[pl - 1] * ph;
     addr += ext_frame->linesize[pl] * ph;
   }
-  if (++c->ext_idx >= c->ring) c->ext_idx = 0;
+  if (++s->ext_idx >= s->ring) s->ext_idx = 0;
   return 0;
 }
 
-static int frame_available(void* priv) {
-  (void)priv;
-  return 0;
-}
+static int frame_available(void* priv) { (void)priv; return 0; }
 
-/* IDENT : recharge le patch depuis le fichier (écrit par le contrôleur) si son mtime a changé.
- * Coût quasi nul tant qu'IDENT off (un stat() par frame sur un fichier absent). */
-static void load_ident_patch(struct rx_ctx* c) {
-  if (!c->ident_file) return;
+/* IDENT : recharge le patch (fichier écrit par le contrôleur) si mtime change. Coût ~nul si off. */
+static void load_ident_patch(struct sess* s) {
+  if (!s->has_ident) return;
   struct stat st;
-  if (stat(c->ident_file, &st) != 0) {       /* absent → IDENT off */
-    if (c->ident_patch) { free(c->ident_patch); c->ident_patch = NULL; }
-    c->id_bw = c->id_bh = 0; c->id_mtime = 0;
-    return;
+  if (stat(s->ident_file, &st) != 0) {
+    if (s->ident_patch) { free(s->ident_patch); s->ident_patch = NULL; }
+    s->id_bw = s->id_bh = 0; s->id_mtime = 0; return;
   }
-  if ((long)st.st_mtime == c->id_mtime && c->ident_patch) return;   /* inchangé */
-  FILE* f = fopen(c->ident_file, "rb");
+  if ((long)st.st_mtime == s->id_mtime && s->ident_patch) return;
+  FILE* f = fopen(s->ident_file, "rb");
   if (!f) return;
   uint32_t hdr[2];
   if (fread(hdr, sizeof(uint32_t), 2, f) != 2) { fclose(f); return; }
@@ -144,29 +130,27 @@ static void load_ident_patch(struct rx_ctx* c) {
   if (!p) { fclose(f); return; }
   if (fread(p, 1, n, f) != n) { free(p); fclose(f); return; }
   fclose(f);
-  if (c->ident_patch) free(c->ident_patch);
-  c->ident_patch = p; c->id_bw = bw; c->id_bh = bh; c->id_mtime = (long)st.st_mtime;
+  if (s->ident_patch) free(s->ident_patch);
+  s->ident_patch = p; s->id_bw = bw; s->id_bh = bh; s->id_mtime = (long)st.st_mtime;
 }
 
-/* Incruste le patch IDENT (Y + chroma neutre) dans le rectangle haut-droit du slot SHM `dst`.
- * 422 ; gère 8/10/12 bits (décalage du patch Y 8 bits + neutre chroma à la profondeur). */
-static void overlay_ident(struct rx_ctx* c, uint8_t* dst) {
-  if (!c->ident_patch || c->id_bw <= 0) return;
-  int W = c->width, H = c->height, bw = c->id_bw, bh = c->id_bh;
+static void overlay_ident(struct sess* s, uint8_t* dst) {
+  if (!s->ident_patch || s->id_bw <= 0) return;
+  int W = s->width, H = s->height, bw = s->id_bw, bh = s->id_bh;
   if (bw > W || bh > H) return;
   int x0 = W - bw - 8, y0 = 8;
   x0 -= x0 & 1; y0 -= y0 & 1; if (x0 < 0) x0 = 0;
-  int deep = (c->bit_depth >= 10), shift = c->bit_depth - 8;
+  int deep = (s->bit_depth >= 10), shift = s->bit_depth - 8;
   size_t ysz = (size_t)W * H, uvsz = (size_t)(W / 2) * H;
   int bps = deep ? 2 : 1;
   for (int r = 0; r < bh; r++) {
-    const uint8_t* s = c->ident_patch + (size_t)r * bw;
+    const uint8_t* p = s->ident_patch + (size_t)r * bw;
     if (deep) { uint16_t* y = (uint16_t*)dst + (size_t)(y0 + r) * W + x0;
-                for (int x = 0; x < bw; x++) y[x] = (uint16_t)s[x] << shift; }
+                for (int x = 0; x < bw; x++) y[x] = (uint16_t)p[x] << shift; }
     else      { uint8_t*  y = dst + (size_t)(y0 + r) * W + x0;
-                for (int x = 0; x < bw; x++) y[x] = s[x]; }
+                for (int x = 0; x < bw; x++) y[x] = p[x]; }
   }
-  int neutral = 1 << (c->bit_depth - 1);
+  int neutral = 1 << (s->bit_depth - 1);
   int ux0 = x0 / 2, ubw = bw / 2;
   uint8_t* uplane = dst + ysz * bps;
   uint8_t* vplane = uplane + uvsz * bps;
@@ -181,54 +165,64 @@ static void overlay_ident(struct rx_ctx* c, uint8_t* dst) {
   }
 }
 
-/* thread RX : récupère les frames complètes (déjà dans le shm) et publie l'en-tête */
-static void* rx_thread(void* arg) {
-  struct rx_ctx* c = arg;
+static void* video_rx_thread(void* arg) {
+  struct sess* s = arg;
   while (!g_stop) {
-    struct st_frame* frame = st20p_rx_get_frame(c->handle);
-    if (!frame) {
-      usleep(1000);
-      continue;
-    }
-    if (!frame->addr[0]) { st20p_rx_put_frame(c->handle, frame); continue; }
-    uint64_t fi = c->frame_index;
-    if (c->copy_mode) {
-      /* PMD noyau : la frame est dans un buffer interne MTL → on la COPIE dans le slot
-       * du ring (frame_index % ring). Le buffer planar de sortie est contigu (Y|U|V),
-       * de taille framesize. */
-      long slot = fi % c->ring;
-      uint8_t* dst = c->frames_base + (size_t)slot * c->framesize;
-      if (c->conv8) {
-        /* planar 10 bits LE → 8 bits : v8 = v10 >> 2, par échantillon (Y|U|V contigus).
-         * nb d'échantillons = framesize (octets dst) = src_framesize/2. */
-        const uint16_t* s = (const uint16_t*)frame->addr[0];
-        size_t n = c->framesize;
-        for (size_t k = 0; k < n; k++) dst[k] = (uint8_t)(s[k] >> 2);
+    struct st_frame* frame = st20p_rx_get_frame(s->vh);
+    if (!frame) { usleep(1000); continue; }
+    if (!frame->addr[0]) { st20p_rx_put_frame(s->vh, frame); continue; }
+    uint64_t fi = s->index;
+    if (s->copy_mode) {
+      long slot = fi % s->ring;
+      uint8_t* dst = s->frames_base + (size_t)slot * s->slotsize;
+      if (s->conv8) {
+        const uint16_t* src = (const uint16_t*)frame->addr[0];
+        size_t n = s->slotsize;
+        for (size_t k = 0; k < n; k++) dst[k] = (uint8_t)(src[k] >> 2);
       } else {
-        memcpy(dst, frame->addr[0], c->framesize);
+        memcpy(dst, frame->addr[0], s->slotsize);
       }
     } else {
-      /* DPDK ext-frame : la frame est DÉJÀ dans un slot du ring (zéro-copie). On aligne
-       * frame_index sur le slot réel (déduit de l'adresse) pour les consommateurs. */
       uint8_t* a = (uint8_t*)frame->addr[0];
-      long slot = (a >= c->frames_base && a < c->frames_base + (size_t)c->ring * c->framesize)
-                  ? (a - c->frames_base) / (long)c->framesize
-                  : (long)(fi % c->ring); /* garde-fou */
-      if (slot < 0 || slot >= c->ring) slot = fi % c->ring;
-      if ((fi % c->ring) != (uint64_t)slot)
-        fi += ((uint64_t)slot - (fi % c->ring) + c->ring) % c->ring;
+      long slot = (a >= s->frames_base && a < s->frames_base + (size_t)s->ring * s->slotsize)
+                  ? (a - s->frames_base) / (long)s->slotsize : (long)(fi % s->ring);
+      if (slot < 0 || slot >= s->ring) slot = fi % s->ring;
+      if ((fi % s->ring) != (uint64_t)slot)
+        fi += ((uint64_t)slot - (fi % s->ring) + s->ring) % s->ring;
     }
-    if (c->ident_file) {            /* IDENT live : recharge si changé + incruste sur le slot */
-      load_ident_patch(c);
-      overlay_ident(c, c->frames_base + (size_t)(fi % c->ring) * c->framesize);
+    if (s->has_ident) {
+      load_ident_patch(s);
+      overlay_ident(s, s->frames_base + (size_t)(fi % s->ring) * s->slotsize);
     }
-    write_shm_header(c, fi);
-    c->frame_index = fi + 1;
-    c->frames_recv++;
-    st20p_rx_put_frame(c->handle, frame);
+    write_shm_header(s, fi);
+    s->index = fi + 1; s->recv++;
+    st20p_rx_put_frame(s->vh, frame);
   }
   return NULL;
 }
+
+/* ═══ AUDIO ═══════════════════════════════════════════════════════════════════ */
+/* st30p délivre le payload L24 du fil = BIG-ENDIAN. Le pipeline MXL audio est désormais en BE
+ * (wire-native) → on écrit le chunk TEL QUEL dans le ring, ZÉRO conversion (passthrough). */
+static void* audio_rx_thread(void* arg) {
+  struct sess* s = arg;
+  while (!g_stop) {
+    struct st30_frame* frame = st30p_rx_get_frame(s->ah);
+    if (!frame) { usleep(500); continue; }
+    uint64_t ci = s->index;
+    long slot = ci % s->ring;
+    uint8_t* dst = s->frames_base + (size_t)slot * s->slotsize;   /* slotsize = 1152 */
+    size_t n = frame->data_size < s->slotsize ? frame->data_size : s->slotsize;
+    memcpy(dst, frame->addr, n);
+    if (n < s->slotsize) memset(dst + n, 0, s->slotsize - n);
+    write_shm_header(s, ci);
+    s->index = ci + 1; s->recv++;
+    st30p_rx_put_frame(s->ah, frame);
+  }
+  return NULL;
+}
+
+/* ═══ communs ═════════════════════════════════════════════════════════════════ */
 
 static enum st_fps to_st_fps(double f) {
   if (fabs(f - 23.98) < 0.05) return ST_FPS_P23_98;
@@ -244,199 +238,252 @@ static enum st_fps to_st_fps(double f) {
   return ST_FPS_P25;
 }
 
-static void usage(const char* p) {
-  fprintf(stderr,
-    "usage: %s [--pmd dpdk|kernel|af_xdp] (--pci <BDF> | --iface <name>) --sip <ip>\n"
-    "          --mcast <ip> --udp_port <p> --payload_type <pt> --width W --height H --fps F\n"
-    "          [--interlaced] --shm </dev/shm/x> --ring N --hdr 64 --lcores a,b,c [--stats_file /path]\n"
-    "  pmd dpdk (défaut) : DPDK user, --pci BDF, zéro-copie ext-frame.\n"
-    "  pmd kernel|af_xdp : NIC sur driver noyau (IGMP par le noyau), --iface <netdev>, copie.\n", p);
+/* mmap (création + ftruncate) du shm de la session, header à l'offset 0. */
+static int open_shm(struct sess* s) {
+  size_t raw = (size_t)s->hdr + (size_t)s->ring * s->slotsize;
+  size_t pg = (size_t)sysconf(_SC_PAGESIZE);
+  s->shm_size = (raw + pg - 1) & ~(pg - 1);
+  int fd = open(s->shm_path, O_CREAT | O_RDWR, 0666);
+  if (fd < 0) { perror("open shm"); return -1; }
+  if (ftruncate(fd, s->shm_size) < 0) { perror("ftruncate"); close(fd); return -1; }
+  s->shm_base = mmap(NULL, s->shm_size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+  close(fd);
+  if (s->shm_base == MAP_FAILED) { perror("mmap"); return -1; }
+  s->frames_base = s->shm_base + s->hdr;
+  return 0;
 }
 
-int main(int argc, char** argv) {
-  const char *pci = NULL, *sip = NULL, *mcast = NULL, *shm_path = NULL,
-             *lcores = NULL, *stats_file = NULL, *pmd_s = "dpdk", *iface = NULL,
-             *ident_file = NULL;
-  int udp_port = 0, payload_type = 96, width = 1920, height = 1080, ring = 10, hdr = 64;
-  int interlaced = 0;
-  int bit_depth = 10;   /* profondeur du plan de SORTIE (8|10|12) — conforme au pipeline MXL */
-  double fps = 25.0;
+static int setup_video(struct sess* s) {
+  s->copy_mode = 1;   /* af_xdp/kernel uniquement dans ce contexte */
+  s->out_fmt = ST_FRAME_FMT_YUV422PLANAR10LE;   /* converter présent ; conv 10→8 nous-mêmes */
+  s->conv8 = (s->bit_depth == 8);
+  s->plane_h = s->interlaced ? s->height / 2 : s->height;
+  if (s->ring > 8) s->ring = 8; if (s->ring < 2) s->ring = 2; if (s->ring > MAX_FB) s->ring = MAX_FB;
 
-  static struct option opts[] = {
-    {"pci", 1, 0, 'p'}, {"sip", 1, 0, 's'}, {"mcast", 1, 0, 'm'},
-    {"udp_port", 1, 0, 'u'}, {"payload_type", 1, 0, 't'}, {"width", 1, 0, 'W'},
-    {"height", 1, 0, 'H'}, {"fps", 1, 0, 'F'}, {"interlaced", 0, 0, 'i'},
-    {"shm", 1, 0, 'S'}, {"ring", 1, 0, 'R'}, {"hdr", 1, 0, 'D'},
-    {"lcores", 1, 0, 'l'}, {"stats_file", 1, 0, 'f'},
-    {"pmd", 1, 0, 'M'}, {"iface", 1, 0, 'N'}, {"bit_depth", 1, 0, 'B'},
-    {"ident_file", 1, 0, 'G'},
-    {0, 0, 0, 0}};
-  int o;
-  while ((o = getopt_long(argc, argv, "", opts, NULL)) != -1) {
-    switch (o) {
-      case 'p': pci = optarg; break;
-      case 's': sip = optarg; break;
-      case 'm': mcast = optarg; break;
-      case 'u': udp_port = atoi(optarg); break;
-      case 't': payload_type = atoi(optarg); break;
-      case 'W': width = atoi(optarg); break;
-      case 'H': height = atoi(optarg); break;
-      case 'F': fps = atof(optarg); break;
-      case 'i': interlaced = 1; break;
-      case 'S': shm_path = optarg; break;
-      case 'R': ring = atoi(optarg); break;
-      case 'D': hdr = atoi(optarg); break;
-      case 'l': lcores = optarg; break;
-      case 'f': stats_file = optarg; break;
-      case 'M': pmd_s = optarg; break;
-      case 'N': iface = optarg; break;
-      case 'B': bit_depth = atoi(optarg); break;
-      case 'G': ident_file = optarg; break;
-      default: usage(argv[0]); return 1;
-    }
-  }
-  int use_kernel = (strcmp(pmd_s, "dpdk") != 0);   /* kernel | af_xdp → driver noyau */
-  const char* dev = use_kernel ? iface : pci;      /* identifiant device selon le mode */
-  if (!dev || !mcast || !udp_port || !shm_path) { usage(argv[0]); return 1; }
-  /* Nom de port MTL : préfixe selon le PMD (cf. mtl_api.h). */
-  char portname[MTL_PORT_MAX_LEN];
-  if (!strcmp(pmd_s, "af_xdp"))      snprintf(portname, sizeof(portname), "native_af_xdp:%s", iface);
-  else if (!strcmp(pmd_s, "kernel")) snprintf(portname, sizeof(portname), "kernel:%s", iface);
-  else                               snprintf(portname, sizeof(portname), "%s", pci);
-  /* MTL st20 limite framebuff_cnt à [2:8] → le ring du pipeline MXL est donc borné à 8 PARTOUT
-   * (producteurs ET consommateurs), réglage shm_video_ring inclus. Ici le ring SHM = le ring
-   * pipeline = framebuff_cnt (slot = frame_index % ring, identique côté consommateurs). */
-  if (ring > 8) ring = 8;
-  if (ring < 2) ring = 2;
-  if (ring > MAX_FB) ring = MAX_FB;
-
-  signal(SIGINT, on_signal);
-  signal(SIGTERM, on_signal);
-
-  /* ── init MTL ── */
-  struct mtl_init_params p;
-  memset(&p, 0, sizeof(p));
-  p.num_ports = 1;
-  snprintf(p.port[MTL_PORT_P], MTL_PORT_MAX_LEN, "%s", portname);
-  if (sip) inet_pton(AF_INET, sip, p.sip_addr[MTL_PORT_P]);
-  p.pmd[MTL_PORT_P] = mtl_pmd_by_port_name(portname);  /* dpdk_user | kernel | native_af_xdp */
-  p.flags |= MTL_FLAG_DEV_AUTO_START_STOP;
-  p.log_level = MTL_LOG_LEVEL_INFO;
-  p.lcores = (char*)lcores;
-  /* Mandatory : nb de queues NIC que la lib doit supporter. 1 session RX → 1 queue RX ;
-   * 1 queue TX pour le contrôle (IGMP join / ARP). Sans ça : « fail to find free rx queue ». */
-  p.rx_queues_cnt[MTL_PORT_P] = 1;
-  p.tx_queues_cnt[MTL_PORT_P] = 1;
-
-  struct rx_ctx c;
-  memset(&c, 0, sizeof(c));
-  c.ring = ring;
-  c.hdr = hdr;
-  c.width = width; c.height = height; c.bit_depth = bit_depth;
-  c.ident_file = ident_file;   /* incrustation IDENT live (fichier écrit par le contrôleur) */
-  c.copy_mode = use_kernel;   /* PMD noyau → frames internes + memcpy (pas de DMA ext-frame) */
-
-  /* libmtl N'A PAS de converter 422-10 (RFC4175) → planar 8 bits (« st20_get_converter, plugin
-   * not found »). On reçoit donc toujours en PLANAR10LE (converter présent) et on convertit
-   * 10→8 nous-mêmes à la copie quand le pipeline MXL est en 8 bits (force8). Uniquement en
-   * copy_mode (af_xdp/kernel) : en DMA ext-frame (DPDK) on ne peut pas convertir → on garde 10. */
-  c.out_fmt = ST_FRAME_FMT_YUV422PLANAR10LE;
-  c.conv8 = (bit_depth == 8 && use_kernel);
-  c.plane_h = interlaced ? height / 2 : height;  /* buffer ext = 1 champ si entrelacé */
-  c.st = mtl_init(&p);
-  if (!c.st) { fprintf(stderr, "mtl_rx: mtl_init fail\n"); return 1; }
-
-  /* ── ops st20p RX en external frames ── */
-  struct st20p_rx_ops ops;
-  memset(&ops, 0, sizeof(ops));
-  ops.name = "bobi_mtl_rx";
-  ops.priv = &c;
+  struct st20p_rx_ops ops; memset(&ops, 0, sizeof(ops));
+  ops.name = "bobi_mtl_v";
+  ops.priv = s;
   ops.port.num_port = 1;
-  inet_pton(AF_INET, mcast, ops.port.ip_addr[MTL_SESSION_PORT_P]);
-  snprintf(ops.port.port[MTL_SESSION_PORT_P], MTL_PORT_MAX_LEN, "%s", portname);
-  ops.port.udp_port[MTL_SESSION_PORT_P] = udp_port;
-  ops.port.payload_type = payload_type;
-  ops.width = width;
-  ops.height = height;
-  ops.fps = to_st_fps(fps);
-  ops.interlaced = interlaced ? true : false;
+  inet_pton(AF_INET, s->mcast, ops.port.ip_addr[MTL_SESSION_PORT_P]);
+  snprintf(ops.port.port[MTL_SESSION_PORT_P], MTL_PORT_MAX_LEN, "%s", s->portname);
+  ops.port.udp_port[MTL_SESSION_PORT_P] = s->udp_port;
+  ops.port.payload_type = s->payload_type;
+  ops.width = s->width; ops.height = s->height; ops.fps = to_st_fps(s->fps);
+  ops.interlaced = s->interlaced ? true : false;
   ops.transport_fmt = ST20_FMT_YUV_422_10BIT;
   ops.output_fmt = ST_FRAME_FMT_YUV422PLANAR10LE;
   ops.device = ST_PLUGIN_DEVICE_AUTO;
-  ops.framebuff_cnt = ring;
+  ops.framebuff_cnt = s->ring;
   ops.notify_frame_available = frame_available;
-  if (!c.copy_mode) {
-    /* DPDK : external frames → DMA zéro-copie dans les slots du ring shm. */
-    ops.query_ext_frame = query_ext_frame;
-    ops.flags |= ST20P_RX_FLAG_EXT_FRAME;
-  }
-  /* mode noyau (copy_mode) : frames internes MTL ; on memcpy vers le shm dans rx_thread. */
-  /* pas de RECEIVE_INCOMPLETE : on ne veut que des frames complètes dans le shm */
+  /* af_xdp → copy_mode : frames internes MTL, on memcpy (pas d'ext-frame DMA). */
 
-  c.handle = st20p_rx_create(c.st, &ops);
-  if (!c.handle) { fprintf(stderr, "mtl_rx: st20p_rx_create fail\n"); mtl_uninit(c.st); return 1; }
-  c.src_framesize = st20p_rx_frame_size(c.handle);   /* frame MTL = planar 10 bits */
-  /* slot SHM : 8 bits (moitié des octets) si conversion, sinon identique à la frame MTL. */
-  c.framesize = c.conv8 ? c.src_framesize / 2 : c.src_framesize;
+  s->vh = st20p_rx_create(s->st, &ops);
+  if (!s->vh) { fprintf(stderr, "mtl_rx: st20p_rx_create fail (video %s:%d)\n", s->mcast, s->udp_port); return -1; }
+  s->src_framesize = st20p_rx_frame_size(s->vh);
+  s->slotsize = s->conv8 ? s->src_framesize / 2 : s->src_framesize;
+  if (open_shm(s) != 0) return -1;
+  fprintf(stderr, "mtl_rx[video] %dx%d%s fps=%.2f pt=%d mc=%s:%d slot=%zu ring=%d shm=%s\n",
+          s->width, s->height, s->interlaced ? "i" : "p", s->fps, s->payload_type,
+          s->mcast, s->udp_port, s->slotsize, s->ring, s->shm_path);
+  return pthread_create(&s->thread, NULL, video_rx_thread, s) == 0 ? (s->started = 1, 0) : -1;
+}
 
-  /* ── shm : mmap (header + ring*framesize), arrondi page ── */
-  size_t raw = (size_t)hdr + (size_t)ring * c.framesize;
-  size_t pg = (size_t)sysconf(_SC_PAGESIZE);
-  c.shm_size = (raw + pg - 1) & ~(pg - 1);   /* aligné page pour le DMA-map */
-  int fd = open(shm_path, O_CREAT | O_RDWR, 0666);
-  if (fd < 0) { perror("open shm"); return 1; }
-  if (ftruncate(fd, c.shm_size) < 0) { perror("ftruncate"); return 1; }
-  c.shm_base = mmap(NULL, c.shm_size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
-  close(fd);
-  if (c.shm_base == MAP_FAILED) { perror("mmap"); return 1; }
-  c.frames_base = c.shm_base + hdr;
+static int setup_audio(struct sess* s) {
+  if (s->channels <= 0) s->channels = 8;
+  if (s->ring < 2) s->ring = 2;
+  s->slotsize = (size_t)(48000 / 1000) * s->channels * 3;   /* 1 ms L24 = 1152 si 8ch */
+  s->copy_mode = 1;
 
-  if (!c.copy_mode) {
-    /* DPDK ext-frame : DMA-map du mapping ENTIER (base alignée page) ; iova frames = base + hdr */
-    c.frames_iova = mtl_dma_map(c.st, c.shm_base, c.shm_size);
-    if (c.frames_iova == MTL_BAD_IOVA) {
-      fprintf(stderr, "mtl_rx: mtl_dma_map fail (shm non DMA-mappable)\n");
-      return 1;
-    }
-    for (int i = 0; i < ring; i++) {
-      c.fb[i].addr = c.frames_base + (size_t)i * c.framesize;
-      c.fb[i].iova = c.frames_iova + (mtl_iova_t)hdr + (mtl_iova_t)i * c.framesize;
-      c.fb[i].len = c.framesize;
-    }
-  }
+  struct st30p_rx_ops ops; memset(&ops, 0, sizeof(ops));
+  ops.name = "bobi_mtl_a";
+  ops.priv = s;
+  ops.port.num_port = 1;
+  inet_pton(AF_INET, s->mcast, ops.port.ip_addr[MTL_SESSION_PORT_P]);
+  snprintf(ops.port.port[MTL_SESSION_PORT_P], MTL_PORT_MAX_LEN, "%s", s->portname);
+  ops.port.udp_port[MTL_SESSION_PORT_P] = s->udp_port;
+  ops.port.payload_type = s->payload_type;
+  ops.fmt = ST30_FMT_PCM24;
+  ops.channel = (uint16_t)s->channels;
+  ops.sampling = ST30_SAMPLING_48K;
+  ops.ptime = ST30_PTIME_1MS;
+  ops.framebuff_size = (uint32_t)s->slotsize;   /* 1 chunk = 1 ms */
+  ops.framebuff_cnt = 4;
 
+  s->ah = st30p_rx_create(s->st, &ops);
+  if (!s->ah) { fprintf(stderr, "mtl_rx: st30p_rx_create fail (audio %s:%d)\n", s->mcast, s->udp_port); return -1; }
+  if (open_shm(s) != 0) return -1;
+  fprintf(stderr, "mtl_rx[audio] %dch L24/48k pt=%d mc=%s:%d slot=%zu ring=%d shm=%s\n",
+          s->channels, s->payload_type, s->mcast, s->udp_port, s->slotsize, s->ring, s->shm_path);
+  return pthread_create(&s->thread, NULL, audio_rx_thread, s) == 0 ? (s->started = 1, 0) : -1;
+}
+
+/* ── parse config JSON ── */
+static const char* jstr(struct json_object* o, const char* k, const char* def) {
+  struct json_object* v;
+  return (json_object_object_get_ex(o, k, &v)) ? json_object_get_string(v) : def;
+}
+static int jint(struct json_object* o, const char* k, int def) {
+  struct json_object* v;
+  return (json_object_object_get_ex(o, k, &v)) ? json_object_get_int(v) : def;
+}
+static double jdbl(struct json_object* o, const char* k, double def) {
+  struct json_object* v;
+  return (json_object_object_get_ex(o, k, &v)) ? json_object_get_double(v) : def;
+}
+
+static void usage(const char* p) {
   fprintf(stderr,
-          "mtl_rx: started %dx%d%s fps=%.2f pt=%d mcast=%s:%d framesize=%zu ring=%d shm=%s pmd=%s dev=%s\n",
-          width, height, interlaced ? "i" : "p", fps, payload_type, mcast, udp_port,
-          c.framesize, ring, shm_path, pmd_s, dev);
+    "usage: %s --config <json>   (sessions multiples : video st20 / audio st30)\n"
+    "   ou : %s [args legacy 1 session video] (--pmd af_xdp --iface .. --mcast .. --shm .. ...)\n", p, p);
+}
 
-  pthread_create(&c.thread, NULL, rx_thread, &c);
+int main(int argc, char** argv) {
+  /* globaux partagés */
+  char pmd[32] = "af_xdp", iface[64] = "", sip[64] = "", lcores[128] = "";
+  const char* config = NULL;
+  struct sess S[MAX_SESS]; memset(S, 0, sizeof(S));
+  int ns = 0;
 
-  /* boucle de stats (fps écrit dans stats_file pour le wrapper :8080) */
-  uint64_t last = 0;
+  /* args legacy d'une session vidéo (compat tests manuels) */
+  const char *l_mcast=NULL,*l_shm=NULL,*l_stats=NULL,*l_ident=NULL,*l_pci=NULL;
+  int l_port=0,l_pt=96,l_w=1920,l_h=1080,l_ring=8,l_hdr=64,l_inter=0,l_bd=10; double l_fps=25.0;
+
+  static struct option opts[] = {
+    {"config",1,0,'c'},{"pmd",1,0,'M'},{"iface",1,0,'N'},{"sip",1,0,'s'},{"lcores",1,0,'l'},
+    {"mcast",1,0,'m'},{"udp_port",1,0,'u'},{"payload_type",1,0,'t'},{"width",1,0,'W'},
+    {"height",1,0,'H'},{"fps",1,0,'F'},{"interlaced",0,0,'i'},{"shm",1,0,'S'},{"ring",1,0,'R'},
+    {"hdr",1,0,'D'},{"stats_file",1,0,'f'},{"bit_depth",1,0,'B'},{"ident_file",1,0,'G'},
+    {"pci",1,0,'p'},{0,0,0,0}};
+  int o;
+  while ((o = getopt_long(argc, argv, "", opts, NULL)) != -1) {
+    switch (o) {
+      case 'c': config = optarg; break;
+      case 'M': snprintf(pmd,sizeof(pmd),"%s",optarg); break;
+      case 'N': snprintf(iface,sizeof(iface),"%s",optarg); break;
+      case 's': snprintf(sip,sizeof(sip),"%s",optarg); break;
+      case 'l': snprintf(lcores,sizeof(lcores),"%s",optarg); break;
+      case 'm': l_mcast=optarg; break;   case 'u': l_port=atoi(optarg); break;
+      case 't': l_pt=atoi(optarg); break; case 'W': l_w=atoi(optarg); break;
+      case 'H': l_h=atoi(optarg); break;  case 'F': l_fps=atof(optarg); break;
+      case 'i': l_inter=1; break;         case 'S': l_shm=optarg; break;
+      case 'R': l_ring=atoi(optarg); break; case 'D': l_hdr=atoi(optarg); break;
+      case 'f': l_stats=optarg; break;    case 'B': l_bd=atoi(optarg); break;
+      case 'G': l_ident=optarg; break;    case 'p': l_pci=optarg; break;
+      default: usage(argv[0]); return 1;
+    }
+  }
+  (void)l_pci;
+
+  if (config) {
+    struct json_object* root = json_object_from_file(config);
+    if (!root) { fprintf(stderr, "mtl_rx: config illisible: %s\n", config); return 1; }
+    snprintf(pmd,sizeof(pmd),"%s",jstr(root,"pmd","af_xdp"));
+    snprintf(iface,sizeof(iface),"%s",jstr(root,"iface",""));
+    snprintf(sip,sizeof(sip),"%s",jstr(root,"sip",""));
+    snprintf(lcores,sizeof(lcores),"%s",jstr(root,"lcores",""));
+    struct json_object* arr;
+    if (!json_object_object_get_ex(root,"sessions",&arr) || !json_object_is_type(arr,json_type_array)) {
+      fprintf(stderr,"mtl_rx: config sans 'sessions'\n"); return 1; }
+    int n = json_object_array_length(arr);
+    for (int k = 0; k < n && ns < MAX_SESS; k++) {
+      struct json_object* j = json_object_array_get_idx(arr, k);
+      struct sess* s = &S[ns];
+      const char* kind = jstr(j,"kind","video");
+      s->kind = !strcmp(kind,"audio") ? K_AUDIO : !strcmp(kind,"data") ? K_DATA : K_VIDEO;
+      snprintf(s->mcast,sizeof(s->mcast),"%s",jstr(j,"mcast",""));
+      s->udp_port=jint(j,"udp_port",0); s->payload_type=jint(j,"payload_type",96);
+      s->ring=jint(j,"ring", s->kind==K_AUDIO?100:8); s->hdr=jint(j,"hdr",64);
+      snprintf(s->shm_path,sizeof(s->shm_path),"%s",jstr(j,"shm",""));
+      snprintf(s->stats_path,sizeof(s->stats_path),"%s",jstr(j,"stats",""));
+      if (s->kind == K_VIDEO) {
+        s->width=jint(j,"width",1920); s->height=jint(j,"height",1080);
+        s->fps=jdbl(j,"fps",25.0); s->interlaced=jint(j,"interlaced",0);
+        s->bit_depth=jint(j,"bit_depth",10);
+        const char* idf=jstr(j,"ident_file",""); if (idf && *idf) { snprintf(s->ident_file,sizeof(s->ident_file),"%s",idf); s->has_ident=1; }
+      } else if (s->kind == K_AUDIO) {
+        s->channels=jint(j,"channels",8);
+      } else {
+        fprintf(stderr,"mtl_rx: session data (2110-40) pas encore implémentée, ignorée\n");
+        continue;   /* point d'extension : setup_data() à venir */
+      }
+      if (!s->mcast[0] || !s->udp_port || !s->shm_path[0]) {
+        fprintf(stderr,"mtl_rx: session %d incomplète, ignorée\n",k); continue; }
+      ns++;
+    }
+    json_object_put(root);
+  } else {
+    /* legacy : 1 session vidéo depuis les args */
+    if (!l_mcast || !l_port || !l_shm || !iface[0]) { usage(argv[0]); return 1; }
+    struct sess* s = &S[0]; s->kind=K_VIDEO;
+    snprintf(s->mcast,sizeof(s->mcast),"%s",l_mcast);
+    s->udp_port=l_port; s->payload_type=l_pt; s->ring=l_ring; s->hdr=l_hdr;
+    s->width=l_w; s->height=l_h; s->fps=l_fps; s->interlaced=l_inter; s->bit_depth=l_bd;
+    snprintf(s->shm_path,sizeof(s->shm_path),"%s",l_shm);
+    if (l_stats) snprintf(s->stats_path,sizeof(s->stats_path),"%s",l_stats);
+    if (l_ident) { snprintf(s->ident_file,sizeof(s->ident_file),"%s",l_ident); s->has_ident=1; }
+    ns = 1;
+  }
+  if (ns <= 0) { fprintf(stderr,"mtl_rx: aucune session valide\n"); return 1; }
+
+  /* nom de port MTL selon le PMD */
+  char portname[MTL_PORT_MAX_LEN];
+  if (!strcmp(pmd,"af_xdp"))      snprintf(portname,sizeof(portname),"native_af_xdp:%s",iface);
+  else if (!strcmp(pmd,"kernel")) snprintf(portname,sizeof(portname),"kernel:%s",iface);
+  else                            snprintf(portname,sizeof(portname),"%s",iface);
+
+  signal(SIGINT, on_signal); signal(SIGTERM, on_signal);
+
+  /* ── mtl_init UNIQUE (PF/MtlManager/XDP partagés) ── */
+  struct mtl_init_params p; memset(&p, 0, sizeof(p));
+  p.num_ports = 1;
+  snprintf(p.port[MTL_PORT_P], MTL_PORT_MAX_LEN, "%s", portname);
+  if (sip[0]) inet_pton(AF_INET, sip, p.sip_addr[MTL_PORT_P]);
+  p.pmd[MTL_PORT_P] = mtl_pmd_by_port_name(portname);
+  p.flags |= MTL_FLAG_DEV_AUTO_START_STOP;
+  p.log_level = MTL_LOG_LEVEL_INFO;
+  p.lcores = lcores[0] ? lcores : NULL;
+  p.rx_queues_cnt[MTL_PORT_P] = ns;     /* une file RX par session */
+  p.tx_queues_cnt[MTL_PORT_P] = 1;      /* contrôle (IGMP/ARP) */
+
+  mtl_handle st = mtl_init(&p);
+  if (!st) { fprintf(stderr, "mtl_rx: mtl_init fail\n"); return 1; }
+
+  int up = 0;
+  for (int k = 0; k < ns; k++) {
+    S[k].st = st;
+    snprintf(S[k].portname, sizeof(S[k].portname), "%s", portname);
+    int r = (S[k].kind == K_AUDIO) ? setup_audio(&S[k]) : setup_video(&S[k]);
+    if (r == 0) up++;
+    else fprintf(stderr, "mtl_rx: session %d échouée\n", k);
+  }
+  if (!up) { fprintf(stderr, "mtl_rx: aucune session démarrée\n"); mtl_uninit(st); return 1; }
+
+  /* ── boucle de stats par session ── */
+  uint64_t last[MAX_SESS]; memset(last, 0, sizeof(last));
   time_t last_t = time(NULL);
   while (!g_stop) {
     sleep(2);
-    time_t now = time(NULL);
-    double dt = difftime(now, last_t);
-    double f = dt > 0 ? (double)(c.frames_recv - last) / dt : 0.0;
-    last = c.frames_recv;
-    last_t = now;
-    if (stats_file) {
-      FILE* sf = fopen(stats_file, "w");
-      if (sf) {
-        fprintf(sf, "{\"fps\": %.1f, \"frame_index\": %llu}\n", f,
-                (unsigned long long)c.frame_index);
-        fclose(sf);
-      }
+    time_t now = time(NULL); double dt = difftime(now, last_t); last_t = now;
+    for (int k = 0; k < ns; k++) {
+      struct sess* s = &S[k];
+      if (!s->started || !s->stats_path[0]) continue;
+      double rate = dt > 0 ? (double)(s->recv - last[k]) / dt : 0.0;
+      last[k] = s->recv;
+      FILE* sf = fopen(s->stats_path, "w");
+      if (sf) { fprintf(sf, "{\"fps\": %.1f, \"frame_index\": %llu}\n", rate,
+                        (unsigned long long)s->index); fclose(sf); }
     }
   }
 
   g_stop = 1;
-  pthread_join(c.thread, NULL);
-  st20p_rx_free(c.handle);
-  if (!c.copy_mode) mtl_dma_unmap(c.st, c.shm_base, c.frames_iova, c.shm_size);
-  munmap(c.shm_base, c.shm_size);
-  mtl_uninit(c.st);
+  for (int k = 0; k < ns; k++) {
+    if (!S[k].started) continue;
+    pthread_join(S[k].thread, NULL);
+    if (S[k].kind == K_AUDIO) { if (S[k].ah) st30p_rx_free(S[k].ah); }
+    else                      { if (S[k].vh) st20p_rx_free(S[k].vh); }
+    if (S[k].shm_base && S[k].shm_base != MAP_FAILED) munmap(S[k].shm_base, S[k].shm_size);
+    if (S[k].ident_patch) free(S[k].ident_patch);
+  }
+  mtl_uninit(st);
   return 0;
 }
