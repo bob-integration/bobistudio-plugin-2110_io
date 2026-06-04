@@ -37,7 +37,10 @@ MTL_RX     = os.environ.get("MTL_RX_BIN") or "/usr/local/bin/mtl_rx"
 HDR        = 64
 SDP_DIR    = "/tmp"
 
-# ─── Layout shm (simu) — identique à receiver_2110 ──────────────────
+# ─── Layout shm (simu) — RÉSOLUTION DYNAMIQUE ───────────────────────
+# La simu (GÉN ou fallback sans SDP) doit suivre la résolution du flux LIVE (lue du SDP) pour
+# que le shm garde la MÊME taille que mtl_rx → les consommateurs ne cassent pas au basculement
+# RX↔simu. WIDTH/HEIGHT (env) ne sont que le défaut quand aucun SDP n'est connu.
 _DEEP    = BIT_DEPTH >= 10
 _BPS     = 2 if _DEEP else 1
 _DT      = "<u2" if _DEEP else "u1"
@@ -46,12 +49,17 @@ _BLACK   = 16 << (BIT_DEPTH - 8) if _DEEP else 16
 _WHITE   = 235 << (BIT_DEPTH - 8) if _DEEP else 235
 _CW = {"420": 2, "422": 2, "444": 1}.get(CHROMA, 2)
 _CH = {"420": 2, "422": 1, "444": 1}.get(CHROMA, 1)
-UV_W = WIDTH // _CW
-UV_H = HEIGHT // _CH
-Y_SIZE       = WIDTH * HEIGHT * _BPS
-UV_SIZE      = UV_W * UV_H * _BPS
-V_FRAME_SIZE = Y_SIZE + 2 * UV_SIZE
-V_TOTAL_SIZE = HDR + V_RING * V_FRAME_SIZE
+
+
+def _layout(w, h):
+    uv_w, uv_h = w // _CW, h // _CH
+    y = w * h * _BPS; uv = uv_w * uv_h * _BPS; vf = y + 2 * uv
+    return {"w": w, "h": h, "uv_w": uv_w, "uv_h": uv_h,
+            "y": y, "uv": uv, "vf": vf, "total": HDR + V_RING * vf}
+
+
+# Résolution courante par slot (pour la simu + la taille IDENT), suit le SDP live.
+_slot_res = [[WIDTH, HEIGHT] for _ in range(N_VIDEO)]
 
 metrics = [{"idx": i, "essence": "video", "fps": 0.0, "frame_index": 0, "mode": "init"}
            for i in range(N_VIDEO)]
@@ -104,8 +112,9 @@ def _render_ident(idx):
     selon le W/H réel de la frame → patch indépendant de la résolution."""
     if not (_HAS_PIL and _ctl[idx]["ident"]):
         return None
-    size = int(_ctl[idx]["ident_size"]) or max(12, HEIGHT // 28)
-    size = max(10, min(size, HEIGHT // 4))
+    _h = _slot_res[idx][1]                       # taille IDENT ∝ résolution live courante
+    size = int(_ctl[idx]["ident_size"]) or max(12, _h // 28)
+    size = max(10, min(size, _h // 4))
     lines = _ident_lines(idx)
     font = _font(size)
     pad = max(3, size // 4); gap = max(1, size // 6)
@@ -146,25 +155,25 @@ def _update_ident(idx):
         print("ident file err:", e, flush=True)
 
 
-def _overlay_simu(mm, off, idx):
+def _overlay_simu(mm, off, idx, lay):
     """Incruste le patch IDENT (Y + chroma neutre) dans la frame simu (haut-droite), en place."""
     p = _ident_patch[idx]
     if not p:
         return
     patch, bw, bh = p
-    if bw > WIDTH or bh > HEIGHT:
+    w, h = lay["w"], lay["h"]
+    if bw > w or bh > h:
         return
-    margin = 8
-    x0 = WIDTH - bw - margin; y0 = margin
+    x0 = w - bw - 8; y0 = 8
     x0 -= x0 % 2; y0 -= y0 % 2
     if x0 < 0:
         x0 = 0
     pp = (patch.astype(np.uint16) << (BIT_DEPTH - 8)) if _DEEP else patch
-    y = np.frombuffer(mm, dtype=np.dtype(_DT), count=Y_SIZE // _BPS, offset=off).reshape(HEIGHT, WIDTH)
+    y = np.frombuffer(mm, dtype=np.dtype(_DT), count=lay["y"] // _BPS, offset=off).reshape(h, w)
     y[y0:y0 + bh, x0:x0 + bw] = pp
     ux0, uy0, ubw, ubh = x0 // _CW, y0 // _CH, bw // _CW, bh // _CH
-    for poff in (off + Y_SIZE, off + Y_SIZE + UV_SIZE):
-        c = np.frombuffer(mm, dtype=np.dtype(_DT), count=UV_SIZE // _BPS, offset=poff).reshape(UV_H, UV_W)
+    for poff in (off + lay["y"], off + lay["y"] + lay["uv"]):
+        c = np.frombuffer(mm, dtype=np.dtype(_DT), count=lay["uv"] // _BPS, offset=poff).reshape(lay["uv_h"], lay["uv_w"])
         c[uy0:uy0 + ubh, ux0:ux0 + ubw] = _NEUTRAL
 
 
@@ -333,16 +342,17 @@ def _launch_mtl_rx(idx, info):
 
 
 # ─── Simulation (mire numpy, mêmes en-têtes shm) — fallback sans SDP ou GÉN forcé ──
-def _simu_frame(mm, fi, idx):
-    base = np.full((HEIGHT, WIDTH), _BLACK, dtype=np.dtype(_DT))
-    col = (fi * 8) % WIDTH
-    base[:, col:min(col + 8, WIDTH)] = _WHITE
-    neutral = np.full((UV_H, UV_W), _NEUTRAL, dtype=np.dtype(_DT)).tobytes()
-    off = HDR + (fi % V_RING) * V_FRAME_SIZE
-    mm[off:off + Y_SIZE] = base.tobytes()
-    mm[off + Y_SIZE:off + Y_SIZE + UV_SIZE] = neutral
-    mm[off + Y_SIZE + UV_SIZE:off + Y_SIZE + 2 * UV_SIZE] = neutral
-    _overlay_simu(mm, off, idx)          # incrustation IDENT (coût nul si off)
+def _simu_frame(mm, fi, idx, lay):
+    w, h = lay["w"], lay["h"]
+    base = np.full((h, w), _BLACK, dtype=np.dtype(_DT))
+    col = (fi * 8) % w
+    base[:, col:min(col + 8, w)] = _WHITE
+    neutral = np.full((lay["uv_h"], lay["uv_w"]), _NEUTRAL, dtype=np.dtype(_DT)).tobytes()
+    off = HDR + (fi % V_RING) * lay["vf"]
+    mm[off:off + lay["y"]] = base.tobytes()
+    mm[off + lay["y"]:off + lay["y"] + lay["uv"]] = neutral
+    mm[off + lay["y"] + lay["uv"]:off + lay["y"] + 2 * lay["uv"]] = neutral
+    _overlay_simu(mm, off, idx, lay)     # incrustation IDENT (coût nul si off)
     mm[0:16] = struct.pack("QQ", fi, time.time_ns())
 
 
@@ -368,22 +378,31 @@ _procs = {}  # idx → Popen (pour le teardown SIGTERM)
 
 def video_slot(idx):
     """Bascule SIMU ↔ mtl_rx selon la présence d'un SDP NMOS. Un seul producteur du shm à la fois."""
+    shm_path = "/dev/shm/{}_{}".format(HOSTNAME, idx)
     sdp_path = "{}/nmos_recv_v_{}.sdp".format(SDP_DIR, idx)
     proc = None
     stats = None
     cur_key = None
     sim_mm = None
+    sim_res = None
     fi = 0
     prev_mode = None
     while True:
         gen = _ctl[idx]["gen"]   # GÉN forcé → mire locale même si un SDP est actif
-        info = None if gen else (_parse_sdp(sdp_path) if os.path.exists(sdp_path) else None)
+        # On parse TOUJOURS le SDP pour connaître la RÉSOLUTION LIVE (même sous GÉN) → la simu
+        # garde la même taille de shm que mtl_rx ⇒ pas de casse côté consommateurs au basculement.
+        sdp = _parse_sdp(sdp_path) if os.path.exists(sdp_path) else None
+        cur_w, cur_h = (sdp["width"], sdp["height"]) if sdp else (WIDTH, HEIGHT)
+        if _slot_res[idx] != [cur_w, cur_h]:
+            _slot_res[idx] = [cur_w, cur_h]
+            _update_ident(idx)               # la taille IDENT suit la résolution
+        info = None if gen else sdp
         if info:
             key = (info["mcast"], info["port"], info["pt"], info["width"],
                    info["height"], info["fps"], info["interlaced"])
             if key != cur_key or (proc and proc.poll() is not None):
                 if sim_mm is not None:
-                    sim_mm.close(); sim_mm = None
+                    sim_mm.close(); sim_mm = None; sim_res = None
                 if proc:
                     proc.terminate()
                     try: proc.wait(timeout=3)
@@ -391,7 +410,6 @@ def video_slot(idx):
                 proc, stats = _launch_mtl_rx(idx, info)
                 _procs[idx] = proc
                 cur_key = key
-            # info courante (pour les lignes IDENT) ; re-rend le patch à la transition.
             _ctl[idx]["info"] = info
             if prev_mode != "mtl":
                 _update_ident(idx); prev_mode = "mtl"
@@ -408,12 +426,17 @@ def video_slot(idx):
                 try: proc.wait(timeout=3)
                 except Exception: proc.kill()
                 proc = None; cur_key = None; _procs.pop(idx, None)
-            if sim_mm is None:
-                sim_mm = _open_shm("/dev/shm/{}_{}".format(HOSTNAME, idx), V_TOTAL_SIZE)
-            _ctl[idx]["info"] = None
+            lay = _layout(cur_w, cur_h)
+            # (Ré)ouvre le shm à la RÉSOLUTION COURANTE (même taille que mtl_rx → pas de resize
+            # visible par les consommateurs ; un resize n'arrive que si la source change de res).
+            if sim_mm is None or sim_res != (cur_w, cur_h):
+                if sim_mm is not None:
+                    sim_mm.close()
+                sim_mm = _open_shm(shm_path, lay["total"]); sim_res = (cur_w, cur_h)
+            _ctl[idx]["info"] = sdp if gen else None
             if prev_mode != "simu":
                 _update_ident(idx); prev_mode = "simu"
-            _simu_frame(sim_mm, fi, idx)
+            _simu_frame(sim_mm, fi, idx, lay)
             fi += 1
             if fi % 25 == 0:
                 with metrics_lock:
