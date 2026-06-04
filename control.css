@@ -1,3 +1,82 @@
-/* SPDX-License-Identifier: GPL-3.0-or-later */
-.mtl-recv-control { font-size: 0.9em; }
-.mtl-recv-control .meta { color: var(--text-muted); }
+/* Corps de carte receiver_2110 (slots vidéo/audio + générateurs locaux), monté dans
+   le shell Sources (I/O). Le cadre de carte (pliage, header, monitoring) est fourni
+   par le shell ; ici on ne style que le contenu. */
+.rx-body .rx-meta { margin-bottom:6px; }
+.ens { border:1px solid var(--border-soft); border-radius:6px; padding:8px 10px; margin-bottom:8px; }
+.ens-title { font-size:0.8em; color:var(--text-muted); margin-bottom:6px; text-transform:uppercase; letter-spacing:0.05em; }
+.flow-row { display:grid; grid-template-columns: 64px 46px 104px 70px 1fr 1fr; gap:8px; align-items:center; padding:4px 6px; border-radius:4px; font-size:0.9em; }
+.flow-row + .flow-row { margin-top:3px; }
+.flow-video { background: rgba(96, 165, 250, 0.10); border-left:3px solid #60a5fa; }
+.flow-audio { background: rgba(52, 211, 153, 0.08); border-left:3px solid #34d399; }
+.flow-tag   { font-weight:600; font-size:0.78em; letter-spacing:0.04em; }
+.flow-tag.v { color:#60a5fa; }
+.flow-tag.a { color:#34d399; }
+.mxl-path { font-family: var(--font-mono); font-size:0.82em; color:var(--text-muted); word-break:break-all; }
+/* Rangée réseau/MXL : 2ᵉ ligne de la grille. L'adresse multicast démarre sous la
+   colonne SDP (col. 4) et s'étend jusqu'à la col. 5 ; la sortie MXL reste à droite (col. 6). */
+.net-addr { font-family: var(--font-mono); font-size:0.82em; display:flex; gap:4px; align-items:baseline; min-width:0;
+    grid-row:2; grid-column:4 / 6; }
+.net-arrow { color:var(--text-muted); flex:none; }
+.net-flows { display:flex; flex-direction:column; gap:1px; min-width:0; }
+.net-flows .flow-addr { white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+.mxl-path { grid-row:2; grid-column:6 / 7; }
+
+/* Badge « générateur local » cliquable (marche/arrêt) + tooltip riche au survol */
+.gen-wrap { position:relative; justify-self:center; }
+.gen-badge { display:inline-flex; align-items:center; gap:3px; cursor:pointer;
+    font-size:0.66em; font-weight:700; letter-spacing:0.04em; line-height:1;
+    padding:3px 5px; border-radius:4px; border:1px solid transparent;
+    transition: background 120ms, opacity 120ms, border-color 120ms; }
+.gen-badge.on  { background:#e8a33d; color:#1a1205;
+    box-shadow:0 0 0 1px rgba(232,163,61,0.4), 0 0 6px rgba(232,163,61,0.35); }
+.gen-badge.on:hover { background:#f0b658; }
+.gen-badge.off { background:transparent; color:var(--text-muted);
+    border-color:var(--border-soft); opacity:0.6; box-shadow:none; }
+.gen-badge.off:hover { opacity:1; color:var(--text); border-color:#e8a33d; }
+.gen-badge.busy { opacity:0.5; cursor:progress; pointer-events:none; }
+
+/* IDENT : incrustation 3 lignes (calqué sur le badge GÉN, accent bleu). */
+.ident-wrap { display:inline-flex; align-items:center; gap:4px; justify-self:center; }
+.ident-badge { display:inline-flex; align-items:center; gap:3px; cursor:pointer;
+    font-size:0.66em; font-weight:700; letter-spacing:0.04em; line-height:1;
+    padding:3px 5px; border-radius:4px; border:1px solid transparent;
+    transition: background 120ms, opacity 120ms, border-color 120ms; }
+.ident-badge.on  { background:var(--btn-blue, #3d7de8); color:#fff;
+    box-shadow:0 0 0 1px rgba(61,125,232,0.4), 0 0 6px rgba(61,125,232,0.35); }
+.ident-badge.off { background:transparent; color:var(--text-muted);
+    border-color:var(--border-soft); opacity:0.6; }
+.ident-badge.off:hover { opacity:1; color:var(--text); border-color:var(--btn-blue, #3d7de8); }
+.ident-badge.busy { opacity:0.5; cursor:progress; pointer-events:none; }
+/* Badge SDP (abonnement NMOS manuel) — vert quand un SDP est actif. */
+.sdp-badge { display:inline-flex; align-items:center; cursor:pointer;
+    font-size:0.66em; font-weight:700; letter-spacing:0.04em; line-height:1;
+    padding:3px 5px; border-radius:4px; border:1px solid transparent;
+    transition: background 120ms, opacity 120ms, border-color 120ms; }
+.sdp-badge.on  { background:var(--status-running-fg, #3fb950); color:#06210f;
+    box-shadow:0 0 0 1px rgba(63,185,80,0.4), 0 0 6px rgba(63,185,80,0.3); }
+.sdp-badge.off { background:transparent; color:var(--text-muted);
+    border-color:var(--border-soft); opacity:0.6; }
+.sdp-badge.off:hover { opacity:1; color:var(--text); border-color:var(--status-running-fg, #3fb950); }
+/* Rotatif compact de taille IDENT : glisser ↕ ou molette. Reste dans sa colonne. */
+.ident-knob { position:relative; width:22px; height:22px; border-radius:50%; flex:0 0 auto;
+    background:var(--bg-input); border:1px solid var(--border); cursor:ns-resize; touch-action:none; }
+.ident-knob:focus-visible { outline:2px solid var(--btn-blue, #3d7de8); outline-offset:2px; }
+.ident-knob-dial { position:absolute; left:calc(50% - 1px); top:2px; width:2px; height:9px;
+    background:var(--btn-blue, #3d7de8); border-radius:1px; transform-origin:50% 100%; }
+.ident-size-val { font-size:0.72em; color:var(--text-muted); font-family:var(--font-mono);
+    min-width:30px; display:inline-block; }
+
+.gen-tip { display:none; position:absolute; bottom:calc(100% + 6px); left:50%; transform:translateX(-50%);
+    z-index:50; min-width:200px; max-width:300px; padding:8px 10px;
+    background:var(--bg-input); color:var(--text); border:1px solid var(--border-soft);
+    border-radius:6px; box-shadow:0 4px 16px rgba(0,0,0,0.45); font-size:0.82em;
+    line-height:1.45; text-align:left; white-space:normal; font-weight:400; letter-spacing:normal; }
+.gen-wrap:hover .gen-tip { display:block; }
+.gen-tip h5 { margin:0 0 5px; font-size:0.95em; color:#e8a33d; }
+.gen-tip .gt-row { display:flex; justify-content:space-between; gap:10px; }
+.gen-tip .gt-row span:last-child { color:var(--text-muted); font-family:var(--font-mono); }
+.gen-tip .gt-chans { display:flex; flex-wrap:wrap; gap:3px; margin-top:6px; }
+.gt-ch { width:18px; height:18px; border-radius:3px; display:flex; align-items:center; justify-content:center;
+    font-size:0.72em; font-family:var(--font-mono); border:1px solid var(--border-soft); color:var(--text-muted); }
+.gt-ch.on  { background:#34d399; color:#06281c; border-color:#34d399; }
+.gt-ch.rup { background:#ef5350; color:#2a0a09; border-color:#ef5350; }
