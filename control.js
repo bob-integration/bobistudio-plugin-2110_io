@@ -150,13 +150,17 @@ window.MXLPlugins["receiver_2110_mtl"] = {
                 <span class="ident-knob-dial" style="transform:rotate(${_identAngle(identSz)}deg)"></span></span>
               <span class="ident-size-val">${identSz}px</span>` : ''}
         </span>`;
-      // SDP (vidéo uniquement) : badge ouvrant une modale d'affichage/édition.
-      // Le SDP n'est PAS inliné dans le HTML (multiligne) — on le garde en cache
-      // par idx (_sdpByIdx, scope mount), la modale le relit.
-      if (!isAudio && !isAnc) _sdpByIdx[r.idx] = r.sdp || '';
-      const sdpCtl = (isAudio || isAnc) ? '' : `<span class="sdp-wrap">
+      // SDP (vidéo, audio ET ANC) : badge ouvrant une modale d'affichage/édition.
+      // Le SDP n'est PAS inliné dans le HTML (multiligne) — on le garde en cache par
+      // (essence:idx) (_sdpByIdx, scope mount), la modale le relit. L'audio (2110-30) et
+      // l'ANC (2110-40) partagent la même chaîne d'abonnement manuel IS-05 que la vidéo
+      // (manual_subscribe côté backend, essence transmise) — sans ça, pas d'abonnement
+      // audio/ANC sans contrôleur NMOS externe → shm non alimenté → streamer muet.
+      const sdpEss = isAnc ? 'anc' : isAudio ? 'audio' : 'video';
+      _sdpByIdx[sdpEss + ':' + r.idx] = r.sdp || '';
+      const sdpCtl = `<span class="sdp-wrap">
           <span class="sdp-badge ${r.sdp ? 'on' : 'off'}" role="button" tabindex="0"
-                data-idx="${r.idx}"
+                data-essence="${sdpEss}" data-idx="${r.idx}"
                 title="Afficher / coller le SDP (abonnement NMOS manuel)">SDP</span>
         </span>`;
       const rateCell = isAnc
@@ -341,7 +345,7 @@ window.MXLPlugins["receiver_2110_mtl"] = {
     }
     // ── SDP : ouverture de la modale d'affichage / abonnement manuel ──────────
     function _closeSdpModal(){ const m = document.getElementById('rx-sdp-modal'); if (m) m.remove(); }
-    async function _sdpApply(idx, enable){
+    async function _sdpApply(essence, idx, enable){
         const ta  = document.getElementById('rx-sdp-ta');
         const st  = document.getElementById('rx-sdp-status');
         const sdp = ta ? ta.value.trim() : '';
@@ -350,7 +354,7 @@ window.MXLPlugins["receiver_2110_mtl"] = {
         try {
             const resp = await fetch(`/api/nmos/receivers/${vmid}/${idx}/sdp`, {
                 method: 'POST', headers: {'Content-Type': 'application/json'},
-                body: JSON.stringify({ sdp, enabled: enable, essence: 'video' }),
+                body: JSON.stringify({ sdp, enabled: enable, essence }),
             });
             const j = await resp.json().catch(()=>({}));
             if (!resp.ok) throw new Error(j.error || ('HTTP ' + resp.status));
@@ -361,9 +365,10 @@ window.MXLPlugins["receiver_2110_mtl"] = {
             if (st){ st.textContent = '✕ ' + err.message; st.style.color = 'var(--status-stopped-fg)'; }
         }
     }
-    function _openSdpModal(idx){
+    function _openSdpModal(essence, idx){
         _closeSdpModal();
-        const cur = _sdpByIdx[idx] || '';
+        const cur = _sdpByIdx[essence + ':' + idx] || '';
+        const essLabel = essence === 'anc' ? 'ANC' : essence === 'audio' ? 'Audio' : 'Vidéo';
         const modal = document.createElement('div');
         modal.id = 'rx-sdp-modal';
         modal.style.cssText = 'position:fixed; inset:0; background:rgba(0,0,0,.55); z-index:9999;'
@@ -371,7 +376,7 @@ window.MXLPlugins["receiver_2110_mtl"] = {
         modal.innerHTML = `
             <div style="background:var(--bg-card); border:1px solid var(--border); border-radius:8px;
                         padding:16px; width:640px; max-width:95vw">
-                <div style="font-weight:600; margin-bottom:8px">SDP — Vidéo ${idx + 1} (#${vmid})</div>
+                <div style="font-weight:600; margin-bottom:8px">SDP — ${essLabel} ${idx + 1} (#${vmid})</div>
                 <div style="color:var(--text-muted); font-size:0.82em; margin-bottom:8px">
                     SDP actif reçu via NMOS. Coller/éditer puis « Appliquer » pour un abonnement
                     manuel immédiat (sans contrôleur externe). « Se désabonner » coupe le flux.
@@ -391,14 +396,14 @@ window.MXLPlugins["receiver_2110_mtl"] = {
         document.body.appendChild(modal);
         modal.addEventListener('click', e => { if (e.target === modal) _closeSdpModal(); });
         document.getElementById('rx-sdp-close').addEventListener('click', _closeSdpModal);
-        document.getElementById('rx-sdp-apply').addEventListener('click', () => _sdpApply(idx, true));
-        document.getElementById('rx-sdp-unsub').addEventListener('click', () => _sdpApply(idx, false));
+        document.getElementById('rx-sdp-apply').addEventListener('click', () => _sdpApply(essence, idx, true));
+        document.getElementById('rx-sdp-unsub').addEventListener('click', () => _sdpApply(essence, idx, false));
         document.getElementById('rx-sdp-ta').focus();
     }
     function onClickSdp(e){
         const badge = e.target.closest('.sdp-badge');
         if (!badge || !body.contains(badge)) return;
-        _openSdpModal(parseInt(badge.dataset.idx, 10));
+        _openSdpModal(badge.dataset.essence || 'video', parseInt(badge.dataset.idx, 10));
     }
 
     body.addEventListener('click', onClick);
