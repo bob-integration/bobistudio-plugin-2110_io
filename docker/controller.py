@@ -30,6 +30,9 @@ N_AUDIO    = int(os.environ.get("AUDIO_COUNT") or 0)                            
 N_ANC      = int(os.environ.get("ANC_COUNT") or 0)                                     # slots RX ANC (st40)
 A_CHANNELS = 8
 A_RING     = max(2, int(os.environ.get("AUDIO_RING") or 100))   # ring shm audio (chunks 1ms)
+# Ptime audio (ST 2110-30) par DÉFAUT (ms) — repli quand le SDP n'a pas d'a=ptime. Réglable par
+# installation (setting mtl_audio_ptime → env AUDIO_PTIME). Le SDP a=ptime PRIME (auto par entrée).
+A_PTIME_DEF = float(os.environ.get("AUDIO_PTIME") or 1.0)
 IFACE      = os.environ.get("IFACE") or "ens1f0np0"
 LCORES     = os.environ.get("LCORES") or "1,2,3"
 V_RING     = max(2, int(os.environ.get("RING") or 8))   # ring du pipeline (réglage) ; mtl_rx borne ≤8
@@ -435,13 +438,19 @@ def _parse_sdp_audio(path):
     c = re.search(r"^c=IN\s+IP4\s+([0-9.]+)", txt, re.M)
     if not (m and c):
         return None
-    return {"port": int(m.group(1)), "pt": int(m.group(2)), "mcast": c.group(1), "channels": A_CHANNELS}
+    # Ptime (durée de paquet, ms) : a=ptime:<v>. AUTO par entrée — doit matcher le flux sinon
+    # mtl_rx droppe TOUS les paquets (« pkt len mismatch »). Absent → défaut install (A_PTIME_DEF).
+    pt_m = re.search(r"^a=ptime:\s*([0-9.]+)", txt, re.M)
+    ptime = float(pt_m.group(1)) if pt_m else A_PTIME_DEF
+    return {"port": int(m.group(1)), "pt": int(m.group(2)), "mcast": c.group(1),
+            "channels": A_CHANNELS, "ptime": ptime}
 
 def _audio_session(idx, info):
     """Session RX audio st30 → /dev/shm/{hn}_audio_{idx} (L24 8ch BE, écrit tel quel par mtl_rx)."""
     return {"kind": "audio", "role": "rx",
             "mcast": info["mcast"], "udp_port": info["port"], "payload_type": info["pt"],
-            "channels": info.get("channels", A_CHANNELS), "ring": A_RING, "hdr": HDR,
+            "channels": info.get("channels", A_CHANNELS), "ptime": info.get("ptime", A_PTIME_DEF),
+            "ring": A_RING, "hdr": HDR,
             "targets": [{"idx": idx, "shm": "/dev/shm/{}_audio_{}".format(HOSTNAME, idx),
                          "stats": "/tmp/mtl_a{}.json".format(idx)}]}
 
@@ -454,7 +463,7 @@ def _audio_tx_session(idx, t, shm_in):
     """Session TX audio st30 : émet le shm audio d'entrée (BE passthrough) vers la dest audio du slot."""
     return {"kind": "audio", "role": "tx",
             "mcast": t["audio_mcast"], "udp_port": t["audio_port"], "payload_type": t.get("audio_pt", 97),
-            "channels": A_CHANNELS, "ring": A_RING, "hdr": HDR,
+            "channels": A_CHANNELS, "ptime": A_PTIME_DEF, "ring": A_RING, "hdr": HDR,
             "targets": [{"idx": idx, "shm": shm_in, "stats": "/tmp/mtl_atx{}.json".format(idx)}]}
 
 
