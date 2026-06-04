@@ -41,6 +41,7 @@
 #define MAX_TG    16   /* cibles (shm de sortie) par session : fan-out même-source → N slots */
 
 enum sess_kind { K_VIDEO, K_AUDIO, K_DATA };   /* DATA = ST 2110-40, prêt mais non implémenté */
+enum sess_role { ROLE_RX, ROLE_TX };           /* RX = wire→shm (receiver) ; TX = shm→wire (sender) */
 
 static volatile int g_stop = 0;
 static void on_signal(int s) { (void)s; g_stop = 1; }
@@ -66,6 +67,7 @@ struct target {
 /* Une session = un flux réseau décodé UNE fois sur le mtl_handle partagé, fan-out vers ses cibles. */
 struct sess {
   enum sess_kind kind;
+  enum sess_role role;      /* RX (wire→shm) ou TX (shm→wire) */
   mtl_handle st;            /* partagé (mtl_init unique) */
   char portname[MTL_PORT_MAX_LEN];
   /* réseau */
@@ -84,7 +86,8 @@ struct sess {
   int      seen;           /* marquage transitoire pendant un passage de réconciliation */
   char     sig[1024];      /* signature = identité+contenu ; un sig différent ⇒ recréer */
   /* ── vidéo ── */
-  st20p_rx_handle vh;
+  st20p_rx_handle vh;      /* RX */
+  st20p_tx_handle vth;     /* TX */
   int      width, height, bit_depth, interlaced; double fps;
   size_t   src_framesize; int conv8;
   enum st_frame_fmt out_fmt; int plane_h;
@@ -285,6 +288,81 @@ static int setup_video(struct sess* s) {
   return pthread_create(&s->thread, NULL, video_rx_thread, s) == 0 ? (s->started = 1, 0) : -1;
 }
 
+/* ═══ VIDÉO TX (shm→wire, st20p_tx) ═══════════════════════════════════════════ */
+/* Ouvre un shm EXISTANT en lecture (le shm d'entrée du TX, écrit par un producteur). Ne crée ni ne
+ * tronque (ne pas resizer le shm du producteur). Renvoie 0 si mappé et assez grand. */
+static int open_shm_in(struct sess* s, struct target* t, size_t want) {
+  int fd = open(t->shm_path, O_RDWR);
+  if (fd < 0) return -1;
+  struct stat stt;
+  if (fstat(fd, &stt) != 0 || (size_t)stt.st_size < want) { close(fd); return -1; }
+  t->shm_size = (size_t)stt.st_size;
+  t->shm_base = mmap(NULL, t->shm_size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+  close(fd);
+  if (t->shm_base == MAP_FAILED) { t->shm_base = NULL; return -1; }
+  t->frames_base = t->shm_base + s->hdr;
+  return 0;
+}
+
+/* Feeder TX : lit la frame courante du shm d'entrée (header [index,ts], ring) et l'émet. Up-shift
+ * 8→10 si le pipeline est en 8 bits (transport 2110-20 = 422-10). Le shm d'entrée est mappé
+ * PARESSEUSEMENT (le producteur peut démarrer après nous). Pacing assuré par ST20P_TX_FLAG_BLOCK_GET. */
+static void* video_tx_thread(void* arg) {
+  struct sess* s = arg;
+  struct target* t = &s->tg[0];                 /* la cible TX = l'unique shm d'entrée */
+  size_t out_size = st20p_tx_frame_size(s->vth);
+  while (!s->stop) {
+    if (!t->shm_base) {
+      if (open_shm_in(s, t, (size_t)s->hdr + s->slotsize) != 0) { usleep(20000); continue; }
+    }
+    struct st_frame* frame = st20p_tx_get_frame(s->vth);   /* bloque → pacing à fps */
+    if (!frame) { usleep(1000); continue; }
+    uint64_t fi = ((volatile uint64_t*)t->shm_base)[0];
+    long slot = (long)(fi % s->ring);
+    const uint8_t* src = t->frames_base + (size_t)slot * s->slotsize;
+    uint8_t* dst = (uint8_t*)frame->addr[0];
+    if (s->bit_depth == 8) {
+      uint16_t* d16 = (uint16_t*)dst;
+      size_t n = s->slotsize;                   /* 8 bits : slotsize octets = n échantillons */
+      for (size_t k = 0; k < n; k++) d16[k] = (uint16_t)src[k] << 2;   /* 8→10 */
+    } else {
+      memcpy(dst, src, out_size < s->slotsize ? out_size : s->slotsize);
+    }
+    st20p_tx_put_frame(s->vth, frame);
+    t->index = fi; t->recv++;
+  }
+  return NULL;
+}
+
+static int setup_video_tx(struct sess* s) {
+  if (s->ring < 2) s->ring = 2;                 /* ring du shm d'ENTRÉE (réglage du producteur) */
+  /* taille d'un slot du shm d'entrée (422 planar : 8b = 2·w·h octets, 10b = 4·w·h octets) */
+  s->slotsize = (size_t)(s->bit_depth == 8 ? 2 : 4) * (size_t)s->width * (size_t)s->height;
+
+  struct st20p_tx_ops ops; memset(&ops, 0, sizeof(ops));
+  ops.name = "bobi_mtl_vtx";
+  ops.priv = s;
+  ops.port.num_port = 1;
+  inet_pton(AF_INET, s->mcast, ops.port.dip_addr[MTL_SESSION_PORT_P]);   /* destination */
+  snprintf(ops.port.port[MTL_SESSION_PORT_P], MTL_PORT_MAX_LEN, "%s", s->portname);
+  ops.port.udp_port[MTL_SESSION_PORT_P] = s->udp_port;
+  ops.port.payload_type = s->payload_type;
+  ops.width = s->width; ops.height = s->height; ops.fps = to_st_fps(s->fps);
+  ops.interlaced = s->interlaced ? true : false;
+  ops.input_fmt = ST_FRAME_FMT_YUV422PLANAR10LE;   /* on fournit du 10-bit (up-shift 8→10 nous-mêmes) */
+  ops.transport_fmt = ST20_FMT_YUV_422_10BIT;
+  ops.device = ST_PLUGIN_DEVICE_AUTO;
+  ops.framebuff_cnt = 3;
+  ops.flags = ST20P_TX_FLAG_BLOCK_GET;             /* get_frame bloque → pacing à fps */
+
+  s->vth = st20p_tx_create(s->st, &ops);
+  if (!s->vth) { fprintf(stderr, "mtl_rx: st20p_tx_create fail (video %s:%d)\n", s->mcast, s->udp_port); return -1; }
+  fprintf(stderr, "mtl_rx[video TX] %dx%d%s fps=%.2f pt=%d → %s:%d (in shm=%s bd%d ring%d)\n",
+          s->width, s->height, s->interlaced ? "i" : "p", s->fps, s->payload_type,
+          s->mcast, s->udp_port, s->tg[0].shm_path, s->bit_depth, s->ring);
+  return pthread_create(&s->thread, NULL, video_tx_thread, s) == 0 ? (s->started = 1, 0) : -1;
+}
+
 static int setup_audio(struct sess* s) {
   if (s->channels <= 0) s->channels = 8;
   if (s->ring < 2) s->ring = 2;
@@ -351,6 +429,7 @@ static int parse_session_into(struct json_object* j, struct sess* s) {
   memset(s, 0, sizeof(*s));
   const char* kind = jstr(j,"kind","video");
   s->kind = !strcmp(kind,"audio") ? K_AUDIO : !strcmp(kind,"data") ? K_DATA : K_VIDEO;
+  s->role = !strcmp(jstr(j,"role","rx"), "tx") ? ROLE_TX : ROLE_RX;
   snprintf(s->mcast,sizeof(s->mcast),"%s",jstr(j,"mcast",""));
   s->udp_port=jint(j,"udp_port",0); s->payload_type=jint(j,"payload_type",96);
   s->ring=jint(j,"ring", s->kind==K_AUDIO?100:8); s->hdr=jint(j,"hdr",64);
@@ -377,8 +456,8 @@ static int parse_session_into(struct json_object* j, struct sess* s) {
 /* Signature = identité réseau + format + cibles. Un sig différent ⇒ on libère l'ancienne session et
  * on en recrée une (flow RX recyclé, device/XDP intacts ⇒ pas de faute PTP). */
 static void compute_sig(struct sess* s) {
-  int n = snprintf(s->sig, sizeof(s->sig), "%d|%s|%d|%d|%dx%d|%.2f|i%d|bd%d|r%d|",
-                   s->kind, s->mcast, s->udp_port, s->payload_type,
+  int n = snprintf(s->sig, sizeof(s->sig), "%d|%d|%s|%d|%d|%dx%d|%.2f|i%d|bd%d|r%d|",
+                   s->role, s->kind, s->mcast, s->udp_port, s->payload_type,
                    s->width, s->height, s->fps, s->interlaced, s->bit_depth, s->ring);
   for (int ti = 0; ti < s->ntg && n > 0 && n < (int)sizeof(s->sig); ti++)
     n += snprintf(s->sig + n, sizeof(s->sig) - n, "%s>%s,",
@@ -390,8 +469,9 @@ static void compute_sig(struct sess* s) {
 static void free_session(struct sess* s) {
   if (!s->used) return;
   if (s->started) { s->stop = 1; pthread_join(s->thread, NULL); }
-  if (s->kind == K_AUDIO) { if (s->ah) st30p_rx_free(s->ah); }
-  else                    { if (s->vh) st20p_rx_free(s->vh); }
+  if (s->role == ROLE_TX)      { if (s->vth) st20p_tx_free(s->vth); }
+  else if (s->kind == K_AUDIO) { if (s->ah) st30p_rx_free(s->ah); }
+  else                         { if (s->vh) st20p_rx_free(s->vh); }
   for (int ti = 0; ti < s->ntg; ti++) {
     struct target* t = &s->tg[ti];
     if (t->shm_base && t->shm_base != MAP_FAILED) munmap(t->shm_base, t->shm_size);
@@ -425,7 +505,8 @@ static void reconcile(struct sess* reg, const char* path, mtl_handle st, const c
     struct sess* s = &reg[slot];
     *s = want;
     s->st = st; snprintf(s->portname, sizeof(s->portname), "%s", portname); s->stop = 0;
-    int r = (s->kind == K_AUDIO) ? setup_audio(s) : setup_video(s);
+    int r = (s->role == ROLE_TX) ? setup_video_tx(s)
+            : (s->kind == K_AUDIO) ? setup_audio(s) : setup_video(s);
     if (r == 0) { s->used = 1; s->seen = 1; }
     else { fprintf(stderr,"mtl_rx: création session %s:%d échouée\n", s->mcast, s->udp_port); memset(s,0,sizeof(*s)); }
   }

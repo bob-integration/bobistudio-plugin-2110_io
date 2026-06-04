@@ -1,8 +1,11 @@
 {
-  "version": "0.12.0",
+  "version": "0.13.0",
   "date": "2026-06-04",
   "changes": {
     "Nouveautés": [
+      "Plan de données TX (émetteur) — le moteur fait désormais RX *et* TX sur le MÊME mtl_init. mtl_rx : sessions role=tx (st20p_tx + feeder shm→wire, up-shift 8→10, pacing BLOCK_GET) ajoutées/retirées à chaud par la même réconciliation que le RX. Contrôleur : slots TX (TX_COUNT), endpoint :8081/tx (destination mcast/port + shm d'entrée câblé + format), sessions TX écrites dans le config. Validé en place sur le moteur vivant : ajout d'un TX à chaud = mtl_init reste 1×, émission 25 fps / 1089 Mb/s (1080p25 422-10), RX intact, 0 faute PTP. Reste (lot suivant) : exposition orchestrateur (manifeste bi-rôle, rebuild_model NMOS cumulatif, hooks auto-alloc mcast, palette Destinations + find-or-create moteur)."
+    ],
+    "Nouveautés (0.12.0)": [
       "mtl_rx devient un DAEMON : mtl_init UNE fois (à vie), puis RÉCONCILIATION des sessions à chaud depuis le config (poll mtime) — plus de kill/relance à chaque changement d'abonnement. Le device auto-start/stop ne détache PAS le XDP (seul mtl_uninit le fait au stop du conteneur) → ptp4l ne faute qu'AU BOOT, plus jamais sur un abonnement/désabonnement/changement de slot. Threads + arrêt PROPRE par session (free_session : st20p_rx_free + munmap, device intact). Réconciliation par signature (identité réseau + format + cibles) : sig changé ⇒ flow recyclé sans toucher au device. Contrôleur : réécrit le config, lance le daemon 1× et le maintient (relance seulement s'il crashe, backoff + purge XDP). Validé en direct : +slot/−slot/→0/ré-abonnement = mtl_init 1×, 0 faute PTP hors boot, 0 crash-loop. Fondation du moteur de nœud bi-rôle (TX à venir)."
     ],
     "Corrections (0.11.1)": [
