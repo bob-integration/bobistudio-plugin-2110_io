@@ -328,6 +328,28 @@ _mtl_proc = None
 _mtl_lock = threading.Lock()
 _cur_sig = None
 _live = [False] * N_VIDEO     # slot vidéo idx actuellement servi par mtl_rx ?
+_last_launch = 0.0            # horodatage du dernier (re)lancement de mtl_rx
+_fail_streak = 0             # échecs rapides consécutifs (backoff)
+
+
+def _kill_mtl():
+    """Arrêt GRACIEUX de l'unique mtl_rx : SIGTERM + longue attente pour laisser mtl_uninit
+    détacher proprement le XDP et se désinscrire de MtlManager. SIGKILL en TOUT dernier recours
+    (un SIGKILL fait fuir le XDP → la session suivante ne peut plus s'attacher → crash-loop)."""
+    global _mtl_proc
+    if not _mtl_proc:
+        return
+    try:
+        _mtl_proc.terminate()
+        try: _mtl_proc.wait(timeout=10)
+        except Exception:
+            print("mtl_rx ne s'arrête pas — SIGKILL (XDP peut fuir)", flush=True)
+            _mtl_proc.kill()
+            try: _mtl_proc.wait(timeout=3)
+            except Exception: pass
+    except Exception:
+        pass
+    _mtl_proc = None
 
 
 def _video_session(idx, info):
@@ -376,7 +398,7 @@ def _read_stats(stats_path):
 def _manager_loop():
     """Recalcule l'ensemble des sessions vidéo ACTIVES (SDP présent, pas GÉN) et (re)lance UN
     mtl_rx (config JSON) quand l'ensemble change. Met à jour la résolution par slot + _live."""
-    global _mtl_proc, _cur_sig
+    global _mtl_proc, _cur_sig, _last_launch, _fail_streak
     while True:
         sessions = []
         for idx in range(N_VIDEO):
@@ -390,25 +412,30 @@ def _manager_loop():
                 sessions.append(_video_session(idx, sdp))
         sig = json.dumps(sessions, sort_keys=True)
         dead = (_mtl_proc is not None and _mtl_proc.poll() is not None)
-        if dead:
-            print("mtl_rx mort — relance", flush=True)
-        if sig != _cur_sig or dead:
-            active = set(s["idx"] for s in sessions)
-            for idx in range(N_VIDEO):
-                _live[idx] = idx in active
-            with _mtl_lock:
-                if _mtl_proc:
-                    _mtl_proc.terminate()
-                    try: _mtl_proc.wait(timeout=3)
-                    except Exception: _mtl_proc.kill()
-                    _mtl_proc = None
-                if sessions:
-                    with open(_CONFIG_PATH, "w") as f:
-                        json.dump({"pmd": "af_xdp", "iface": IFACE, "lcores": LCORES,
-                                   "sessions": sessions}, f)
-                    print("mtl_rx (re)lance : {} session(s) active(s)".format(len(sessions)), flush=True)
-                    _mtl_proc = subprocess.Popen([MTL_RX, "--config", _CONFIG_PATH])
-            _cur_sig = sig
+        if not (sig != _cur_sig or dead):
+            time.sleep(0.5); continue
+        # Backoff : si mtl_rx vient de mourir VITE après son lancement, c'est un échec (XDP/MtlManager)
+        # → on attend (laisse l'infra se reposer) au lieu de marteler (le crash-loop 529×).
+        if dead and (time.time() - _last_launch) < 6:
+            _fail_streak = min(_fail_streak + 1, 6)
+            wait = min(2 + 2 * _fail_streak, 15)
+            print("mtl_rx échec rapide (#{}) — backoff {}s".format(_fail_streak, wait), flush=True)
+            time.sleep(wait)
+        else:
+            _fail_streak = 0
+        active = set(s["idx"] for s in sessions)
+        for idx in range(N_VIDEO):
+            _live[idx] = idx in active
+        with _mtl_lock:
+            _kill_mtl()                                  # arrêt gracieux (XDP détaché proprement)
+            if sessions:
+                with open(_CONFIG_PATH, "w") as f:
+                    json.dump({"pmd": "af_xdp", "iface": IFACE, "lcores": LCORES,
+                               "sessions": sessions}, f)
+                print("mtl_rx (re)lance : {} session(s)".format(len(sessions)), flush=True)
+                _mtl_proc = subprocess.Popen([MTL_RX, "--config", _CONFIG_PATH])
+                _last_launch = time.time()
+        _cur_sig = sig
         time.sleep(0.5)
 
 
@@ -443,13 +470,16 @@ def _simu_loop(idx):
 
 
 def _cleanup(*a):
-    # Teardown gracieux : terminer l'unique mtl_rx multi-session. (Le détachement XDP est garanti
-    # côté orchestrateur par `ip link set <iface> xdp off` — MtlManager n'a pas le temps.)
-    global _mtl_proc
+    # Teardown gracieux : SIGTERM à mtl_rx + courte attente pour qu'il détache son XDP via
+    # mtl_uninit (sinon résidu → la session suivante ne peut plus s'attacher). Filet de sécurité
+    # côté orchestrateur : `ip link set <iface> xdp off` au destroy.
     with _mtl_lock:
         if _mtl_proc:
-            try: _mtl_proc.terminate()
-            except Exception: pass
+            try:
+                _mtl_proc.terminate()
+                _mtl_proc.wait(timeout=4)
+            except Exception:
+                pass
     raise SystemExit(0)
 
 
