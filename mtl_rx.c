@@ -107,6 +107,7 @@ struct sess {
   st30p_rx_handle ah;      /* RX */
   st30p_tx_handle a_tx;    /* TX */
   int      channels;
+  double   a_ptime;        /* ptime audio (ms) du SDP/réglage : 1.0, 0.125, 0.25… → ST30_PTIME_* */
   /* ── data / ANC (2110-40) ── */
   st40p_rx_handle d_rx;    /* RX */
   st40p_tx_handle d_tx;    /* TX */
@@ -305,6 +306,17 @@ static enum st_fps to_st_fps(double f) {
   return ST_FPS_P25;
 }
 
+/* ptime audio (ms) → enum ST30_PTIME. DOIT matcher le flux (a=ptime du SDP) sinon « pkt len
+ * mismatch » → tous les paquets droppés. Défaut 1 ms. framebuff_size reste 1 ms (multiple du
+ * paquet pour 1/0.25/0.125 ms → chunk shm inchangé). */
+static enum st30_ptime to_st30_ptime(double ms) {
+  if (fabs(ms - 0.125) < 0.01) return ST30_PTIME_125US;
+  if (fabs(ms - 0.25)  < 0.01) return ST30_PTIME_250US;
+  if (fabs(ms - 0.333) < 0.02) return ST30_PTIME_333US;
+  if (fabs(ms - 4.0)   < 0.05) return ST30_PTIME_4MS;
+  return ST30_PTIME_1MS;
+}
+
 /* mmap (création + ftruncate) du shm d'une cible, header à l'offset 0. Taille = hdr + ring*slot
  * (dimensions de la session, communes à toutes ses cibles). */
 static int open_shm(struct sess* s, struct target* t) {
@@ -480,7 +492,7 @@ static int setup_audio(struct sess* s) {
   ops.fmt = ST30_FMT_PCM24;
   ops.channel = (uint16_t)s->channels;
   ops.sampling = ST30_SAMPLING_48K;
-  ops.ptime = ST30_PTIME_1MS;
+  ops.ptime = to_st30_ptime(s->a_ptime);   /* AUTO depuis le SDP (a=ptime) / défaut réglage */
   ops.framebuff_size = (uint32_t)s->slotsize;   /* 1 chunk = 1 ms */
   ops.framebuff_cnt = 4;
 
@@ -533,7 +545,7 @@ static int setup_audio_tx(struct sess* s) {
   ops.fmt = ST30_FMT_PCM24;
   ops.channel = (uint16_t)s->channels;
   ops.sampling = ST30_SAMPLING_48K;
-  ops.ptime = ST30_PTIME_1MS;
+  ops.ptime = to_st30_ptime(s->a_ptime);   /* AUTO depuis le SDP (a=ptime) / défaut réglage */
   ops.framebuff_size = (uint32_t)s->slotsize;
   ops.framebuff_cnt = 4;
   ops.flags = ST30P_TX_FLAG_BLOCK_GET;
@@ -741,6 +753,7 @@ static int parse_session_into(struct json_object* j, struct sess* s) {
     s->bit_depth=jint(j,"bit_depth",10);
   } else if (s->kind == K_AUDIO) {
     s->channels=jint(j,"channels",8);
+    s->a_ptime=jdbl(j,"ptime",1.0);   /* ms ; doit matcher le flux (a=ptime du SDP) */
   } else {   /* K_DATA / ANC : seul fps compte (pacing TX) */
     s->fps=jdbl(j,"fps",25.0);
   }
@@ -758,9 +771,10 @@ static int parse_session_into(struct json_object* j, struct sess* s) {
 /* Signature = identité réseau + format + cibles. Un sig différent ⇒ on libère l'ancienne session et
  * on en recrée une (flow RX recyclé, device/XDP intacts ⇒ pas de faute PTP). */
 static void compute_sig(struct sess* s) {
-  int n = snprintf(s->sig, sizeof(s->sig), "%d|%d|%s|%d|%d|%dx%d|%.2f|i%d|f%d|bd%d|r%d|",
+  int n = snprintf(s->sig, sizeof(s->sig), "%d|%d|%s|%d|%d|%dx%d|%.2f|i%d|f%d|bd%d|r%d|ch%d|ap%.3f|",
                    s->role, s->kind, s->mcast, s->udp_port, s->payload_type,
-                   s->width, s->height, s->fps, s->interlaced, s->tff, s->bit_depth, s->ring);
+                   s->width, s->height, s->fps, s->interlaced, s->tff, s->bit_depth, s->ring,
+                   s->channels, s->a_ptime);
   for (int ti = 0; ti < s->ntg && n > 0 && n < (int)sizeof(s->sig); ti++)
     n += snprintf(s->sig + n, sizeof(s->sig) - n, "%s>%s,",
                   s->tg[ti].shm_path, s->tg[ti].has_ident ? s->tg[ti].ident_file : "-");
