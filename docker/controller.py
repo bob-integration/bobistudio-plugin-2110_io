@@ -38,6 +38,20 @@ MTL_RX     = os.environ.get("MTL_RX_BIN") or "/usr/local/bin/mtl_rx"
 HDR        = 64
 SDP_DIR    = "/tmp"
 
+
+def _detect_iface_ip(iface):
+    """IP v4 du PF — source IP des paquets TX (sip). Sans elle, source 0.0.0.0 → paquets souvent
+    rejetés / SSM impossible. La réception RX (IGMP join) n'en a pas besoin, mais l'émission oui."""
+    try:
+        out = subprocess.run(["ip", "-4", "-o", "addr", "show", iface],
+                             capture_output=True, text=True, timeout=3).stdout
+        m = re.search(r"inet (\d+\.\d+\.\d+\.\d+)", out)
+        return m.group(1) if m else ""
+    except Exception:
+        return ""
+
+SIP = os.environ.get("SIP") or _detect_iface_ip(IFACE)
+
 # ─── Layout shm (simu) — RÉSOLUTION DYNAMIQUE ───────────────────────
 # La simu (GÉN ou fallback sans SDP) doit suivre la résolution du flux LIVE (lue du SDP) pour
 # que le shm garde la MÊME taille que mtl_rx → les consommateurs ne cassent pas au basculement
@@ -188,7 +202,12 @@ class MetricsHandler(BaseHTTPRequestHandler):
             recs = [dict(m) for m in metrics]
         # fps agrégé = premier slot actif (compat get_metrics qui lit .fps top-level)
         top_fps = next((m["fps"] for m in recs if m.get("mode") == "mtl"), recs[0]["fps"] if recs else 0.0)
-        payload = {"fps": top_fps, "receivers": recs}
+        # Senders TX actifs (câblés) : SDP exposé pour le transportfile NMOS (manifest_href).
+        with _tx_lock:
+            senders = [{"tx_idx": i, "sdp": _tx_sdp(i, _tx[i])}
+                       for i in range(N_TX)
+                       if _tx[i]["enabled"] and _tx[i]["mcast"] and _tx[i]["udp_port"] and _tx[i]["shm_in"]]
+        payload = {"fps": top_fps, "receivers": recs, "senders": senders}
         self.wfile.write(json.dumps(payload).encode())
     def log_message(self, *a): pass
 
@@ -458,6 +477,34 @@ def _tx_session(idx, t):
             "targets": [{"idx": idx, "shm": shm, "stats": "/tmp/mtl_tx{}.json".format(idx)}]}
 
 
+_FR = {25.0: "25", 50.0: "50", 24.0: "24", 30.0: "30", 60.0: "60", 100.0: "100", 120.0: "120",
+       23.98: "24000/1001", 29.97: "30000/1001", 59.94: "60000/1001"}
+
+def _fps_str(fps):
+    f = round(float(fps or 25), 2)
+    return _FR.get(f) or (str(int(f)) if float(f).is_integer() else "{}/1001".format(int(round(f + 1))))
+
+def _tx_sdp(i, t):
+    """SDP ST 2110-20 d'un slot TX. Transport = 422-10 (depth=10 même si le shm est en 8 bits).
+    sip = IP du PF (source des paquets). L'orchestrateur ajoute ts-refclk (PTP) au fetch."""
+    return (
+        "v=0\r\n"
+        "o=- 0 0 IN IP4 {sip}\r\n"
+        "s={hn} TX{i}\r\n"
+        "t=0 0\r\n"
+        "m=video {port} RTP/AVP {pt}\r\n"
+        "c=IN IP4 {mcast}/64\r\n"
+        "a=source-filter: incl IN IP4 {mcast} {sip}\r\n"
+        "a=rtpmap:{pt} raw/90000\r\n"
+        "a=fmtp:{pt} sampling=YCbCr-4:2:2; width={w}; height={h}; exactframerate={fr}; depth=10; "
+        "colorimetry=BT709; PM=2110GPM; SSN=ST2110-20:2017; TP=2110TPN;\r\n"
+        "a=mediaclk:direct=0\r\n"
+    ).format(sip=SIP or "0.0.0.0", hn=HOSTNAME, i=i,
+             port=int(t.get("udp_port") or 0), pt=int(t.get("pt") or 96),
+             mcast=t.get("mcast") or "0.0.0.0", w=int(t.get("w") or 1920),
+             h=int(t.get("h") or 1080), fr=_fps_str(t.get("fps")))
+
+
 # ─── Simulation (mire numpy, mêmes en-têtes shm) — fallback sans SDP ou GÉN forcé ──
 def _simu_frame(mm, fi, idx, lay):
     w, h = lay["w"], lay["h"]
@@ -494,7 +541,7 @@ def _write_config(sessions):
     """Écrit le config lu par le DAEMON mtl_rx : device params (cap des files = N_VIDEO) + sessions
     désirées. Le daemon détecte le changement de mtime et RÉCONCILIE à chaud — aucune relance."""
     with open(_CONFIG_PATH, "w") as f:
-        json.dump({"pmd": "af_xdp", "iface": IFACE, "lcores": LCORES,
+        json.dump({"pmd": "af_xdp", "iface": IFACE, "lcores": LCORES, "sip": SIP,
                    "rx_queues": max(1, N_VIDEO), "tx_queues": max(1, N_TX + 1),
                    "sessions": sessions}, f)
 
