@@ -33,6 +33,7 @@ def before_deploy(params, context):
 def topology_ports(hostname, params, ctx):
     nv = int(params.get("video_count") or 0)
     na = int(params.get("audio_count") or 0)
+    nd = int(params.get("anc_count") or 0)
     video_fmt = {
         "width":  int(params.get("width") or 0),
         "height": int(params.get("height") or 0),
@@ -43,6 +44,7 @@ def topology_ports(hostname, params, ctx):
     audio_fmt = {"sample_rate": 48000, "channels": 8, "bit_depth": 24}
     produces  = [{"shm": f"{hostname}_{i}", "kind": "video", "format": video_fmt} for i in range(nv)]
     produces += [{"shm": f"{hostname}_audio_{i}", "kind": "audio", "format": audio_fmt} for i in range(na)]
+    produces += [{"shm": f"{hostname}_anc_{i}", "kind": "data", "format": {"type": "smpte291"}} for i in range(nd)]
     # Slots TX (émetteurs) = ports d'ENTRÉE câblables → destinations MXL à droite sur la page Câbles.
     # Le shm câblé est persisté à plat dans deploy_config sous tx{i}_shm (state_field du manifeste).
     consumes = []
@@ -60,14 +62,17 @@ def topology_ports(hostname, params, ctx):
 
 
 def produced_flow_count(params, ctx):
-    return int(params.get("video_count") or 0) + int(params.get("audio_count") or 0)
+    return (int(params.get("video_count") or 0) + int(params.get("audio_count") or 0)
+            + int(params.get("anc_count") or 0))
 
 
 def produced_shms(hostname, params, ctx):
     nv = int(params.get("video_count") or 0)
     na = int(params.get("audio_count") or 0)
+    nd = int(params.get("anc_count") or 0)
     return ([f"{hostname}_{i}" for i in range(nv)]
-            + [f"{hostname}_audio_{i}" for i in range(na)])
+            + [f"{hostname}_audio_{i}" for i in range(na)]
+            + [f"{hostname}_anc_{i}" for i in range(nd)])
 
 
 def control_action(action, body, params, ctx):
@@ -124,14 +129,16 @@ def source_shm(params, context):
     """Colonnes source/shm_out pour le dashboard (identique receiver_2110)."""
     nv = int(params.get("video_count", 0))
     na = int(params.get("audio_count", 0))
+    nd = int(params.get("anc_count", 0))
     hn = params.get("hostname", "mxl")
     if params.get("sim_master") or params.get("simulation"):
-        parts  = (([f"{nv}v simu"] if nv else []) + ([f"{na}a simu"] if na else []))
+        parts  = (([f"{nv}v simu"] if nv else []) + ([f"{na}a simu"] if na else []) + ([f"{nd} ANC"] if nd else []))
         source = " + ".join(parts) or "simu"
     else:
-        parts  = (([f"{nv} NMOS vidéo"] if nv else []) + ([f"{na} NMOS audio"] if na else []))
+        parts  = (([f"{nv} NMOS vidéo"] if nv else []) + ([f"{na} NMOS audio"] if na else []) + ([f"{nd} NMOS ANC"] if nd else []))
         source = " + ".join(parts) or "NMOS"
     shm_parts = []
     if nv: shm_parts.append(f"{hn}_0..{nv-1}" if nv > 1 else f"{hn}_0")
     if na: shm_parts.append(f"{hn}_audio_0..{na-1}" if na > 1 else f"{hn}_audio_0")
+    if nd: shm_parts.append(f"{hn}_anc_0..{nd-1}" if nd > 1 else f"{hn}_anc_0")
     return {"source": source, "shm": " · ".join(shm_parts) or "—"}

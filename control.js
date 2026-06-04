@@ -119,15 +119,18 @@ window.MXLPlugins["receiver_2110_mtl"] = {
         : '<span style="color:var(--text-muted)">—</span>';
       const mxl = r.shm_path ? esc(r.shm_path) : '<span style="color:var(--text-muted)">—</span>';
       const isAudio = r.essence === 'audio';
+      const isAnc   = r.essence === 'anc';
       const ess = isAudio ? 'audio' : 'video';
-      // Nommage : « Vidéo 1 » ; « Audio 1-1 » = vidéo 1, 1ʳᵉ piste audio de cette vidéo.
-      const tag = isAudio
+      // Nommage : « Vidéo 1 » ; « Audio 1-1 » = vidéo 1, 1ʳᵉ piste audio de cette vidéo ; « ANC 1 ».
+      const tag = isAnc
+        ? `ANC ${(r.video_idx != null ? r.video_idx : r.idx) + 1}`
+        : isAudio
         ? ((r.video_idx != null && r.audio_sub_idx != null)
             ? `Audio ${r.video_idx + 1}-${r.audio_sub_idx + 1}`
             : `Audio ${r.idx + 1}`)
         : `Vidéo ${r.idx + 1}`;
-      // Bouton générateur : data-* lus par délégation (pas d'onclick global).
-      const genIcon = `<span class="gen-wrap">
+      // Bouton générateur : data-* lus par délégation (pas d'onclick global). Pas de GÉN pour l'ANC.
+      const genIcon = isAnc ? '' : `<span class="gen-wrap">
           <span class="gen-badge ${r.simulated ? 'on' : 'off'}" role="button" tabindex="0"
                 data-essence="${ess}" data-idx="${r.idx}" data-enable="${r.simulated ? '0' : '1'}">GÉN</span>
           ${genTooltip(r, isAudio)}
@@ -136,7 +139,7 @@ window.MXLPlugins["receiver_2110_mtl"] = {
       // IDENT : badge marche/arrêt + petit rotatif compact pour la taille du texte
       // (glisser ↕ ou molette) — reste dans sa colonne, ne décale pas le badge GÉN.
       const identSz = r.ident_size || Math.max(12, Math.round((r.height || 720) / 28));
-      const identCtl = isAudio ? '' : `<span class="ident-wrap">
+      const identCtl = (isAudio || isAnc) ? '' : `<span class="ident-wrap">
           <span class="ident-badge ${r.ident ? 'on' : 'off'}" role="button" tabindex="0"
                 data-idx="${r.idx}" data-enable="${r.ident ? '0' : '1'}"
                 title="Incrustation 3 lignes (nom · source/multicast · format), fond noir, haut-droite">IDENT</span>
@@ -150,13 +153,24 @@ window.MXLPlugins["receiver_2110_mtl"] = {
       // SDP (vidéo uniquement) : badge ouvrant une modale d'affichage/édition.
       // Le SDP n'est PAS inliné dans le HTML (multiligne) — on le garde en cache
       // par idx (_sdpByIdx, scope mount), la modale le relit.
-      if (!isAudio) _sdpByIdx[r.idx] = r.sdp || '';
-      const sdpCtl = isAudio ? '' : `<span class="sdp-wrap">
+      if (!isAudio && !isAnc) _sdpByIdx[r.idx] = r.sdp || '';
+      const sdpCtl = (isAudio || isAnc) ? '' : `<span class="sdp-wrap">
           <span class="sdp-badge ${r.sdp ? 'on' : 'off'}" role="button" tabindex="0"
                 data-idx="${r.idx}"
                 title="Afficher / coller le SDP (abonnement NMOS manuel)">SDP</span>
         </span>`;
-      const rateCell = isAudio
+      const rateCell = isAnc
+        ? (() => {
+            const flowing = Number(r.fps) > 0;
+            const tc = r.timecode || '--:--:--:--';
+            const col = flowing ? 'var(--status-running-fg)' : 'var(--status-stopped-fg)';
+            const tip = flowing
+              ? (r.timecode ? 'ANC 2110-40 actif · timecode ATC (SMPTE 12-1)' + (r.df ? ' · drop-frame' : '')
+                            : 'ANC 2110-40 actif · pas de timecode ATC dans le flux')
+              : 'Aucun paquet ANC reçu sur ce slot';
+            return `<span style="color:${col};font-family:var(--font-mono,ui-monospace,monospace);letter-spacing:.5px" title="${tip}">${esc(tc)}${r.df ? ' DF' : ''}</span>`;
+          })()
+        : isAudio
         ? (() => {
             const flowing = Number(r.fps) > 0;
             const col = flowing ? 'var(--status-running-fg)' : 'var(--status-stopped-fg)';
@@ -165,8 +179,9 @@ window.MXLPlugins["receiver_2110_mtl"] = {
             return `<span style="color:${col}" title="${tip}">${txt}</span>`;
           })()
         : `<span title="format vidéo">${fmtVideoFormat(r)}</span>`;
-      return `<div class="flow-row ${isAudio ? 'flow-audio' : 'flow-video'}">
-        <span class="flow-tag ${isAudio ? 'a' : 'v'}">${tag}</span>
+      const rowCls = isAnc ? 'flow-anc' : isAudio ? 'flow-audio' : 'flow-video';
+      return `<div class="flow-row ${rowCls}">
+        <span class="flow-tag ${isAnc ? 'd' : isAudio ? 'a' : 'v'}">${tag}</span>
         ${genIcon}
         ${identCtl}
         ${sdpCtl}
@@ -179,14 +194,21 @@ window.MXLPlugins["receiver_2110_mtl"] = {
     function groupEnsembles(receivers){
       const videos = receivers.filter(x => x.essence === 'video');
       const audios = receivers.filter(x => x.essence === 'audio');
-      if (videos.length === 0) return audios.map(a => ({video: null, audios: [a]}));
-      const groups = videos.map(v => ({video: v, audios: []}));
+      const ancs   = receivers.filter(x => x.essence === 'anc');
+      if (videos.length === 0)
+        return audios.map(a => ({video: null, audios: [a], ancs: []}))
+                     .concat(ancs.map(d => ({video: null, audios: [], ancs: [d]})));
+      const groups = videos.map(v => ({video: v, audios: [], ancs: []}));
       const byVid = {};
       groups.forEach(g => { byVid[g.video.idx] = g; });
-      // Associe chaque audio à SA vidéo (video_idx) ; fallback : idx (ancien 1:1).
+      // Associe chaque audio/ANC à SA vidéo (video_idx) ; fallback : idx (ancien 1:1).
       audios.forEach(a => {
         const vi = (a.video_idx != null) ? a.video_idx : a.idx;
         (byVid[vi] || groups[groups.length - 1]).audios.push(a);
+      });
+      ancs.forEach(d => {
+        const vi = (d.video_idx != null) ? d.video_idx : d.idx;
+        (byVid[vi] || groups[groups.length - 1]).ancs.push(d);
       });
       return groups;
     }
@@ -204,9 +226,11 @@ window.MXLPlugins["receiver_2110_mtl"] = {
             const rows = [];
             if (g.video) rows.push(rowReceiver(g.video));
             g.audios.forEach(a => rows.push(rowReceiver(a)));
+            (g.ancs || []).forEach(d => rows.push(rowReceiver(d)));
             const titleParts = [];
             if (g.video) titleParts.push('1 vidéo');
             if (g.audios.length) titleParts.push(`${g.audios.length} audio`);
+            if ((g.ancs || []).length) titleParts.push(`${g.ancs.length} ANC`);
             return `<div class="ens">
               <div class="ens-title">Ensemble #${i} — ${titleParts.join(' + ')}</div>
               ${rows.join('')}
