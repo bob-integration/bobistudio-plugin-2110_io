@@ -811,6 +811,28 @@ static void reconcile(struct sess* reg, const char* path, mtl_handle st, const c
   }
   for (int i = 0; i < MAX_SESS; i++) reg[i].seen = 0;
   int n = json_object_array_length(arr);
+
+  /* Pass 1 — MATCH : marquer « seen » les sessions désirées DÉJÀ présentes (sig identique).
+   * On ne crée RIEN ici (une session inchangée — ex. la vidéo — n'est pas touchée → pas de faute PTP). */
+  for (int k = 0; k < n; k++) {
+    struct sess want;
+    if (parse_session_into(json_object_array_get_idx(arr, k), &want) != 0) continue;
+    compute_sig(&want);
+    for (int i = 0; i < MAX_SESS; i++)
+      if (reg[i].used && !reg[i].seen && !strcmp(reg[i].sig, want.sig)) { reg[i].seen = 1; break; }
+  }
+
+  /* Pass 2 — FREE-BEFORE-CREATE : libérer les sessions périmées AVANT toute création. Libère leur
+   * file/flow AF_XDP (mt_rx_xdp_put) ; sinon recréer un flux pour une source CHANGÉE échoue
+   * (« create flow fail -5 ») tant que l'ancienne session tient ses ressources → on se retrouvait
+   * sans aucune session (cas changement de source audio). */
+  for (int i = 0; i < MAX_SESS; i++)
+    if (reg[i].used && !reg[i].seen) {
+      fprintf(stderr,"mtl_rx: retrait session %s:%d\n", reg[i].mcast, reg[i].udp_port);
+      free_session(&reg[i]);
+    }
+
+  /* Pass 3 — CREATE : monter les sessions désirées encore absentes (file/flow maintenant libres). */
   for (int k = 0; k < n; k++) {
     struct sess want;
     if (parse_session_into(json_object_array_get_idx(arr, k), &want) != 0) continue;
@@ -818,7 +840,7 @@ static void reconcile(struct sess* reg, const char* path, mtl_handle st, const c
     int found = -1;
     for (int i = 0; i < MAX_SESS; i++)
       if (reg[i].used && !strcmp(reg[i].sig, want.sig)) { found = i; break; }
-    if (found >= 0) { reg[found].seen = 1; continue; }      /* inchangée → on garde telle quelle */
+    if (found >= 0) continue;                                /* déjà présente (gardée en Pass 1) */
     int slot = -1;
     for (int i = 0; i < MAX_SESS; i++) if (!reg[i].used) { slot = i; break; }
     if (slot < 0) { fprintf(stderr,"mtl_rx: registre plein, session ignorée\n"); continue; }
@@ -831,11 +853,6 @@ static void reconcile(struct sess* reg, const char* path, mtl_handle st, const c
     if (r == 0) { s->used = 1; s->seen = 1; }
     else { fprintf(stderr,"mtl_rx: création session %s:%d échouée\n", s->mcast, s->udp_port); memset(s,0,sizeof(*s)); }
   }
-  for (int i = 0; i < MAX_SESS; i++)
-    if (reg[i].used && !reg[i].seen) {
-      fprintf(stderr,"mtl_rx: retrait session %s:%d\n", reg[i].mcast, reg[i].udp_port);
-      free_session(&reg[i]);
-    }
   json_object_put(root);
 }
 
