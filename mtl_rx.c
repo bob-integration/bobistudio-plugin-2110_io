@@ -462,7 +462,10 @@ int main(int argc, char** argv) {
   uint64_t last[MAX_SESS]; memset(last, 0, sizeof(last));
   time_t last_t = time(NULL);
   while (!g_stop) {
-    sleep(2);
+    /* dort ~2s MAIS réactif au SIGTERM (sinon mtl_uninit tarde → le manager SIGKILL →
+     * XDP/registration MtlManager fuient → la session suivante ne peut plus s'attacher). */
+    for (int z = 0; z < 20 && !g_stop; z++) usleep(100000);
+    if (g_stop) break;
     time_t now = time(NULL); double dt = difftime(now, last_t); last_t = now;
     for (int k = 0; k < ns; k++) {
       struct sess* s = &S[k];
