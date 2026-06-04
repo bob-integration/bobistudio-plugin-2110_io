@@ -52,7 +52,7 @@ RUN cd /src/MTL/manager \
 
 # 4) Notre binaire de réception.
 COPY mtl_rx.c /src/mtl_rx.c
-RUN cc -O2 -o /usr/local/bin/mtl_rx /src/mtl_rx.c $(pkg-config --cflags --libs mtl) -lpthread -lm
+RUN cc -O2 -o /usr/local/bin/mtl_rx /src/mtl_rx.c $(pkg-config --cflags --libs mtl) -ljson-c -lpthread -lm
 
 # 5) DDP comms : NON copié ici. En AF_XDP/kernel le DDP est chargé par le driver ice de l'HÔTE.
 #    Pour le mode PF-DPDK-in-container (plus tard), monter le .pkg via `docker run -v` à
