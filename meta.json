@@ -1,9 +1,12 @@
 {
-  "version": "0.8.0",
+  "version": "0.8.1",
   "date": "2026-06-04",
   "changes": {
     "Nouveautés": [
-      "Conformité profondeur de bits au pipeline MXL : mtl_rx accepte --bit_depth et choisit l'output_fmt planar (8→YUV422PLANAR8, 10→10LE, 12→12LE) ; deploy_docker applique mxl_pipeline_bit_depth (force8 par défaut) → le contrôleur passe la profondeur à mtl_rx + à la simu. Corrige l'image verte/fantôme (le shm était écrit en 10 bits, lu en 8 bits par les consommateurs)."
+      "Conversion 10→8 bits faite dans mtl_rx : libmtl n'a PAS de converter 422-10 → planar 8 (« plugin not found »), donc l'output_fmt PLANAR8 ne convertissait pas (image résiduellement dégradée). On reçoit désormais en PLANAR10LE (converter présent) et on convertit 10→8 (v>>2) à la copie quand le pipeline est en 8 bits (force8), en mode af_xdp/kernel. Corrige l'image verte/fantôme."
+    ],
+    "Nouveautés (0.8.0, remplacé)": [
+      "Tentative --bit_depth → output_fmt PLANAR8 (ne marche pas : pas de converter libmtl). deploy_docker applique mxl_pipeline_bit_depth (force8). Conservé : contrôleur passe --bit_depth."
     ],
     "Nouveautés (0.7.0)": [
       "Panneau de contrôle identique à receiver_2110 : même carte (ensembles vidéo/audio, format, état NMOS, badges GÉN/IDENT/SDP, modale SDP d'abonnement manuel). Données via /api/nmos/receivers/<vmid>/detail + fps live :8080. Hooks control_action (gen/ident) portés. NB : le hot-wire GÉN/IDENT et l'overlay IDENT côté conteneur nécessitent la mise à jour du contrôleur (:8082) — sinon repli redeploy."
