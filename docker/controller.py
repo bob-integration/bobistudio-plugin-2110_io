@@ -27,6 +27,7 @@ HOSTNAME   = os.environ.get("HOSTNAME_RX") or os.environ.get("HOSTNAME") or "mtl
 N_VIDEO    = int(os.environ.get("RX_COUNT") or os.environ.get("VIDEO_COUNT") or 1)   # slots RX vidéo
 N_TX       = int(os.environ.get("TX_COUNT") or 0)                                     # slots TX (senders)
 N_AUDIO    = int(os.environ.get("AUDIO_COUNT") or 0)                                   # slots RX audio (st30)
+N_ANC      = int(os.environ.get("ANC_COUNT") or 0)                                     # slots RX ANC (st40)
 A_CHANNELS = 8
 A_RING     = max(2, int(os.environ.get("AUDIO_RING") or 100))   # ring shm audio (chunks 1ms)
 IFACE      = os.environ.get("IFACE") or "ens1f0np0"
@@ -203,13 +204,31 @@ class MetricsHandler(BaseHTTPRequestHandler):
         self.end_headers()
         with metrics_lock:
             recs = [dict(m) for m in metrics]
+        # Receivers ANC (2110-40) : pas de simu (n'existent que si abonnés) → lus à la volée depuis
+        # leur stats json (fps + frame_index + timecode ATC) et exposés en essence "anc".
+        for idx in range(N_ANC):
+            d = _read_stats_raw("/tmp/mtl_anc{}.json".format(idx))
+            if d is None:
+                continue
+            rec = {"idx": idx, "essence": "anc", "fps": float(d.get("fps", 0.0)),
+                   "frame_index": int(d.get("frame_index", 0)),
+                   "mode": "mtl" if float(d.get("fps", 0.0)) > 0 else "idle"}
+            if d.get("timecode"):
+                rec["timecode"] = d["timecode"]; rec["df"] = bool(d.get("df"))
+            recs.append(rec)
         # fps agrégé = premier slot actif (compat get_metrics qui lit .fps top-level)
         top_fps = next((m["fps"] for m in recs if m.get("mode") == "mtl"), recs[0]["fps"] if recs else 0.0)
         # Senders TX actifs (câblés) : SDP exposé pour le transportfile NMOS (manifest_href).
         with _tx_lock:
-            senders = [{"tx_idx": i, "sdp": _tx_sdp(i, _tx[i])}
-                       for i in range(N_TX)
-                       if _tx[i]["enabled"] and _tx[i]["mcast"] and _tx[i]["udp_port"] and _tx[i]["shm_in"]]
+            senders = []
+            for i in range(N_TX):
+                t = _tx[i]
+                if not (t["enabled"] and t["shm_in"]):
+                    continue
+                if t["mcast"] and t["udp_port"]:
+                    senders.append({"tx_idx": i, "essence": "video", "sdp": _tx_sdp(i, t)})
+                if t.get("anc_mcast") and t.get("anc_port"):
+                    senders.append({"tx_idx": i, "essence": "anc", "sdp": _anc_sdp(i, t)})
         payload = {"fps": top_fps, "receivers": recs, "senders": senders}
         self.wfile.write(json.dumps(payload).encode())
     def log_message(self, *a): pass
@@ -243,9 +262,9 @@ class AgentHandler(BaseHTTPRequestHandler):
             sdp     = body.get("sdp")
             if isinstance(sdp, list):            # SMPTE 2022-7 : on garde la leg 0 en v1
                 sdp = sdp[0] if sdp else None
-            if essence not in ("video", "audio"):  # ANC (2110-40) non implémenté
+            if essence not in ("video", "audio", "anc"):
                 return self._json(200, {"ok": True, "note": "{} ignoré".format(essence)})
-            pfx  = "nmos_recv_a_" if essence == "audio" else "nmos_recv_v_"
+            pfx  = {"audio": "nmos_recv_a_", "anc": "nmos_recv_anc_"}.get(essence, "nmos_recv_v_")
             path = os.path.join(SDP_DIR, "{}{}.sdp".format(pfx, idx))
             try:
                 if enabled and sdp:
@@ -273,6 +292,9 @@ class AgentHandler(BaseHTTPRequestHandler):
                 if "audio_mcast" in body: t["audio_mcast"] = body.get("audio_mcast") or None
                 if "audio_port"  in body: t["audio_port"]  = int(body.get("audio_port") or 0)
                 if "audio_pt"    in body: t["audio_pt"]    = int(body.get("audio_pt") or 97)
+                if "anc_mcast"   in body: t["anc_mcast"]   = body.get("anc_mcast") or None
+                if "anc_port"    in body: t["anc_port"]    = int(body.get("anc_port") or 0)
+                if "anc_pt"      in body: t["anc_pt"]      = int(body.get("anc_pt") or 97)
                 for k_in, k_st in (("width","w"),("height","h"),("fps","fps"),("bit_depth","bd"),("ring","ring")):
                     if body.get(k_in):
                         t[k_st] = (float(body[k_in]) if k_st == "fps" else int(body[k_in]))
@@ -429,6 +451,41 @@ def _audio_tx_session(idx, t, shm_in):
             "targets": [{"idx": idx, "shm": shm_in, "stats": "/tmp/mtl_atx{}.json".format(idx)}]}
 
 
+# ─── ANC (ST 2110-40 / data) ────────────────────────────────────────
+def _parse_sdp_anc(path):
+    """SDP 2110-40 : un m=video déclaré en smpte291 (a=rtpmap:<pt> smpte291/90000). On extrait
+    c=/port/pt. C'est l'ANC : passthrough + extraction timecode côté mtl_rx."""
+    try:
+        txt = open(path).read()
+    except Exception:
+        return None
+    m = re.search(r"^m=video\s+(\d+)\s+RTP/AVP\s+(\d+)", txt, re.M)
+    c = re.search(r"^c=IN\s+IP4\s+([0-9.]+)", txt, re.M)
+    if not (m and c and re.search(r"smpte291", txt, re.I)):
+        return None
+    return {"port": int(m.group(1)), "pt": int(m.group(2)), "mcast": c.group(1)}
+
+def _anc_session(idx, info):
+    """Session RX ANC st40 → /dev/shm/{hn}_anc_{idx} (meta+udw sérialisés par mtl_rx)."""
+    return {"kind": "data", "role": "rx",
+            "mcast": info["mcast"], "udp_port": info["port"], "payload_type": info["pt"],
+            "ring": 8, "hdr": HDR,
+            "targets": [{"idx": idx, "shm": "/dev/shm/{}_anc_{}".format(HOSTNAME, idx),
+                         "stats": "/tmp/mtl_anc{}.json".format(idx)}]}
+
+def _derive_anc_shm(video_shm):
+    """shm vidéo câblé → shm ANC associé : 'mtl_0' → 'mtl_anc_0' (None si pas de _N final)."""
+    m = re.match(r"^(.*)_(\d+)$", (video_shm or "").strip())
+    return "{}_anc_{}".format(m.group(1), m.group(2)) if m else None
+
+def _anc_tx_session(idx, t, shm_in):
+    """Session TX ANC st40 : ré-émet le shm ANC d'entrée (passthrough) vers la dest ANC du slot."""
+    return {"kind": "data", "role": "tx",
+            "mcast": t["anc_mcast"], "udp_port": t["anc_port"], "payload_type": t.get("anc_pt", 97),
+            "fps": t.get("fps") or FPS, "ring": 8, "hdr": HDR,
+            "targets": [{"idx": idx, "shm": shm_in, "stats": "/tmp/mtl_anctx{}.json".format(idx)}]}
+
+
 # ─── Gestionnaire de sessions central ───────────────────────────────
 # UN SEUL mtl_rx multi-session (un mtl_init = un PF) sert TOUTES les sessions actives. Le manager
 # recalcule l'ensemble actif (slots avec SDP, pas GÉN) et (re)lance mtl_rx avec un config JSON
@@ -447,7 +504,8 @@ _fail_streak = 0             # échecs rapides consécutifs (backoff)
 # shm_in (non câblé) ou désactivé n'émet pas.
 _tx = [{"enabled": False, "mcast": None, "udp_port": 0, "pt": 96, "shm_in": None,
         "w": WIDTH, "h": HEIGHT, "fps": FPS, "bd": BIT_DEPTH, "ring": V_RING,
-        "audio_mcast": None, "audio_port": 0, "audio_pt": 97}
+        "audio_mcast": None, "audio_port": 0, "audio_pt": 97,
+        "anc_mcast": None, "anc_port": 0, "anc_pt": 97}
        for _ in range(N_TX)]
 _tx_lock = threading.Lock()
 
@@ -548,6 +606,23 @@ def _tx_sdp(i, t):
              mcast=t.get("mcast") or "0.0.0.0", w=int(t.get("w") or 1920),
              h=int(t.get("h") or 1080), fr=_fps_str(t.get("fps")))
 
+def _anc_sdp(i, t):
+    """SDP ST 2110-40 (ANC / SMPTE 291) d'un slot TX. dest = anc_mcast/anc_port du slot."""
+    return (
+        "v=0\r\n"
+        "o=- 0 0 IN IP4 {sip}\r\n"
+        "s={hn} TX{i} ANC\r\n"
+        "t=0 0\r\n"
+        "m=video {port} RTP/AVP {pt}\r\n"
+        "c=IN IP4 {mcast}/64\r\n"
+        "a=source-filter: incl IN IP4 {mcast} {sip}\r\n"
+        "a=rtpmap:{pt} smpte291/90000\r\n"
+        "a=fmtp:{pt} TP=2110TPN; SSN=ST2110-40:2018;\r\n"
+        "a=mediaclk:direct=0\r\n"
+    ).format(sip=SIP or "0.0.0.0", hn=HOSTNAME, i=i,
+             port=int(t.get("anc_port") or 0), pt=int(t.get("anc_pt") or 97),
+             mcast=t.get("anc_mcast") or "0.0.0.0")
+
 
 # ─── Simulation (mire numpy, mêmes en-têtes shm) — fallback sans SDP ou GÉN forcé ──
 def _simu_frame(mm, fi, idx, lay):
@@ -580,13 +655,21 @@ def _read_stats(stats_path):
     except Exception:
         return None
 
+def _read_stats_raw(stats_path):
+    """Lit le stats json complet (fps/frame_index + timecode/df pour l'ANC), ou None si absent."""
+    try:
+        with open(stats_path) as f:
+            return json.load(f)
+    except Exception:
+        return None
+
 
 def _write_config(sessions):
     """Écrit le config lu par le DAEMON mtl_rx : device params (cap des files = N_VIDEO) + sessions
     désirées. Le daemon détecte le changement de mtime et RÉCONCILIE à chaud — aucune relance."""
     with open(_CONFIG_PATH, "w") as f:
         json.dump({"pmd": "af_xdp", "iface": IFACE, "lcores": LCORES, "sip": SIP,
-                   "rx_queues": max(1, N_VIDEO + N_AUDIO), "tx_queues": max(1, N_TX * 2 + 1),
+                   "rx_queues": max(1, N_VIDEO + N_AUDIO + N_ANC), "tx_queues": max(1, N_TX * 3 + 1),
                    "sessions": sessions}, f)
 
 
@@ -631,6 +714,13 @@ def _manager_loop():
             if ainfo:
                 sessions.append(_audio_session(idx, ainfo))
 
+        # Sessions RX ANC (2110-40) : SDP smpte291 actif → écrit /dev/shm/{hn}_anc_{idx} + timecode.
+        for idx in range(N_ANC):
+            dpath = "{}/nmos_recv_anc_{}.sdp".format(SDP_DIR, idx)
+            dinfo = _parse_sdp_anc(dpath) if os.path.exists(dpath) else None
+            if dinfo:
+                sessions.append(_anc_session(idx, dinfo))
+
         # Sessions TX : un slot émet s'il est activé, a une destination et un shm d'entrée câblé.
         with _tx_lock:
             for i in range(N_TX):
@@ -643,6 +733,12 @@ def _manager_loop():
                     if not ashm.startswith("/"):
                         ashm = "/dev/shm/" + ashm
                     sessions.append(_audio_tx_session(i, t, ashm))
+                # TX ANC : suit la vidéo (shm ANC dérivé) si une dest ANC est réglée sur le slot.
+                dshm = _derive_anc_shm(t["shm_in"])
+                if t["enabled"] and t.get("anc_mcast") and t.get("anc_port") and dshm:
+                    if not dshm.startswith("/"):
+                        dshm = "/dev/shm/" + dshm
+                    sessions.append(_anc_tx_session(i, t, dshm))
 
         # 1) config : réécrit dès qu'il change → le daemon réconcilie à chaud (aucune relance/faute PTP)
         sig = json.dumps(sessions, sort_keys=True)

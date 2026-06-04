@@ -34,13 +34,20 @@
 
 #include <mtl/st_pipeline_api.h>
 #include <mtl/st30_pipeline_api.h>
+#include <mtl/st40_pipeline_api.h>
 #include <json-c/json.h>
 
 #define MAX_FB    64
 #define MAX_SESS  16
 #define MAX_TG    16   /* cibles (shm de sortie) par session : fan-out même-source → N slots */
 
-enum sess_kind { K_VIDEO, K_AUDIO, K_DATA };   /* DATA = ST 2110-40, prêt mais non implémenté */
+/* ── ANC / ST 2110-40 (data) ── un slot shm ANC sérialise un frame st40 (meta + udw). */
+#define ANC_SLOT     8192u    /* taille d'un slot ANC (sérialisation bornée) */
+#define ANC_MAX_UDW  4000u    /* buffer UDW max par frame (octets, 1 o = 1 UDW low8) */
+/* En-tête de slot : [u32 meta_num][u32 udw_fill], puis meta_num × anc_meta_rec, puis udw_fill octets. */
+struct anc_meta_rec { uint16_t did, sdid, line, hori, udw_size, udw_offset, c, s; };  /* 16 o */
+
+enum sess_kind { K_VIDEO, K_AUDIO, K_DATA };   /* DATA = ST 2110-40 ANC (passthrough + timecode) */
 enum sess_role { ROLE_RX, ROLE_TX };           /* RX = wire→shm (receiver) ; TX = shm→wire (sender) */
 
 static volatile int g_stop = 0;
@@ -62,6 +69,8 @@ struct target {
   uint64_t recv;           /* compteur reçu (pour le débit) */
   char     ident_file[300]; int has_ident;
   uint8_t* ident_patch; int id_bw, id_bh; long id_mtime;
+  /* timecode ATC (data/ANC) — dernier TC décodé, publié dans les stats */
+  char     tc[16]; int tc_df; int tc_valid;
 };
 
 /* Une session = un flux réseau décodé UNE fois sur le mtl_handle partagé, fan-out vers ses cibles. */
@@ -95,6 +104,10 @@ struct sess {
   st30p_rx_handle ah;      /* RX */
   st30p_tx_handle a_tx;    /* TX */
   int      channels;
+  /* ── data / ANC (2110-40) ── */
+  st40p_rx_handle d_rx;    /* RX */
+  st40p_tx_handle d_tx;    /* TX */
+  uint32_t max_udw;        /* taille du buffer UDW (octets) */
 };
 
 static void write_shm_header(struct target* t, uint64_t i) {
@@ -449,6 +462,156 @@ static int setup_audio_tx(struct sess* s) {
   return pthread_create(&s->thread, NULL, audio_tx_thread, s) == 0 ? (s->started = 1, 0) : -1;
 }
 
+/* ═══ DATA / ANC — ST 2110-40 (st40p) ═════════════════════════════════════════ */
+/* Le pipeline st40p présente udw_buff_addr comme un tableau d'OCTETS (1 o = 1 UDW, low 8 bits,
+ * parité déjà vérifiée à la réception) ; meta[k].udw_offset = offset OCTET dans ce tableau,
+ * meta[k].udw_size = nombre de UDW. RX et TX utilisent ce MÊME format → passthrough = copie. */
+
+/* Décode l'ATC (SMPTE ST 12-1 / RP 188, DID 0x60 SDID 0x60). 16 UDW → 8 octets de timecode :
+ * octet[i] = low-nibble(UDW[2i]) | low-nibble(UDW[2i+1])<<4. Octets 0/2/4/6 = frames/sec/min/h
+ * (BCD : unités b0-3, dizaines b4+). DF = bit 6 de l'octet 0. Renvoie 1 si un ATC est trouvé. */
+static int decode_atc(struct st40_frame_info* f, char* out, int* df) {
+  for (uint32_t m = 0; m < f->meta_num; m++) {
+    struct st40_meta* md = &f->meta[m];
+    if (md->did != 0x60 || md->sdid != 0x60) continue;
+    if (md->udw_size < 16) continue;
+    const uint8_t* w = f->udw_buff_addr + md->udw_offset;   /* 1 octet = 1 UDW (low 8 bits) */
+    uint8_t b[8];
+    for (int i = 0; i < 8; i++) b[i] = (uint8_t)((w[i*2] & 0x0f) | ((w[i*2+1] & 0x0f) << 4));
+    int frames  = (b[0] & 0x0f) + ((b[0] >> 4) & 0x03) * 10;
+    int seconds = (b[2] & 0x0f) + ((b[2] >> 4) & 0x07) * 10;
+    int minutes = (b[4] & 0x0f) + ((b[4] >> 4) & 0x07) * 10;
+    int hours   = (b[6] & 0x0f) + ((b[6] >> 4) & 0x03) * 10;
+    *df = (b[0] >> 6) & 0x01;
+    snprintf(out, 16, "%02d:%02d:%02d%c%02d", hours, minutes, seconds, *df ? ';' : ':', frames);
+    return 1;
+  }
+  return 0;
+}
+
+/* Feeder RX ANC : st40p_rx_get_frame → sérialise meta[] + udw dans le slot courant (fan-out),
+ * + extraction du timecode ATC publié dans les stats. */
+static void* data_rx_thread(void* arg) {
+  struct sess* s = arg;
+  while (!s->stop) {
+    struct st40_frame_info* frame = st40p_rx_get_frame(s->d_rx);
+    if (!frame) { usleep(1000); continue; }
+    uint32_t mn = frame->meta_num; if (mn > ST40_MAX_META) mn = ST40_MAX_META;
+    uint32_t fill = frame->udw_buffer_fill; if (fill > s->max_udw) fill = s->max_udw;
+    size_t need = 8 + (size_t)mn * sizeof(struct anc_meta_rec) + fill;
+    char tc[16]; int df = 0; int got_tc = decode_atc(frame, tc, &df);
+    for (int ti = 0; ti < s->ntg; ti++) {
+      struct target* t = &s->tg[ti];
+      uint64_t ci = t->index;
+      uint8_t* dst = t->frames_base + (size_t)(ci % s->ring) * s->slotsize;
+      if (need <= s->slotsize) {
+        ((uint32_t*)dst)[0] = mn; ((uint32_t*)dst)[1] = fill;
+        struct anc_meta_rec* mr = (struct anc_meta_rec*)(dst + 8);
+        for (uint32_t m = 0; m < mn; m++) {
+          struct st40_meta* md = &frame->meta[m];
+          mr[m].did = md->did; mr[m].sdid = md->sdid;
+          mr[m].line = md->line_number; mr[m].hori = md->hori_offset;
+          mr[m].udw_size = md->udw_size; mr[m].udw_offset = md->udw_offset;
+          mr[m].c = md->c; mr[m].s = md->s;
+        }
+        if (fill) memcpy(dst + 8 + (size_t)mn * sizeof(struct anc_meta_rec), frame->udw_buff_addr, fill);
+      } else {   /* frame anormalement gros → slot vide (on ne déborde jamais) */
+        ((uint32_t*)dst)[0] = 0; ((uint32_t*)dst)[1] = 0;
+      }
+      if (got_tc) { memcpy(t->tc, tc, sizeof(t->tc)); t->tc_df = df; t->tc_valid = 1; }
+      write_shm_header(t, ci);
+      t->index = ci + 1; t->recv++;
+    }
+    st40p_rx_put_frame(s->d_rx, frame);
+  }
+  return NULL;
+}
+
+/* Feeder TX ANC : lit le slot courant du shm d'entrée → reconstruit meta[]+udw → st40p_tx_put_frame.
+ * Passthrough intégral (les udw_offset restent valides : on recopie tout le buffer udw verbatim). */
+static void* data_tx_thread(void* arg) {
+  struct sess* s = arg;
+  struct target* t = &s->tg[0];
+  while (!s->stop) {
+    if (!t->shm_base) {
+      if (open_shm_in(s, t, (size_t)s->hdr + s->slotsize) != 0) { usleep(20000); continue; }
+    }
+    struct st40_frame_info* frame = st40p_tx_get_frame(s->d_tx);   /* bloque (BLOCK_GET) → pacing fps */
+    if (!frame) { usleep(1000); continue; }
+    uint64_t ci = ((volatile uint64_t*)t->shm_base)[0];
+    const uint8_t* src = t->frames_base + (size_t)(ci % s->ring) * s->slotsize;
+    uint32_t mn = ((const uint32_t*)src)[0]; if (mn > ST40_MAX_META) mn = 0;
+    uint32_t fill = ((const uint32_t*)src)[1]; if (fill > s->max_udw) fill = s->max_udw;
+    const struct anc_meta_rec* mr = (const struct anc_meta_rec*)(src + 8);
+    frame->meta_num = mn;
+    for (uint32_t m = 0; m < mn; m++) {
+      struct st40_meta* md = &frame->meta[m];
+      md->did = mr[m].did; md->sdid = mr[m].sdid;
+      md->line_number = mr[m].line; md->hori_offset = mr[m].hori;
+      md->udw_size = mr[m].udw_size; md->udw_offset = mr[m].udw_offset;
+      md->c = mr[m].c; md->s = mr[m].s; md->stream_num = 0;
+    }
+    if (fill && frame->udw_buff_addr)
+      memcpy(frame->udw_buff_addr, src + 8 + (size_t)mn * sizeof(struct anc_meta_rec), fill);
+    frame->udw_buffer_fill = fill;
+    st40p_tx_put_frame(s->d_tx, frame);
+    t->index = ci; t->recv++;
+  }
+  return NULL;
+}
+
+static int setup_data(struct sess* s) {
+  if (s->ring > 8) s->ring = 8; if (s->ring < 2) s->ring = 2;
+  s->slotsize = ANC_SLOT; s->max_udw = ANC_MAX_UDW; s->copy_mode = 1;
+
+  struct st40p_rx_ops ops; memset(&ops, 0, sizeof(ops));
+  ops.name = "bobi_mtl_d";
+  ops.priv = s;
+  ops.port.num_port = 1;
+  inet_pton(AF_INET, s->mcast, ops.port.ip_addr[MTL_SESSION_PORT_P]);
+  snprintf(ops.port.port[MTL_SESSION_PORT_P], MTL_PORT_MAX_LEN, "%s", s->portname);
+  ops.port.udp_port[MTL_SESSION_PORT_P] = s->udp_port;
+  ops.port.payload_type = s->payload_type;
+  ops.framebuff_cnt = 4;
+  ops.max_udw_buff_size = s->max_udw;
+  ops.rtp_ring_size = 1024;   /* requis (>0, puissance de 2 : ring DPDK des paquets RTP ANC) */
+  ops.flags = ST40P_RX_FLAG_BLOCK_GET;
+
+  s->d_rx = st40p_rx_create(s->st, &ops);
+  if (!s->d_rx) { fprintf(stderr, "mtl_rx: st40p_rx_create fail (data %s:%d)\n", s->mcast, s->udp_port); return -1; }
+  if (open_targets(s) != 0) return -1;
+  fprintf(stderr, "mtl_rx[data] ANC pt=%d mc=%s:%d slot=%zu ring=%d → %d cible(s):",
+          s->payload_type, s->mcast, s->udp_port, s->slotsize, s->ring, s->ntg);
+  for (int ti = 0; ti < s->ntg; ti++) fprintf(stderr, " %s", s->tg[ti].shm_path);
+  fprintf(stderr, "\n");
+  return pthread_create(&s->thread, NULL, data_rx_thread, s) == 0 ? (s->started = 1, 0) : -1;
+}
+
+static int setup_data_tx(struct sess* s) {
+  if (s->ring < 2) s->ring = 2;
+  s->slotsize = ANC_SLOT; s->max_udw = ANC_MAX_UDW;
+
+  struct st40p_tx_ops ops; memset(&ops, 0, sizeof(ops));
+  ops.name = "bobi_mtl_dtx";
+  ops.priv = s;
+  ops.port.num_port = 1;
+  inet_pton(AF_INET, s->mcast, ops.port.dip_addr[MTL_SESSION_PORT_P]);   /* destination */
+  snprintf(ops.port.port[MTL_SESSION_PORT_P], MTL_PORT_MAX_LEN, "%s", s->portname);
+  ops.port.udp_port[MTL_SESSION_PORT_P] = s->udp_port;
+  ops.port.payload_type = s->payload_type;
+  ops.fps = to_st_fps(s->fps);
+  ops.interlaced = false;
+  ops.framebuff_cnt = 4;
+  ops.max_udw_buff_size = s->max_udw;
+  ops.flags = ST40P_TX_FLAG_BLOCK_GET;
+
+  s->d_tx = st40p_tx_create(s->st, &ops);
+  if (!s->d_tx) { fprintf(stderr, "mtl_rx: st40p_tx_create fail (data %s:%d)\n", s->mcast, s->udp_port); return -1; }
+  fprintf(stderr, "mtl_rx[data TX] ANC fps=%.2f pt=%d → %s:%d (in shm=%s)\n",
+          s->fps, s->payload_type, s->mcast, s->udp_port, s->tg[0].shm_path);
+  return pthread_create(&s->thread, NULL, data_tx_thread, s) == 0 ? (s->started = 1, 0) : -1;
+}
+
 /* ── parse config JSON ── */
 static const char* jstr(struct json_object* o, const char* k, const char* def) {
   struct json_object* v;
@@ -494,8 +657,8 @@ static int parse_session_into(struct json_object* j, struct sess* s) {
     s->bit_depth=jint(j,"bit_depth",10);
   } else if (s->kind == K_AUDIO) {
     s->channels=jint(j,"channels",8);
-  } else {
-    return -1;   /* data 2110-40 : non implémenté */
+  } else {   /* K_DATA / ANC : seul fps compte (pacing TX) */
+    s->fps=jdbl(j,"fps",25.0);
   }
   struct json_object* tgs;
   if (json_object_object_get_ex(j,"targets",&tgs) && json_object_is_type(tgs,json_type_array)) {
@@ -525,10 +688,12 @@ static void free_session(struct sess* s) {
   if (!s->used) return;
   if (s->started) { s->stop = 1; pthread_join(s->thread, NULL); }
   if (s->role == ROLE_TX) {
-    if (s->kind == K_AUDIO) { if (s->a_tx) st30p_tx_free(s->a_tx); }
-    else                    { if (s->vth)  st20p_tx_free(s->vth); }
-  } else if (s->kind == K_AUDIO) { if (s->ah) st30p_rx_free(s->ah); }
-  else                           { if (s->vh) st20p_rx_free(s->vh); }
+    if (s->kind == K_AUDIO)     { if (s->a_tx) st30p_tx_free(s->a_tx); }
+    else if (s->kind == K_DATA) { if (s->d_tx) st40p_tx_free(s->d_tx); }
+    else                        { if (s->vth)  st20p_tx_free(s->vth); }
+  } else if (s->kind == K_AUDIO) { if (s->ah)  st30p_rx_free(s->ah); }
+  else if (s->kind == K_DATA)    { if (s->d_rx) st40p_rx_free(s->d_rx); }
+  else                           { if (s->vh)  st20p_rx_free(s->vh); }
   for (int ti = 0; ti < s->ntg; ti++) {
     struct target* t = &s->tg[ti];
     if (t->shm_base && t->shm_base != MAP_FAILED) munmap(t->shm_base, t->shm_size);
@@ -563,8 +728,8 @@ static void reconcile(struct sess* reg, const char* path, mtl_handle st, const c
     *s = want;
     s->st = st; snprintf(s->portname, sizeof(s->portname), "%s", portname); s->stop = 0;
     int r = (s->role == ROLE_TX)
-            ? ((s->kind == K_AUDIO) ? setup_audio_tx(s) : setup_video_tx(s))
-            : ((s->kind == K_AUDIO) ? setup_audio(s) : setup_video(s));
+            ? ((s->kind == K_AUDIO) ? setup_audio_tx(s) : (s->kind == K_DATA) ? setup_data_tx(s) : setup_video_tx(s))
+            : ((s->kind == K_AUDIO) ? setup_audio(s)    : (s->kind == K_DATA) ? setup_data(s)    : setup_video(s));
     if (r == 0) { s->used = 1; s->seen = 1; }
     else { fprintf(stderr,"mtl_rx: création session %s:%d échouée\n", s->mcast, s->udp_port); memset(s,0,sizeof(*s)); }
   }
@@ -587,8 +752,14 @@ static void write_stats(struct sess* reg, uint64_t last[][MAX_TG], double dt) {
       double rate = dt > 0 ? (double)(t->recv - last[i][ti]) / dt : 0.0;
       last[i][ti] = t->recv;
       FILE* sf = fopen(t->stats_path, "w");
-      if (sf) { fprintf(sf, "{\"fps\": %.1f, \"frame_index\": %llu}\n", rate,
-                        (unsigned long long)t->index); fclose(sf); }
+      if (sf) {
+        if (s->kind == K_DATA && t->tc_valid)
+          fprintf(sf, "{\"fps\": %.1f, \"frame_index\": %llu, \"timecode\": \"%s\", \"df\": %s}\n",
+                  rate, (unsigned long long)t->index, t->tc, t->tc_df ? "true" : "false");
+        else
+          fprintf(sf, "{\"fps\": %.1f, \"frame_index\": %llu}\n", rate, (unsigned long long)t->index);
+        fclose(sf);
+      }
     }
   }
 }
