@@ -24,8 +24,11 @@ import numpy as np
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
 HOSTNAME   = os.environ.get("HOSTNAME_RX") or os.environ.get("HOSTNAME") or "mtlrx"
-N_VIDEO    = int(os.environ.get("RX_COUNT") or os.environ.get("VIDEO_COUNT") or 1)   # slots RX (receivers)
+N_VIDEO    = int(os.environ.get("RX_COUNT") or os.environ.get("VIDEO_COUNT") or 1)   # slots RX vidéo
 N_TX       = int(os.environ.get("TX_COUNT") or 0)                                     # slots TX (senders)
+N_AUDIO    = int(os.environ.get("AUDIO_COUNT") or 0)                                   # slots RX audio (st30)
+A_CHANNELS = 8
+A_RING     = max(2, int(os.environ.get("AUDIO_RING") or 100))   # ring shm audio (chunks 1ms)
 IFACE      = os.environ.get("IFACE") or "ens1f0np0"
 LCORES     = os.environ.get("LCORES") or "1,2,3"
 V_RING     = max(2, int(os.environ.get("RING") or 8))   # ring du pipeline (réglage) ; mtl_rx borne ≤8
@@ -240,9 +243,10 @@ class AgentHandler(BaseHTTPRequestHandler):
             sdp     = body.get("sdp")
             if isinstance(sdp, list):            # SMPTE 2022-7 : on garde la leg 0 en v1
                 sdp = sdp[0] if sdp else None
-            if essence != "video":               # v1 : vidéo uniquement
-                return self._json(200, {"ok": True, "note": "audio ignoré en v1"})
-            path = os.path.join(SDP_DIR, "nmos_recv_v_{}.sdp".format(idx))
+            if essence not in ("video", "audio"):  # ANC (2110-40) non implémenté
+                return self._json(200, {"ok": True, "note": "{} ignoré".format(essence)})
+            pfx  = "nmos_recv_a_" if essence == "audio" else "nmos_recv_v_"
+            path = os.path.join(SDP_DIR, "{}{}.sdp".format(pfx, idx))
             try:
                 if enabled and sdp:
                     with open(path, "w") as f: f.write(sdp)
@@ -266,6 +270,9 @@ class AgentHandler(BaseHTTPRequestHandler):
                 if "udp_port" in body: t["udp_port"] = int(body.get("udp_port") or 0)
                 if "pt"       in body: t["pt"]       = int(body.get("pt") or 96)
                 if "shm_in"   in body: t["shm_in"]   = (body.get("shm_in") or "").strip() or None
+                if "audio_mcast" in body: t["audio_mcast"] = body.get("audio_mcast") or None
+                if "audio_port"  in body: t["audio_port"]  = int(body.get("audio_port") or 0)
+                if "audio_pt"    in body: t["audio_pt"]    = int(body.get("audio_pt") or 97)
                 for k_in, k_st in (("width","w"),("height","h"),("fps","fps"),("bit_depth","bd"),("ring","ring")):
                     if body.get(k_in):
                         t[k_st] = (float(body[k_in]) if k_st == "fps" else int(body[k_in]))
@@ -302,7 +309,9 @@ class ControlHandler(BaseHTTPRequestHandler):
 
         if path == "/input":        # câblage à chaud d'un shm vers un slot TX (générique plugin)
             if body.get("essence", "video") != "video":
-                return self._json(200, {"ok": True, "note": "audio TX non implémenté"})
+                # L'audio TX suit automatiquement la vidéo : shm audio dérivé du shm vidéo câblé
+                # (mtl_0 → mtl_audio_0). Pas de câblage audio séparé.
+                return self._json(200, {"ok": True, "note": "audio TX suit la vidéo (shm dérivé)"})
             try: slot = int(body.get("slot", 0))
             except Exception: slot = -1
             if not (0 <= slot < N_TX):
@@ -386,6 +395,40 @@ def _parse_sdp(path):
     return info
 
 
+# ─── Audio (ST 2110-30) ─────────────────────────────────────────────
+def _parse_sdp_audio(path):
+    """SDP minimal 2110-30 : m=audio + c= + pt. Canaux fixés à 8 (L24/48k, convention MXL)."""
+    try:
+        txt = open(path).read()
+    except Exception:
+        return None
+    m = re.search(r"^m=audio\s+(\d+)\s+RTP/AVP\s+(\d+)", txt, re.M)
+    c = re.search(r"^c=IN\s+IP4\s+([0-9.]+)", txt, re.M)
+    if not (m and c):
+        return None
+    return {"port": int(m.group(1)), "pt": int(m.group(2)), "mcast": c.group(1), "channels": A_CHANNELS}
+
+def _audio_session(idx, info):
+    """Session RX audio st30 → /dev/shm/{hn}_audio_{idx} (L24 8ch BE, écrit tel quel par mtl_rx)."""
+    return {"kind": "audio", "role": "rx",
+            "mcast": info["mcast"], "udp_port": info["port"], "payload_type": info["pt"],
+            "channels": info.get("channels", A_CHANNELS), "ring": A_RING, "hdr": HDR,
+            "targets": [{"idx": idx, "shm": "/dev/shm/{}_audio_{}".format(HOSTNAME, idx),
+                         "stats": "/tmp/mtl_a{}.json".format(idx)}]}
+
+def _derive_audio_shm(video_shm):
+    """shm vidéo câblé → shm audio associé : 'mtl_0' → 'mtl_audio_0' (None si pas de _N final)."""
+    m = re.match(r"^(.*)_(\d+)$", (video_shm or "").strip())
+    return "{}_audio_{}".format(m.group(1), m.group(2)) if m else None
+
+def _audio_tx_session(idx, t, shm_in):
+    """Session TX audio st30 : émet le shm audio d'entrée (BE passthrough) vers la dest audio du slot."""
+    return {"kind": "audio", "role": "tx",
+            "mcast": t["audio_mcast"], "udp_port": t["audio_port"], "payload_type": t.get("audio_pt", 97),
+            "channels": A_CHANNELS, "ring": A_RING, "hdr": HDR,
+            "targets": [{"idx": idx, "shm": shm_in, "stats": "/tmp/mtl_atx{}.json".format(idx)}]}
+
+
 # ─── Gestionnaire de sessions central ───────────────────────────────
 # UN SEUL mtl_rx multi-session (un mtl_init = un PF) sert TOUTES les sessions actives. Le manager
 # recalcule l'ensemble actif (slots avec SDP, pas GÉN) et (re)lance mtl_rx avec un config JSON
@@ -403,7 +446,8 @@ _fail_streak = 0             # échecs rapides consécutifs (backoff)
 # en fait une session role=tx dans le config ; mtl_rx lit le shm et émet en 2110-20. Un slot sans
 # shm_in (non câblé) ou désactivé n'émet pas.
 _tx = [{"enabled": False, "mcast": None, "udp_port": 0, "pt": 96, "shm_in": None,
-        "w": WIDTH, "h": HEIGHT, "fps": FPS, "bd": BIT_DEPTH, "ring": V_RING}
+        "w": WIDTH, "h": HEIGHT, "fps": FPS, "bd": BIT_DEPTH, "ring": V_RING,
+        "audio_mcast": None, "audio_port": 0, "audio_pt": 97}
        for _ in range(N_TX)]
 _tx_lock = threading.Lock()
 
@@ -542,7 +586,7 @@ def _write_config(sessions):
     désirées. Le daemon détecte le changement de mtime et RÉCONCILIE à chaud — aucune relance."""
     with open(_CONFIG_PATH, "w") as f:
         json.dump({"pmd": "af_xdp", "iface": IFACE, "lcores": LCORES, "sip": SIP,
-                   "rx_queues": max(1, N_VIDEO), "tx_queues": max(1, N_TX + 1),
+                   "rx_queues": max(1, N_VIDEO + N_AUDIO), "tx_queues": max(1, N_TX * 2 + 1),
                    "sessions": sessions}, f)
 
 
@@ -576,9 +620,16 @@ def _manager_loop():
                 key = (sdp["mcast"], sdp["port"])
                 groups.setdefault(key, {"info": sdp, "idxs": []})["idxs"].append(idx)
         sessions = [_video_session(g["info"], g["idxs"]) for g in groups.values()]
-        active = set(t["idx"] for s in sessions for t in s["targets"])
+        active = set(t["idx"] for s in sessions if s["kind"] == "video" for t in s["targets"])
         for idx in range(N_VIDEO):
             _live[idx] = idx in active
+
+        # Sessions RX audio (2110-30) : SDP audio actif → écrit /dev/shm/{hn}_audio_{idx} en L24 BE.
+        for idx in range(N_AUDIO):
+            apath = "{}/nmos_recv_a_{}.sdp".format(SDP_DIR, idx)
+            ainfo = _parse_sdp_audio(apath) if os.path.exists(apath) else None
+            if ainfo:
+                sessions.append(_audio_session(idx, ainfo))
 
         # Sessions TX : un slot émet s'il est activé, a une destination et un shm d'entrée câblé.
         with _tx_lock:
@@ -586,6 +637,12 @@ def _manager_loop():
                 t = _tx[i]
                 if t["enabled"] and t["mcast"] and t["udp_port"] and t["shm_in"]:
                     sessions.append(_tx_session(i, t))
+                # TX audio : suit la vidéo (shm audio dérivé) si une dest audio est réglée sur le slot.
+                ashm = _derive_audio_shm(t["shm_in"])
+                if t["enabled"] and t.get("audio_mcast") and t.get("audio_port") and ashm:
+                    if not ashm.startswith("/"):
+                        ashm = "/dev/shm/" + ashm
+                    sessions.append(_audio_tx_session(i, t, ashm))
 
         # 1) config : réécrit dès qu'il change → le daemon réconcilie à chaud (aucune relance/faute PTP)
         sig = json.dumps(sessions, sort_keys=True)
