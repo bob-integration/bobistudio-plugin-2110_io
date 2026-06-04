@@ -46,7 +46,9 @@ struct rx_ctx {
   uint8_t* shm_base;      /* début du mapping (header à l'offset 0) */
   size_t   shm_size;
   uint8_t* frames_base;   /* shm_base + hdr (début du 1er slot) */
-  size_t   framesize;     /* taille d'un slot = st20p_rx_frame_size(...) */
+  size_t   framesize;     /* taille d'un slot SHM (8 bits si conv8, sinon = src_framesize) */
+  size_t   src_framesize; /* taille de la frame MTL reçue (planar 10 bits) */
+  int      conv8;         /* 1 = convertir 10→8 bits à la copie (libmtl n'a pas ce converter) */
   int      ring;
   int      hdr;
   /* external frames pré-calculées (un par slot du ring) */
@@ -128,7 +130,16 @@ static void* rx_thread(void* arg) {
        * du ring (frame_index % ring). Le buffer planar de sortie est contigu (Y|U|V),
        * de taille framesize. */
       long slot = fi % c->ring;
-      memcpy(c->frames_base + (size_t)slot * c->framesize, frame->addr[0], c->framesize);
+      uint8_t* dst = c->frames_base + (size_t)slot * c->framesize;
+      if (c->conv8) {
+        /* planar 10 bits LE → 8 bits : v8 = v10 >> 2, par échantillon (Y|U|V contigus).
+         * nb d'échantillons = framesize (octets dst) = src_framesize/2. */
+        const uint16_t* s = (const uint16_t*)frame->addr[0];
+        size_t n = c->framesize;
+        for (size_t k = 0; k < n; k++) dst[k] = (uint8_t)(s[k] >> 2);
+      } else {
+        memcpy(dst, frame->addr[0], c->framesize);
+      }
     } else {
       /* DPDK ext-frame : la frame est DÉJÀ dans un slot du ring (zéro-copie). On aligne
        * frame_index sur le slot réel (déduit de l'adresse) pour les consommateurs. */
@@ -249,12 +260,12 @@ int main(int argc, char** argv) {
   c.hdr = hdr;
   c.copy_mode = use_kernel;   /* PMD noyau → frames internes + memcpy (pas de DMA ext-frame) */
 
-  /* Profondeur du plan de sortie conforme au pipeline MXL (force8 par défaut côté orchestrateur).
-   * libmtl convertit le transport 422-10 (RFC4175) vers le planar demandé. 422 conservé. */
-  enum st_frame_fmt _ofmt = (bit_depth == 8)  ? ST_FRAME_FMT_YUV422PLANAR8
-                          : (bit_depth == 12) ? ST_FRAME_FMT_YUV422PLANAR12LE
-                          :                     ST_FRAME_FMT_YUV422PLANAR10LE;
-  c.out_fmt = _ofmt;
+  /* libmtl N'A PAS de converter 422-10 (RFC4175) → planar 8 bits (« st20_get_converter, plugin
+   * not found »). On reçoit donc toujours en PLANAR10LE (converter présent) et on convertit
+   * 10→8 nous-mêmes à la copie quand le pipeline MXL est en 8 bits (force8). Uniquement en
+   * copy_mode (af_xdp/kernel) : en DMA ext-frame (DPDK) on ne peut pas convertir → on garde 10. */
+  c.out_fmt = ST_FRAME_FMT_YUV422PLANAR10LE;
+  c.conv8 = (bit_depth == 8 && use_kernel);
   c.plane_h = interlaced ? height / 2 : height;  /* buffer ext = 1 champ si entrelacé */
   c.st = mtl_init(&p);
   if (!c.st) { fprintf(stderr, "mtl_rx: mtl_init fail\n"); return 1; }
@@ -274,7 +285,7 @@ int main(int argc, char** argv) {
   ops.fps = to_st_fps(fps);
   ops.interlaced = interlaced ? true : false;
   ops.transport_fmt = ST20_FMT_YUV_422_10BIT;
-  ops.output_fmt = _ofmt;
+  ops.output_fmt = ST_FRAME_FMT_YUV422PLANAR10LE;
   ops.device = ST_PLUGIN_DEVICE_AUTO;
   ops.framebuff_cnt = ring;
   ops.notify_frame_available = frame_available;
@@ -288,7 +299,9 @@ int main(int argc, char** argv) {
 
   c.handle = st20p_rx_create(c.st, &ops);
   if (!c.handle) { fprintf(stderr, "mtl_rx: st20p_rx_create fail\n"); mtl_uninit(c.st); return 1; }
-  c.framesize = st20p_rx_frame_size(c.handle);
+  c.src_framesize = st20p_rx_frame_size(c.handle);   /* frame MTL = planar 10 bits */
+  /* slot SHM : 8 bits (moitié des octets) si conversion, sinon identique à la frame MTL. */
+  c.framesize = c.conv8 ? c.src_framesize / 2 : c.src_framesize;
 
   /* ── shm : mmap (header + ring*framesize), arrondi page ── */
   size_t raw = (size_t)hdr + (size_t)ring * c.framesize;
