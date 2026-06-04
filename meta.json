@@ -1,8 +1,11 @@
 {
-  "version": "0.14.1",
+  "version": "0.14.2",
   "date": "2026-06-04",
   "changes": {
     "Nouveautés": [
+      "Page Câbles : le moteur bi-rôle est SCINDÉ en deux nœuds (flag manifeste split_io) — RX dans la colonne Sources (gauche), TX dans la colonne Destinations (droite) — au lieu d'un nœud central « process ». RX (réseau→shm) et TX (shm→réseau) sont indépendants, pas un passthrough. Même vmid pour les deux nœuds (le câblage cible le vmid ; endpointOf choisit le nœud qui porte le port). Champ palette « Émetteurs (TX) » pour créer le moteur avec des slots TX."
+    ],
+    "Nouveautés (0.14.1)": [
       "Exposition moteur bi-rôle (sous-étapes 3-4) : CÂBLAGE des slots TX. Manifeste wiring.consumes (video, repeat tx_count, state_field tx{i}_shm, mode hot-wire) → les émetteurs apparaissent comme destinations MXL à droite sur la page Câbles. Contrôleur :8082 /input (câble un shm sur un slot TX, à chaud) + /state (shm câblé par slot). Hook topology_ports expose les ports TX ; before_deploy auto-alloue une destination mcast/port DISTINCTE par slot (évite le conflit de flow). docker_driver push_tx_slots combine destination (tx_slots) + shm câblé (tx{i}_shm) → :8081/tx. Reste : palette « +Émetteur » / find-or-create moteur (UI), puis test E2E sur CT 2000."
     ],
     "Nouveautés (0.14.0)": [
