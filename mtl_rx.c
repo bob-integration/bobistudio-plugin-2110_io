@@ -292,7 +292,10 @@ static int setup_video(struct sess* s) {
 /* Ouvre un shm EXISTANT en lecture (le shm d'entrée du TX, écrit par un producteur). Ne crée ni ne
  * tronque (ne pas resizer le shm du producteur). Renvoie 0 si mappé et assez grand. */
 static int open_shm_in(struct sess* s, struct target* t, size_t want) {
-  int fd = open(t->shm_path, O_RDWR);
+  char path[320];   /* défensif : un nom relatif (ex. "mtl_0") → /dev/shm/mtl_0 */
+  if (t->shm_path[0] == '/') snprintf(path, sizeof(path), "%s", t->shm_path);
+  else snprintf(path, sizeof(path), "/dev/shm/%s", t->shm_path);
+  int fd = open(path, O_RDWR);
   if (fd < 0) return -1;
   struct stat stt;
   if (fstat(fd, &stt) != 0 || (size_t)stt.st_size < want) { close(fd); return -1; }

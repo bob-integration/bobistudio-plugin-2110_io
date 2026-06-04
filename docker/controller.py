@@ -445,12 +445,17 @@ def _video_session(info, idxs):
 
 def _tx_session(idx, t):
     """Une session TX = lit le shm d'entrée câblé (t['shm_in'], au format du producteur) et émet en
-    2110-20 vers t['mcast']:t['udp_port']. Le format (w/h/bd/ring) est celui du shm consommé."""
+    2110-20 vers t['mcast']:t['udp_port']. Le format (w/h/bd/ring) est celui du shm consommé.
+    Le câblage fournit le NOM du shm (ex. 'mtl_0') → on préfixe /dev/shm/ (le RX écrit en chemin
+    complet ; sans ça le feeder n'ouvre rien → 0 frame)."""
+    shm = t["shm_in"] or ""
+    if shm and not shm.startswith("/"):
+        shm = "/dev/shm/" + shm
     return {"kind": "video", "role": "tx",
             "mcast": t["mcast"], "udp_port": t["udp_port"], "payload_type": t["pt"],
             "width": t["w"], "height": t["h"], "fps": t["fps"],
             "interlaced": False, "bit_depth": t["bd"], "ring": t["ring"], "hdr": HDR,
-            "targets": [{"idx": idx, "shm": t["shm_in"], "stats": "/tmp/mtl_tx{}.json".format(idx)}]}
+            "targets": [{"idx": idx, "shm": shm, "stats": "/tmp/mtl_tx{}.json".format(idx)}]}
 
 
 # ─── Simulation (mire numpy, mêmes en-têtes shm) — fallback sans SDP ou GÉN forcé ──
