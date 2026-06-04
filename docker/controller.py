@@ -27,7 +27,7 @@ HOSTNAME   = os.environ.get("HOSTNAME_RX") or os.environ.get("HOSTNAME") or "mtl
 N_VIDEO    = int(os.environ.get("VIDEO_COUNT") or 1)
 IFACE      = os.environ.get("IFACE") or "ens1f0np0"
 LCORES     = os.environ.get("LCORES") or "1,2,3"
-V_RING     = min(int(os.environ.get("RING") or 8), 8)
+V_RING     = max(2, int(os.environ.get("RING") or 8))   # ring du pipeline (réglage) ; mtl_rx borne ≤8
 WIDTH      = int(os.environ.get("WIDTH") or 1280)     # défaut/simu (réel = lu du SDP)
 HEIGHT     = int(os.environ.get("HEIGHT") or 720)
 FPS        = float(os.environ.get("FPS") or 25)
