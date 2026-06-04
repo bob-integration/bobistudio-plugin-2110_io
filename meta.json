@@ -1,7 +1,10 @@
 {
-  "version": "0.18.0",
+  "version": "0.18.1",
   "date": "2026-06-04",
   "changes": {
+    "Corrections": [
+      "UI (control.js) : le badge « SDP » (abonnement NMOS manuel) est désormais rendu pour l'AUDIO (2110-30) et l'ANC (2110-40), plus seulement la vidéo. Sans contrôleur NMOS externe, l'audio/ANC n'avaient AUCUN moyen d'être abonnés → mtl_rx sans session audio → shm audio non alimenté → streamer muet. Le backend gérait déjà l'essence (manual_subscribe + route /api/nmos/receivers/<vmid>/<idx>/sdp + receiver detail r.sdp pour toutes essences) ; il ne manquait que le bouton. Modale titrée par essence (Vidéo/Audio/ANC), cache SDP keyé (essence:idx). UI-ONLY : aucun changement conteneur, pas de rebuild d'image ni de redéploiement requis (sync orchestrateur suffit)."
+    ],
     "Nouveautés": [
       "Entrelacé (1080i50) — binaire mtl_rx COMPLÉTÉ : merge/split des champs ↔ trame. Fait établi (sources libmtl 26.01) : l'API st20p travaille PAR CHAMP en entrelacé (st_frame_size /2 ; un get/put_frame = 1 champ ; second_field alterné par la lib). Le binaire passait le flag mais copiait à plat (plane_h inutilisé, slotsize TX figé) → incomplet. DÉCISION D'ARCHI : encapsuler les champs À LA FRONTIÈRE MTL, le shm MXL reste « 1 TRAME PLEINE par slot » (les consommateurs voient des trames normales). RX : weave des 2 champs reçus dans un slot trame-pleine (parité second_field+field_order, publication header/index AU 2e champ seulement). TX : dé-weave un slot trame-pleine en 2 champs émis (slot latché sur le 1er champ → pas de combing). conv8 (8↔10 bits) appliqué ligne à ligne. open_shm dimensionne le slot en trame pleine (shm_slotsize) ; répare l'invariant simu↔live (le simu était déjà en trame pleine). field_weave + field_parity ; field_order lu du JSON (parse_session_into) + signature de session (recrée si i/p ou tff change). Progressif strictement inchangé (gardé par if interlaced). ⚠️ À builder + tester sur le nœud E810 (non compilable/testable off-site)."
     ],
