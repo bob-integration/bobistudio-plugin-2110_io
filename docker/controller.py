@@ -172,6 +172,7 @@ def _launch_mtl_rx(idx, info):
             "--width", str(info["width"]), "--height", str(info["height"]),
             "--fps", str(info["fps"]),
             "--shm", shm, "--ring", str(V_RING), "--hdr", str(HDR),
+            "--bit_depth", str(BIT_DEPTH),   # conforme au pipeline MXL (force8 → 8)
             "--lcores", LCORES, "--stats_file", stats]
     if info.get("interlaced"):
         args.append("--interlaced")

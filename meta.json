@@ -1,8 +1,11 @@
 {
-  "version": "0.7.0",
+  "version": "0.8.0",
   "date": "2026-06-04",
   "changes": {
     "Nouveautés": [
+      "Conformité profondeur de bits au pipeline MXL : mtl_rx accepte --bit_depth et choisit l'output_fmt planar (8→YUV422PLANAR8, 10→10LE, 12→12LE) ; deploy_docker applique mxl_pipeline_bit_depth (force8 par défaut) → le contrôleur passe la profondeur à mtl_rx + à la simu. Corrige l'image verte/fantôme (le shm était écrit en 10 bits, lu en 8 bits par les consommateurs)."
+    ],
+    "Nouveautés (0.7.0)": [
       "Panneau de contrôle identique à receiver_2110 : même carte (ensembles vidéo/audio, format, état NMOS, badges GÉN/IDENT/SDP, modale SDP d'abonnement manuel). Données via /api/nmos/receivers/<vmid>/detail + fps live :8080. Hooks control_action (gen/ident) portés. NB : le hot-wire GÉN/IDENT et l'overlay IDENT côté conteneur nécessitent la mise à jour du contrôleur (:8082) — sinon repli redeploy."
     ],
     "Nouveautés (0.6.0)": [
