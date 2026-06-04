@@ -1,8 +1,9 @@
 {
-  "version": "0.18.1",
+  "version": "0.18.2",
   "date": "2026-06-04",
   "changes": {
     "Corrections": [
+      "UI (control.js) : alignement du badge SDP audio/ANC sur celui de la vidéo. .flow-row est une grille placée par POSITION ; GÉN (absent en ANC) et IDENT (absents en audio/ANC) étaient des chaînes vides → l'élément disparaissait → le badge SDP remontait d'une colonne. Fix : placeholders vides (<span class=gen-wrap/ident-wrap></span>) qui réservent leur colonne → SDP reste en colonne 4 comme la vidéo. UI-ONLY.",
       "UI (control.js) : le badge « SDP » (abonnement NMOS manuel) est désormais rendu pour l'AUDIO (2110-30) et l'ANC (2110-40), plus seulement la vidéo. Sans contrôleur NMOS externe, l'audio/ANC n'avaient AUCUN moyen d'être abonnés → mtl_rx sans session audio → shm audio non alimenté → streamer muet. Le backend gérait déjà l'essence (manual_subscribe + route /api/nmos/receivers/<vmid>/<idx>/sdp + receiver detail r.sdp pour toutes essences) ; il ne manquait que le bouton. Modale titrée par essence (Vidéo/Audio/ANC), cache SDP keyé (essence:idx). UI-ONLY : aucun changement conteneur, pas de rebuild d'image ni de redéploiement requis (sync orchestrateur suffit)."
     ],
     "Nouveautés": [
