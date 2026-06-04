@@ -78,6 +78,11 @@ struct sess {
   struct target tg[MAX_TG]; int ntg;
   pthread_t thread; int started;
   int      copy_mode;      /* vidéo: 1=memcpy (af_xdp) ; audio: toujours 1 */
+  /* ── cycle de vie daemon (réconciliation à chaud) ── */
+  volatile int stop;       /* arrêt PROPRE à cette session (thread boucle sur !stop) */
+  int      used;           /* slot du registre occupé par une session vivante */
+  int      seen;           /* marquage transitoire pendant un passage de réconciliation */
+  char     sig[1024];      /* signature = identité+contenu ; un sig différent ⇒ recréer */
   /* ── vidéo ── */
   st20p_rx_handle vh;
   int      width, height, bit_depth, interlaced; double fps;
@@ -155,7 +160,7 @@ static void overlay_ident(struct sess* s, struct target* t, uint8_t* dst) {
 
 static void* video_rx_thread(void* arg) {
   struct sess* s = arg;
-  while (!g_stop) {
+  while (!s->stop) {
     struct st_frame* frame = st20p_rx_get_frame(s->vh);
     if (!frame) { usleep(1000); continue; }
     if (!frame->addr[0]) { st20p_rx_put_frame(s->vh, frame); continue; }
@@ -186,7 +191,7 @@ static void* video_rx_thread(void* arg) {
  * (wire-native) → on écrit le chunk TEL QUEL dans le ring, ZÉRO conversion (passthrough). */
 static void* audio_rx_thread(void* arg) {
   struct sess* s = arg;
-  while (!g_stop) {
+  while (!s->stop) {
     struct st30_frame* frame = st30p_rx_get_frame(s->ah);
     if (!frame) { usleep(500); continue; }
     size_t n = frame->data_size < s->slotsize ? frame->data_size : s->slotsize;
@@ -337,16 +342,122 @@ static int parse_target(struct json_object* j, struct target* t) {
 
 static void usage(const char* p) {
   fprintf(stderr,
-    "usage: %s --config <json>   (sessions multiples : video st20 / audio st30)\n"
+    "usage: %s --config <json>   (DAEMON : sessions réconciliées à chaud, video st20 / audio st30)\n"
     "   ou : %s [args legacy 1 session video] (--pmd af_xdp --iface .. --mcast .. --shm .. ...)\n", p, p);
+}
+
+/* Remplit une session depuis un objet JSON. 0 si valide (mcast + port + ≥1 cible). */
+static int parse_session_into(struct json_object* j, struct sess* s) {
+  memset(s, 0, sizeof(*s));
+  const char* kind = jstr(j,"kind","video");
+  s->kind = !strcmp(kind,"audio") ? K_AUDIO : !strcmp(kind,"data") ? K_DATA : K_VIDEO;
+  snprintf(s->mcast,sizeof(s->mcast),"%s",jstr(j,"mcast",""));
+  s->udp_port=jint(j,"udp_port",0); s->payload_type=jint(j,"payload_type",96);
+  s->ring=jint(j,"ring", s->kind==K_AUDIO?100:8); s->hdr=jint(j,"hdr",64);
+  if (s->kind == K_VIDEO) {
+    s->width=jint(j,"width",1920); s->height=jint(j,"height",1080);
+    s->fps=jdbl(j,"fps",25.0); s->interlaced=jint(j,"interlaced",0);
+    s->bit_depth=jint(j,"bit_depth",10);
+  } else if (s->kind == K_AUDIO) {
+    s->channels=jint(j,"channels",8);
+  } else {
+    return -1;   /* data 2110-40 : non implémenté */
+  }
+  struct json_object* tgs;
+  if (json_object_object_get_ex(j,"targets",&tgs) && json_object_is_type(tgs,json_type_array)) {
+    int nt = json_object_array_length(tgs);
+    for (int ti = 0; ti < nt && s->ntg < MAX_TG; ti++)
+      if (parse_target(json_object_array_get_idx(tgs, ti), &s->tg[s->ntg]) == 0) s->ntg++;
+  } else {
+    if (parse_target(j, &s->tg[0]) == 0) s->ntg = 1;   /* compat : shm/stats/ident_file inline */
+  }
+  return (s->mcast[0] && s->udp_port && s->ntg > 0) ? 0 : -1;
+}
+
+/* Signature = identité réseau + format + cibles. Un sig différent ⇒ on libère l'ancienne session et
+ * on en recrée une (flow RX recyclé, device/XDP intacts ⇒ pas de faute PTP). */
+static void compute_sig(struct sess* s) {
+  int n = snprintf(s->sig, sizeof(s->sig), "%d|%s|%d|%d|%dx%d|%.2f|i%d|bd%d|r%d|",
+                   s->kind, s->mcast, s->udp_port, s->payload_type,
+                   s->width, s->height, s->fps, s->interlaced, s->bit_depth, s->ring);
+  for (int ti = 0; ti < s->ntg && n > 0 && n < (int)sizeof(s->sig); ti++)
+    n += snprintf(s->sig + n, sizeof(s->sig) - n, "%s>%s,",
+                  s->tg[ti].shm_path, s->tg[ti].has_ident ? s->tg[ti].ident_file : "-");
+}
+
+/* Libère une session vivante : arrêt PROPRE du thread, free du handle MTL (le flow RX), munmap des
+ * cibles. Le device (mtl_init/XDP) n'est PAS touché ⇒ aucune faute PTP. */
+static void free_session(struct sess* s) {
+  if (!s->used) return;
+  if (s->started) { s->stop = 1; pthread_join(s->thread, NULL); }
+  if (s->kind == K_AUDIO) { if (s->ah) st30p_rx_free(s->ah); }
+  else                    { if (s->vh) st20p_rx_free(s->vh); }
+  for (int ti = 0; ti < s->ntg; ti++) {
+    struct target* t = &s->tg[ti];
+    if (t->shm_base && t->shm_base != MAP_FAILED) munmap(t->shm_base, t->shm_size);
+    if (t->ident_patch) free(t->ident_patch);
+  }
+  memset(s, 0, sizeof(*s));
+}
+
+/* Réconcilie le registre des sessions vivantes avec le config (sessions désirées), À CHAUD sur le
+ * mtl_handle vivant : libère les disparues, crée les nouvelles. JAMAIS de mtl_uninit. */
+static void reconcile(struct sess* reg, const char* path, mtl_handle st, const char* portname) {
+  struct json_object* root = json_object_from_file(path);
+  if (!root) return;
+  struct json_object* arr;
+  if (!json_object_object_get_ex(root,"sessions",&arr) || !json_object_is_type(arr,json_type_array)) {
+    json_object_put(root); return;
+  }
+  for (int i = 0; i < MAX_SESS; i++) reg[i].seen = 0;
+  int n = json_object_array_length(arr);
+  for (int k = 0; k < n; k++) {
+    struct sess want;
+    if (parse_session_into(json_object_array_get_idx(arr, k), &want) != 0) continue;
+    compute_sig(&want);
+    int found = -1;
+    for (int i = 0; i < MAX_SESS; i++)
+      if (reg[i].used && !strcmp(reg[i].sig, want.sig)) { found = i; break; }
+    if (found >= 0) { reg[found].seen = 1; continue; }      /* inchangée → on garde telle quelle */
+    int slot = -1;
+    for (int i = 0; i < MAX_SESS; i++) if (!reg[i].used) { slot = i; break; }
+    if (slot < 0) { fprintf(stderr,"mtl_rx: registre plein, session ignorée\n"); continue; }
+    struct sess* s = &reg[slot];
+    *s = want;
+    s->st = st; snprintf(s->portname, sizeof(s->portname), "%s", portname); s->stop = 0;
+    int r = (s->kind == K_AUDIO) ? setup_audio(s) : setup_video(s);
+    if (r == 0) { s->used = 1; s->seen = 1; }
+    else { fprintf(stderr,"mtl_rx: création session %s:%d échouée\n", s->mcast, s->udp_port); memset(s,0,sizeof(*s)); }
+  }
+  for (int i = 0; i < MAX_SESS; i++)
+    if (reg[i].used && !reg[i].seen) {
+      fprintf(stderr,"mtl_rx: retrait session %s:%d\n", reg[i].mcast, reg[i].udp_port);
+      free_session(&reg[i]);
+    }
+  json_object_put(root);
+}
+
+/* Écrit le fichier de stats {fps, frame_index} de chaque cible vivante. */
+static void write_stats(struct sess* reg, uint64_t last[][MAX_TG], double dt) {
+  for (int i = 0; i < MAX_SESS; i++) {
+    struct sess* s = &reg[i];
+    if (!s->used || !s->started) continue;
+    for (int ti = 0; ti < s->ntg; ti++) {
+      struct target* t = &s->tg[ti];
+      if (!t->stats_path[0]) continue;
+      double rate = dt > 0 ? (double)(t->recv - last[i][ti]) / dt : 0.0;
+      last[i][ti] = t->recv;
+      FILE* sf = fopen(t->stats_path, "w");
+      if (sf) { fprintf(sf, "{\"fps\": %.1f, \"frame_index\": %llu}\n", rate,
+                        (unsigned long long)t->index); fclose(sf); }
+    }
+  }
 }
 
 int main(int argc, char** argv) {
   /* globaux partagés */
   char pmd[32] = "af_xdp", iface[64] = "", sip[64] = "", lcores[128] = "";
   const char* config = NULL;
-  struct sess S[MAX_SESS]; memset(S, 0, sizeof(S));
-  int ns = 0;
 
   /* args legacy d'une session vidéo (compat tests manuels) */
   const char *l_mcast=NULL,*l_shm=NULL,*l_stats=NULL,*l_ident=NULL,*l_pci=NULL;
@@ -378,73 +489,76 @@ int main(int argc, char** argv) {
   }
   (void)l_pci;
 
+  /* nom de port MTL selon le PMD (rempli après lecture iface/pmd) */
+  char portname[MTL_PORT_MAX_LEN];
+  signal(SIGINT, on_signal); signal(SIGTERM, on_signal);
+  static struct sess reg[MAX_SESS]; memset(reg, 0, sizeof(reg));
+  static uint64_t last[MAX_SESS][MAX_TG]; memset(last, 0, sizeof(last));
+
   if (config) {
+    /* ═══ DAEMON ═══ mtl_init UNE fois (à vie), puis réconciliation des sessions à chaud.
+     * Le device reste démarré (XDP attaché) tant que le process vit → ptp4l ne faute qu'au boot. */
     struct json_object* root = json_object_from_file(config);
     if (!root) { fprintf(stderr, "mtl_rx: config illisible: %s\n", config); return 1; }
     snprintf(pmd,sizeof(pmd),"%s",jstr(root,"pmd","af_xdp"));
     snprintf(iface,sizeof(iface),"%s",jstr(root,"iface",""));
     snprintf(sip,sizeof(sip),"%s",jstr(root,"sip",""));
     snprintf(lcores,sizeof(lcores),"%s",jstr(root,"lcores",""));
-    struct json_object* arr;
-    if (!json_object_object_get_ex(root,"sessions",&arr) || !json_object_is_type(arr,json_type_array)) {
-      fprintf(stderr,"mtl_rx: config sans 'sessions'\n"); return 1; }
-    int n = json_object_array_length(arr);
-    for (int k = 0; k < n && ns < MAX_SESS; k++) {
-      struct json_object* j = json_object_array_get_idx(arr, k);
-      struct sess* s = &S[ns];
-      const char* kind = jstr(j,"kind","video");
-      s->kind = !strcmp(kind,"audio") ? K_AUDIO : !strcmp(kind,"data") ? K_DATA : K_VIDEO;
-      snprintf(s->mcast,sizeof(s->mcast),"%s",jstr(j,"mcast",""));
-      s->udp_port=jint(j,"udp_port",0); s->payload_type=jint(j,"payload_type",96);
-      s->ring=jint(j,"ring", s->kind==K_AUDIO?100:8); s->hdr=jint(j,"hdr",64);
-      if (s->kind == K_VIDEO) {
-        s->width=jint(j,"width",1920); s->height=jint(j,"height",1080);
-        s->fps=jdbl(j,"fps",25.0); s->interlaced=jint(j,"interlaced",0);
-        s->bit_depth=jint(j,"bit_depth",10);
-      } else if (s->kind == K_AUDIO) {
-        s->channels=jint(j,"channels",8);
-      } else {
-        fprintf(stderr,"mtl_rx: session data (2110-40) pas encore implémentée, ignorée\n");
-        continue;   /* point d'extension : setup_data() à venir */
-      }
-      /* cibles : soit un tableau "targets" (fan-out même-source → N slots), soit "shm" (1 cible). */
-      struct json_object* tgs;
-      if (json_object_object_get_ex(j,"targets",&tgs) && json_object_is_type(tgs,json_type_array)) {
-        int nt = json_object_array_length(tgs);
-        for (int ti = 0; ti < nt && s->ntg < MAX_TG; ti++)
-          if (parse_target(json_object_array_get_idx(tgs, ti), &s->tg[s->ntg]) == 0) s->ntg++;
-      } else {
-        if (parse_target(j, &s->tg[0]) == 0) s->ntg = 1;   /* compat : shm/stats/ident_file inline */
-      }
-      if (!s->mcast[0] || !s->udp_port || s->ntg <= 0) {
-        fprintf(stderr,"mtl_rx: session %d incomplète, ignorée\n",k); continue; }
-      ns++;
-    }
+    int rx_q = jint(root,"rx_queues", 8);   /* plafond de sessions RX (= rx_count du moteur) */
+    int tx_q = jint(root,"tx_queues", 1);   /* TX : Phase 2 (1 = file de contrôle IGMP/ARP) */
     json_object_put(root);
-  } else {
-    /* legacy : 1 session vidéo depuis les args */
-    if (!l_mcast || !l_port || !l_shm || !iface[0]) { usage(argv[0]); return 1; }
-    struct sess* s = &S[0]; s->kind=K_VIDEO;
-    snprintf(s->mcast,sizeof(s->mcast),"%s",l_mcast);
-    s->udp_port=l_port; s->payload_type=l_pt; s->ring=l_ring; s->hdr=l_hdr;
-    s->width=l_w; s->height=l_h; s->fps=l_fps; s->interlaced=l_inter; s->bit_depth=l_bd;
-    struct target* t = &s->tg[0]; s->ntg = 1;
-    snprintf(t->shm_path,sizeof(t->shm_path),"%s",l_shm);
-    if (l_stats) snprintf(t->stats_path,sizeof(t->stats_path),"%s",l_stats);
-    if (l_ident) { snprintf(t->ident_file,sizeof(t->ident_file),"%s",l_ident); t->has_ident=1; }
-    ns = 1;
-  }
-  if (ns <= 0) { fprintf(stderr,"mtl_rx: aucune session valide\n"); return 1; }
+    if (!iface[0]) { fprintf(stderr,"mtl_rx: config sans iface\n"); return 1; }
 
-  /* nom de port MTL selon le PMD */
-  char portname[MTL_PORT_MAX_LEN];
+    if (!strcmp(pmd,"af_xdp"))      snprintf(portname,sizeof(portname),"native_af_xdp:%s",iface);
+    else if (!strcmp(pmd,"kernel")) snprintf(portname,sizeof(portname),"kernel:%s",iface);
+    else                            snprintf(portname,sizeof(portname),"%s",iface);
+
+    struct mtl_init_params p; memset(&p, 0, sizeof(p));
+    p.num_ports = 1;
+    snprintf(p.port[MTL_PORT_P], MTL_PORT_MAX_LEN, "%s", portname);
+    if (sip[0]) inet_pton(AF_INET, sip, p.sip_addr[MTL_PORT_P]);
+    p.pmd[MTL_PORT_P] = mtl_pmd_by_port_name(portname);
+    /* AUTO_START_STOP : en AF_XDP le flow/XSK se crée AVEC le démarrage du device, déclenché par le
+     * 1ᵉʳ st20p_rx_create (impossible de pré-démarrer un device vide : « add flow fail »). Le device
+     * se start/stop au gré du nombre de sessions, mais le XDP reste attaché tant que mtl_init vit
+     * (le détache n'a lieu qu'à mtl_uninit) → ptp4l ne faute qu'au boot, pas sur les changements. */
+    p.flags |= MTL_FLAG_DEV_AUTO_START_STOP;
+    p.log_level = MTL_LOG_LEVEL_INFO;
+    p.lcores = lcores[0] ? lcores : NULL;
+    p.rx_queues_cnt[MTL_PORT_P] = rx_q > 0 ? rx_q : 1;
+    p.tx_queues_cnt[MTL_PORT_P] = tx_q > 0 ? tx_q : 1;
+
+    mtl_handle st = mtl_init(&p);
+    if (!st) { fprintf(stderr, "mtl_rx: mtl_init fail\n"); return 1; }
+    fprintf(stderr, "mtl_rx: daemon up (iface=%s rx_q=%d tx_q=%d) — réconciliation à chaud\n",
+            iface, rx_q, tx_q);
+
+    long cfg_mtime = 0; struct stat cst;
+    reconcile(reg, config, st, portname);                 /* état initial */
+    if (stat(config, &cst) == 0) cfg_mtime = (long)cst.st_mtime;
+    time_t last_t = time(NULL);
+    while (!g_stop) {
+      for (int z = 0; z < 5 && !g_stop; z++) usleep(100000);   /* ~0.5s, réactif au SIGTERM */
+      if (g_stop) break;
+      struct stat cs;
+      if (stat(config, &cs) == 0 && (long)cs.st_mtime != cfg_mtime) {
+        cfg_mtime = (long)cs.st_mtime;
+        reconcile(reg, config, st, portname);             /* config changé → converge à chaud */
+      }
+      time_t now = time(NULL); double dt = difftime(now, last_t);
+      if (dt >= 2.0) { write_stats(reg, last, dt); last_t = now; }
+    }
+    for (int i = 0; i < MAX_SESS; i++) if (reg[i].used) free_session(&reg[i]);
+    mtl_uninit(st);
+    return 0;
+  }
+
+  /* ═══ LEGACY one-shot ═══ (tests manuels : 1 session vidéo depuis les args, pas de réconciliation) */
+  if (!l_mcast || !l_port || !l_shm || !iface[0]) { usage(argv[0]); return 1; }
   if (!strcmp(pmd,"af_xdp"))      snprintf(portname,sizeof(portname),"native_af_xdp:%s",iface);
   else if (!strcmp(pmd,"kernel")) snprintf(portname,sizeof(portname),"kernel:%s",iface);
   else                            snprintf(portname,sizeof(portname),"%s",iface);
 
-  signal(SIGINT, on_signal); signal(SIGTERM, on_signal);
-
-  /* ── mtl_init UNIQUE (PF/MtlManager/XDP partagés) ── */
   struct mtl_init_params p; memset(&p, 0, sizeof(p));
   p.num_ports = 1;
   snprintf(p.port[MTL_PORT_P], MTL_PORT_MAX_LEN, "%s", portname);
@@ -453,58 +567,32 @@ int main(int argc, char** argv) {
   p.flags |= MTL_FLAG_DEV_AUTO_START_STOP;
   p.log_level = MTL_LOG_LEVEL_INFO;
   p.lcores = lcores[0] ? lcores : NULL;
-  p.rx_queues_cnt[MTL_PORT_P] = ns;     /* une file RX par session */
-  p.tx_queues_cnt[MTL_PORT_P] = 1;      /* contrôle (IGMP/ARP) */
+  p.rx_queues_cnt[MTL_PORT_P] = 1;
+  p.tx_queues_cnt[MTL_PORT_P] = 1;
 
   mtl_handle st = mtl_init(&p);
   if (!st) { fprintf(stderr, "mtl_rx: mtl_init fail\n"); return 1; }
 
-  int up = 0;
-  for (int k = 0; k < ns; k++) {
-    S[k].st = st;
-    snprintf(S[k].portname, sizeof(S[k].portname), "%s", portname);
-    int r = (S[k].kind == K_AUDIO) ? setup_audio(&S[k]) : setup_video(&S[k]);
-    if (r == 0) up++;
-    else fprintf(stderr, "mtl_rx: session %d échouée\n", k);
-  }
-  if (!up) { fprintf(stderr, "mtl_rx: aucune session démarrée\n"); mtl_uninit(st); return 1; }
+  struct sess* s = &reg[0]; s->kind = K_VIDEO;
+  snprintf(s->mcast,sizeof(s->mcast),"%s",l_mcast);
+  s->udp_port=l_port; s->payload_type=l_pt; s->ring=l_ring; s->hdr=l_hdr;
+  s->width=l_w; s->height=l_h; s->fps=l_fps; s->interlaced=l_inter; s->bit_depth=l_bd;
+  s->ntg = 1;
+  snprintf(s->tg[0].shm_path,sizeof(s->tg[0].shm_path),"%s",l_shm);
+  if (l_stats) snprintf(s->tg[0].stats_path,sizeof(s->tg[0].stats_path),"%s",l_stats);
+  if (l_ident) { snprintf(s->tg[0].ident_file,sizeof(s->tg[0].ident_file),"%s",l_ident); s->tg[0].has_ident=1; }
+  s->st = st; snprintf(s->portname, sizeof(s->portname), "%s", portname); s->stop = 0;
+  if (setup_video(s) != 0) { fprintf(stderr,"mtl_rx: setup échoué\n"); mtl_uninit(st); return 1; }
+  s->used = 1;
 
-  /* ── boucle de stats par CIBLE (un fichier de stats par slot shm) ── */
-  static uint64_t last[MAX_SESS][MAX_TG]; memset(last, 0, sizeof(last));
   time_t last_t = time(NULL);
   while (!g_stop) {
-    /* dort ~2s MAIS réactif au SIGTERM (sinon mtl_uninit tarde → le manager SIGKILL →
-     * XDP/registration MtlManager fuient → la session suivante ne peut plus s'attacher). */
     for (int z = 0; z < 20 && !g_stop; z++) usleep(100000);
     if (g_stop) break;
     time_t now = time(NULL); double dt = difftime(now, last_t); last_t = now;
-    for (int k = 0; k < ns; k++) {
-      struct sess* s = &S[k];
-      if (!s->started) continue;
-      for (int ti = 0; ti < s->ntg; ti++) {
-        struct target* t = &s->tg[ti];
-        if (!t->stats_path[0]) continue;
-        double rate = dt > 0 ? (double)(t->recv - last[k][ti]) / dt : 0.0;
-        last[k][ti] = t->recv;
-        FILE* sf = fopen(t->stats_path, "w");
-        if (sf) { fprintf(sf, "{\"fps\": %.1f, \"frame_index\": %llu}\n", rate,
-                          (unsigned long long)t->index); fclose(sf); }
-      }
-    }
+    write_stats(reg, last, dt);
   }
-
-  g_stop = 1;
-  for (int k = 0; k < ns; k++) {
-    if (!S[k].started) continue;
-    pthread_join(S[k].thread, NULL);
-    if (S[k].kind == K_AUDIO) { if (S[k].ah) st30p_rx_free(S[k].ah); }
-    else                      { if (S[k].vh) st20p_rx_free(S[k].vh); }
-    for (int ti = 0; ti < S[k].ntg; ti++) {
-      struct target* t = &S[k].tg[ti];
-      if (t->shm_base && t->shm_base != MAP_FAILED) munmap(t->shm_base, t->shm_size);
-      if (t->ident_patch) free(t->ident_patch);
-    }
-  }
+  free_session(s);
   mtl_uninit(st);
   return 0;
 }

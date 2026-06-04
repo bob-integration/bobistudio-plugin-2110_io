@@ -418,15 +418,34 @@ def _read_stats(stats_path):
         return None
 
 
+def _write_config(sessions):
+    """Écrit le config lu par le DAEMON mtl_rx : device params (cap des files = N_VIDEO) + sessions
+    désirées. Le daemon détecte le changement de mtime et RÉCONCILIE à chaud — aucune relance."""
+    with open(_CONFIG_PATH, "w") as f:
+        json.dump({"pmd": "af_xdp", "iface": IFACE, "lcores": LCORES,
+                   "rx_queues": max(1, N_VIDEO), "tx_queues": 1,
+                   "sessions": sessions}, f)
+
+
+def _launch_mtl():
+    """(Re)lance le daemon mtl_rx. Purge d'abord le XDP résiduel : au 1er lancement (ou après un
+    crash) une instance précédente a pu laisser un programme XDP accroché → mtl_init échouerait en
+    boucle (`native xdp dev init fail -5`)."""
+    global _mtl_proc, _last_launch
+    _xdp_off()
+    _mtl_proc = subprocess.Popen([MTL_RX, "--config", _CONFIG_PATH])
+    _last_launch = time.time()
+    print("mtl_rx daemon (re)lancé", flush=True)
+
+
 def _manager_loop():
-    """Recalcule l'ensemble des sessions vidéo ACTIVES (SDP présent, pas GÉN) et (re)lance UN
-    mtl_rx (config JSON) quand l'ensemble change. Met à jour la résolution par slot + _live."""
-    global _mtl_proc, _cur_sig, _last_launch, _fail_streak
+    """Calcule l'ensemble RX voulu (SDP actifs, groupés par source pour le fan-out) et RÉÉCRIT le
+    config. Le daemon mtl_rx — lancé UNE fois et MAINTENU en vie (mtl_init à vie) — réconcilie les
+    sessions à chaud : plus de kill/relance, ptp4l ne faute qu'au 1er lancement. On ne relance QUE
+    si le daemon meurt (crash), avec backoff + purge XDP."""
+    global _mtl_proc, _cur_sig, _fail_streak
     while True:
-        # 1) résoudre le SDP de chaque slot + grouper les slots actifs par SOURCE (mcast:port).
-        #    Plusieurs slots sur la même source → UNE session (fan-out), pas N sessions réseau
-        #    (l'AF_XDP refuse 2 files RX sur le même 5-tuple).
-        groups = {}        # (mcast, port) → {"info": sdp, "idxs": [..]}
+        groups = {}        # (mcast, port) → {"info": sdp, "idxs": [..]} — fan-out même-source
         for idx in range(N_VIDEO):
             sdp_path = "{}/nmos_recv_v_{}.sdp".format(SDP_DIR, idx)
             sdp = _parse_sdp(sdp_path) if os.path.exists(sdp_path) else None
@@ -438,32 +457,34 @@ def _manager_loop():
                 key = (sdp["mcast"], sdp["port"])
                 groups.setdefault(key, {"info": sdp, "idxs": []})["idxs"].append(idx)
         sessions = [_video_session(g["info"], g["idxs"]) for g in groups.values()]
-        sig = json.dumps(sessions, sort_keys=True)
-        dead = (_mtl_proc is not None and _mtl_proc.poll() is not None)
-        if not (sig != _cur_sig or dead):
-            time.sleep(0.5); continue
-        # Backoff : si mtl_rx vient de mourir VITE après son lancement, c'est un échec (XDP/MtlManager)
-        # → on attend (laisse l'infra se reposer) au lieu de marteler (le crash-loop 529×).
-        if dead and (time.time() - _last_launch) < 6:
-            _fail_streak = min(_fail_streak + 1, 6)
-            wait = min(2 + 2 * _fail_streak, 15)
-            print("mtl_rx échec rapide (#{}) — backoff {}s".format(_fail_streak, wait), flush=True)
-            time.sleep(wait)
-        else:
-            _fail_streak = 0
         active = set(t["idx"] for s in sessions for t in s["targets"])
         for idx in range(N_VIDEO):
             _live[idx] = idx in active
+
+        # 1) config : réécrit dès qu'il change → le daemon réconcilie à chaud (aucune relance/faute PTP)
+        sig = json.dumps(sessions, sort_keys=True)
+        if sig != _cur_sig:
+            with _mtl_lock:
+                _write_config(sessions)
+            _cur_sig = sig
+            print("mtl_rx config: {} session(s)".format(len(sessions)), flush=True)
+
+        # 2) cycle de vie : lancé 1× au 1er besoin, maintenu en vie ; relancé seulement s'il a crashé
+        dead = (_mtl_proc is not None and _mtl_proc.poll() is not None)
         with _mtl_lock:
-            _kill_mtl()                                  # arrêt gracieux (XDP détaché proprement)
-            if sessions:
-                with open(_CONFIG_PATH, "w") as f:
-                    json.dump({"pmd": "af_xdp", "iface": IFACE, "lcores": LCORES,
-                               "sessions": sessions}, f)
-                print("mtl_rx (re)lance : {} session(s)".format(len(sessions)), flush=True)
-                _mtl_proc = subprocess.Popen([MTL_RX, "--config", _CONFIG_PATH])
-                _last_launch = time.time()
-        _cur_sig = sig
+            if _mtl_proc is None and sessions:
+                _launch_mtl()                               # 1er lancement (mtl_init → 1 seule faute PTP)
+            elif dead and sessions:
+                if (time.time() - _last_launch) < 6:
+                    _fail_streak = min(_fail_streak + 1, 6)
+                    wait = min(2 + 2 * _fail_streak, 15)
+                    print("mtl_rx crash → backoff {}s (#{})".format(wait, _fail_streak), flush=True)
+                    time.sleep(wait)
+                else:
+                    _fail_streak = 0
+                _launch_mtl()                               # relance après crash (purge XDP incluse)
+            elif dead:
+                _mtl_proc = None                            # mort sans rien à servir → relance au besoin
         time.sleep(0.5)
 
 
@@ -498,16 +519,10 @@ def _simu_loop(idx):
 
 
 def _cleanup(*a):
-    # Teardown gracieux : SIGTERM à mtl_rx + courte attente pour qu'il détache son XDP via
-    # mtl_uninit (sinon résidu → la session suivante ne peut plus s'attacher). Filet de sécurité
-    # côté orchestrateur : `ip link set <iface> xdp off` au destroy.
+    # Arrêt du conteneur : teardown gracieux du daemon (SIGTERM → free sessions + mtl_stop/uninit)
+    # puis purge XDP (_kill_mtl). C'est le SEUL endroit qui arrête mtl_rx (plus de kill par changement).
     with _mtl_lock:
-        if _mtl_proc:
-            try:
-                _mtl_proc.terminate()
-                _mtl_proc.wait(timeout=4)
-            except Exception:
-                pass
+        _kill_mtl()
     raise SystemExit(0)
 
 
