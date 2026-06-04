@@ -1,8 +1,11 @@
 {
-  "version": "0.9.0",
+  "version": "0.9.1",
   "date": "2026-06-04",
   "changes": {
     "Nouveautés": [
+      "GÉN : la mire simu suit la RÉSOLUTION LIVE (lue du SDP même sous GÉN) → le shm garde la même taille qu'en réception ; plus de bascule RX→simu qui passait en 720p et noircissait les consommateurs (moniteur). Layout simu dynamique par slot."
+    ],
+    "Nouveautés (0.9.0)": [
       "Contrôle à chaud GÉN + IDENT (panneau identique receiver_2110) : le contrôleur sert :8082 (/gen force la mire simu sur un slot ; /ident bascule/dimensionne l'incrustation 3 lignes). IDENT sur simu = overlay numpy (PIL) ; IDENT sur live MTL = mtl_rx lit le patch (fichier écrit par le contrôleur) et l'incruste en C (rect haut-droit, 8/10/12 bits). Coût CPU nul tant que GÉN/IDENT off (un stat() par frame). +python3-pil/fonts-dejavu."
     ],
     "Nouveautés (0.8.1)": [
