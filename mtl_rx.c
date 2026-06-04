@@ -98,8 +98,11 @@ struct sess {
   st20p_rx_handle vh;      /* RX */
   st20p_tx_handle vth;     /* TX */
   int      width, height, bit_depth, interlaced; double fps;
+  int      tff;            /* entrelacé : 1=TFF (1080i), 0=BFF (576i) — parité des champs */
   size_t   src_framesize; int conv8;
-  enum st_frame_fmt out_fmt; int plane_h;
+  size_t   shm_slotsize;   /* taille d'un slot shm = TRAME PLEINE (≠ slotsize = taille CHAMP en
+                              entrelacé, côté libmtl). 0 ⇒ open_shm retombe sur slotsize (audio/data). */
+  enum st_frame_fmt out_fmt; int plane_h;   /* plane_h = hauteur de CHAMP (H/2) en entrelacé */
   /* ── audio ── */
   st30p_rx_handle ah;      /* RX */
   st30p_tx_handle a_tx;    /* TX */
@@ -175,6 +178,47 @@ static void overlay_ident(struct sess* s, struct target* t, uint8_t* dst) {
   }
 }
 
+/* Entrelacé : pont entre un CHAMP libmtl (planar 422, 10-bit, plane_h = H/2 lignes, addr/linesize
+ * par plan) et un slot shm TRAME PLEINE (planar 422 contigu Y|Cb|Cr, H lignes). Une ligne de champ
+ * = une ligne sur deux de la trame, départ `parity` (0|1), stride 2.
+ *   dir=0 : champ → trame (RX merge) ; dir=1 : trame → champ (TX split).
+ *   shm8=1 : le shm est en 8 bits (conv8 RX / bit_depth 8 TX) → conversion 8↔10 par échantillon ;
+ *            le buffer libmtl est TOUJOURS 10-bit (out/input_fmt YUV422PLANAR10LE).
+ * 422 : plan 0 (Y) = W échantillons/ligne ; plans 1,2 (Cb,Cr) = W/2 ; tous H lignes en trame. */
+static void field_weave(int W, int H, int shm8, struct st_frame* frame,
+                        uint8_t* slot, int parity, int dir) {
+  int fh = H / 2;
+  int bps_shm = shm8 ? 1 : 2;
+  size_t plane_off = 0;
+  for (int p = 0; p < 3; p++) {
+    int pw = p == 0 ? W : W / 2;                  /* échantillons/ligne du plan (422) */
+    size_t shm_ls = (size_t)pw * bps_shm;          /* linesize shm (sans padding) */
+    uint8_t* shm_p = slot + plane_off;
+    uint8_t* fld_p = (uint8_t*)frame->addr[p];
+    size_t fld_ls = frame->linesize[p];            /* linesize libmtl (peut avoir du padding) */
+    for (int j = 0; j < fh; j++) {
+      uint8_t* shm_l = shm_p + (size_t)(2 * j + parity) * shm_ls;
+      uint8_t* fld_l = fld_p + (size_t)j * fld_ls;
+      if (dir == 0) {                              /* RX : champ(10) → trame(shm) */
+        if (shm8) { const uint16_t* sf = (const uint16_t*)fld_l;
+                    for (int x = 0; x < pw; x++) shm_l[x] = (uint8_t)(sf[x] >> 2); }
+        else memcpy(shm_l, fld_l, (size_t)pw * 2);
+      } else {                                     /* TX : trame(shm) → champ(10) */
+        if (shm8) { uint16_t* df = (uint16_t*)fld_l;
+                    for (int x = 0; x < pw; x++) df[x] = (uint16_t)shm_l[x] << 2; }
+        else memcpy(fld_l, shm_l, (size_t)pw * 2);
+      }
+    }
+    plane_off += (size_t)pw * H * bps_shm;          /* plan suivant (trame pleine : H lignes) */
+  }
+}
+
+/* parité (ligne de départ 0|1) d'un champ : second_field (lib) + ordre de champ (tff).
+ * TFF : 1er champ→paires(0), 2e→impaires(1) ; BFF : inversé. DOIT être identique RX↔TX. */
+static inline int field_parity(int second_field, int tff) {
+  return (second_field ? 1 : 0) ^ (tff ? 0 : 1);
+}
+
 static void* video_rx_thread(void* arg) {
   struct sess* s = arg;
   while (!s->stop) {
@@ -183,20 +227,39 @@ static void* video_rx_thread(void* arg) {
     if (!frame->addr[0]) { st20p_rx_put_frame(s->vh, frame); continue; }
     /* af_xdp/copy_mode : décodage unique → fan-out vers chaque cible (slot shm).
      * Chaque cible a son propre ring/index + son propre IDENT. */
-    for (int ti = 0; ti < s->ntg; ti++) {
-      struct target* t = &s->tg[ti];
-      uint64_t fi = t->index;
-      uint8_t* dst = t->frames_base + (size_t)(fi % s->ring) * s->slotsize;
-      if (s->conv8) {
-        const uint16_t* src = (const uint16_t*)frame->addr[0];
-        size_t n = s->slotsize;
-        for (size_t k = 0; k < n; k++) dst[k] = (uint8_t)(src[k] >> 2);
-      } else {
-        memcpy(dst, frame->addr[0], s->slotsize);
+    if (s->interlaced) {
+      /* On reçoit UN CHAMP par appel ; libmtl pose frame->second_field. On weave les 2 champs dans
+       * le MÊME slot (trame pleine) et on ne PUBLIE (header + index) qu'au 2e champ → les
+       * consommateurs lisent toujours une trame complète, jamais une demi-trame. */
+      int sf = frame->second_field ? 1 : 0;
+      int parity = field_parity(sf, s->tff);
+      for (int ti = 0; ti < s->ntg; ti++) {
+        struct target* t = &s->tg[ti];
+        uint64_t fi = t->index;                    /* index NON bumpé tant que la trame est partielle */
+        uint8_t* dst = t->frames_base + (size_t)(fi % s->ring) * s->shm_slotsize;
+        field_weave(s->width, s->height, s->conv8, frame, dst, parity, 0);
+        if (sf) {                                  /* 2e champ : trame complète */
+          if (t->has_ident) { load_ident_patch(t); overlay_ident(s, t, dst); }
+          write_shm_header(t, fi);
+          t->index = fi + 1; t->recv++;
+        }
       }
-      if (t->has_ident) { load_ident_patch(t); overlay_ident(s, t, dst); }
-      write_shm_header(t, fi);
-      t->index = fi + 1; t->recv++;
+    } else {
+      for (int ti = 0; ti < s->ntg; ti++) {
+        struct target* t = &s->tg[ti];
+        uint64_t fi = t->index;
+        uint8_t* dst = t->frames_base + (size_t)(fi % s->ring) * s->slotsize;
+        if (s->conv8) {
+          const uint16_t* src = (const uint16_t*)frame->addr[0];
+          size_t n = s->slotsize;
+          for (size_t k = 0; k < n; k++) dst[k] = (uint8_t)(src[k] >> 2);
+        } else {
+          memcpy(dst, frame->addr[0], s->slotsize);
+        }
+        if (t->has_ident) { load_ident_patch(t); overlay_ident(s, t, dst); }
+        write_shm_header(t, fi);
+        t->index = fi + 1; t->recv++;
+      }
     }
     st20p_rx_put_frame(s->vh, frame);
   }
@@ -245,7 +308,10 @@ static enum st_fps to_st_fps(double f) {
 /* mmap (création + ftruncate) du shm d'une cible, header à l'offset 0. Taille = hdr + ring*slot
  * (dimensions de la session, communes à toutes ses cibles). */
 static int open_shm(struct sess* s, struct target* t) {
-  size_t raw = (size_t)s->hdr + (size_t)s->ring * s->slotsize;
+  /* Slot = TRAME PLEINE (shm_slotsize) en vidéo entrelacée ; sinon (progressif/audio/data)
+   * shm_slotsize vaut 0 → on retombe sur slotsize (comportement historique). */
+  size_t slot = s->shm_slotsize ? s->shm_slotsize : s->slotsize;
+  size_t raw = (size_t)s->hdr + (size_t)s->ring * slot;
   size_t pg = (size_t)sysconf(_SC_PAGESIZE);
   t->shm_size = (raw + pg - 1) & ~(pg - 1);
   int fd = open(t->shm_path, O_CREAT | O_RDWR, 0666);
@@ -291,8 +357,10 @@ static int setup_video(struct sess* s) {
 
   s->vh = st20p_rx_create(s->st, &ops);
   if (!s->vh) { fprintf(stderr, "mtl_rx: st20p_rx_create fail (video %s:%d)\n", s->mcast, s->udp_port); return -1; }
-  s->src_framesize = st20p_rx_frame_size(s->vh);
+  s->src_framesize = st20p_rx_frame_size(s->vh);   /* = taille CHAMP si entrelacé (st_frame_size/2) */
   s->slotsize = s->conv8 ? s->src_framesize / 2 : s->src_framesize;
+  /* Slot shm = TRAME PLEINE : en entrelacé on weave 2 champs (×2) ; en progressif = slotsize. */
+  s->shm_slotsize = s->interlaced ? s->slotsize * 2 : s->slotsize;
   if (open_targets(s) != 0) return -1;
   fprintf(stderr, "mtl_rx[video] %dx%d%s fps=%.2f pt=%d mc=%s:%d slot=%zu ring=%d → %d cible(s):",
           s->width, s->height, s->interlaced ? "i" : "p", s->fps, s->payload_type,
@@ -327,26 +395,41 @@ static int open_shm_in(struct sess* s, struct target* t, size_t want) {
 static void* video_tx_thread(void* arg) {
   struct sess* s = arg;
   struct target* t = &s->tg[0];                 /* la cible TX = l'unique shm d'entrée */
-  size_t out_size = st20p_tx_frame_size(s->vth);
+  size_t out_size = st20p_tx_frame_size(s->vth);   /* = taille CHAMP si entrelacé */
+  uint64_t latched_fi = 0;                      /* entrelacé : index latché sur le 1er champ */
   while (!s->stop) {
     if (!t->shm_base) {
       if (open_shm_in(s, t, (size_t)s->hdr + s->slotsize) != 0) { usleep(20000); continue; }
     }
     struct st_frame* frame = st20p_tx_get_frame(s->vth);   /* bloque → pacing à fps */
     if (!frame) { usleep(1000); continue; }
-    uint64_t fi = ((volatile uint64_t*)t->shm_base)[0];
-    long slot = (long)(fi % s->ring);
-    const uint8_t* src = t->frames_base + (size_t)slot * s->slotsize;
-    uint8_t* dst = (uint8_t*)frame->addr[0];
-    if (s->bit_depth == 8) {
-      uint16_t* d16 = (uint16_t*)dst;
-      size_t n = s->slotsize;                   /* 8 bits : slotsize octets = n échantillons */
-      for (size_t k = 0; k < n; k++) d16[k] = (uint16_t)src[k] << 2;   /* 8→10 */
+    if (s->interlaced) {
+      /* Un CHAMP par appel (libmtl pose/alterne second_field). Les 2 champs d'une trame viennent du
+       * MÊME slot shm → on latche l'index sur le 1er champ, réutilisé pour le 2e (évite le combing si
+       * le producteur avance entre les deux get_frame). On dé-weave la trame pleine en lignes. */
+      int sf = frame->second_field ? 1 : 0;
+      int parity = field_parity(sf, s->tff);
+      uint64_t fi = sf ? latched_fi : (latched_fi = ((volatile uint64_t*)t->shm_base)[0]);
+      long slot = (long)(fi % s->ring);
+      uint8_t* src = t->frames_base + (size_t)slot * s->slotsize;   /* slot = TRAME PLEINE */
+      field_weave(s->width, s->height, (s->bit_depth == 8), frame, src, parity, 1);
+      st20p_tx_put_frame(s->vth, frame);
+      t->index = fi; t->recv++;
     } else {
-      memcpy(dst, src, out_size < s->slotsize ? out_size : s->slotsize);
+      uint64_t fi = ((volatile uint64_t*)t->shm_base)[0];
+      long slot = (long)(fi % s->ring);
+      const uint8_t* src = t->frames_base + (size_t)slot * s->slotsize;
+      uint8_t* dst = (uint8_t*)frame->addr[0];
+      if (s->bit_depth == 8) {
+        uint16_t* d16 = (uint16_t*)dst;
+        size_t n = s->slotsize;                 /* 8 bits : slotsize octets = n échantillons */
+        for (size_t k = 0; k < n; k++) d16[k] = (uint16_t)src[k] << 2;   /* 8→10 */
+      } else {
+        memcpy(dst, src, out_size < s->slotsize ? out_size : s->slotsize);
+      }
+      st20p_tx_put_frame(s->vth, frame);
+      t->index = fi; t->recv++;
     }
-    st20p_tx_put_frame(s->vth, frame);
-    t->index = fi; t->recv++;
   }
   return NULL;
 }
@@ -654,6 +737,7 @@ static int parse_session_into(struct json_object* j, struct sess* s) {
   if (s->kind == K_VIDEO) {
     s->width=jint(j,"width",1920); s->height=jint(j,"height",1080);
     s->fps=jdbl(j,"fps",25.0); s->interlaced=jint(j,"interlaced",0);
+    s->tff = strcmp(jstr(j,"field_order","tff"), "bff") != 0;   /* défaut TFF ; "bff" → 0 */
     s->bit_depth=jint(j,"bit_depth",10);
   } else if (s->kind == K_AUDIO) {
     s->channels=jint(j,"channels",8);
@@ -674,9 +758,9 @@ static int parse_session_into(struct json_object* j, struct sess* s) {
 /* Signature = identité réseau + format + cibles. Un sig différent ⇒ on libère l'ancienne session et
  * on en recrée une (flow RX recyclé, device/XDP intacts ⇒ pas de faute PTP). */
 static void compute_sig(struct sess* s) {
-  int n = snprintf(s->sig, sizeof(s->sig), "%d|%d|%s|%d|%d|%dx%d|%.2f|i%d|bd%d|r%d|",
+  int n = snprintf(s->sig, sizeof(s->sig), "%d|%d|%s|%d|%d|%dx%d|%.2f|i%d|f%d|bd%d|r%d|",
                    s->role, s->kind, s->mcast, s->udp_port, s->payload_type,
-                   s->width, s->height, s->fps, s->interlaced, s->bit_depth, s->ring);
+                   s->width, s->height, s->fps, s->interlaced, s->tff, s->bit_depth, s->ring);
   for (int ti = 0; ti < s->ntg && n > 0 && n < (int)sizeof(s->sig); ti++)
     n += snprintf(s->sig + n, sizeof(s->sig) - n, "%s>%s,",
                   s->tg[ti].shm_path, s->tg[ti].has_ident ? s->tg[ti].ident_file : "-");

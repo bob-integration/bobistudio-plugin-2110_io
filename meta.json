@@ -1,8 +1,14 @@
 {
-  "version": "0.16.0",
+  "version": "0.18.0",
   "date": "2026-06-04",
   "changes": {
     "Nouveautés": [
+      "Entrelacé (1080i50) — binaire mtl_rx COMPLÉTÉ : merge/split des champs ↔ trame. Fait établi (sources libmtl 26.01) : l'API st20p travaille PAR CHAMP en entrelacé (st_frame_size /2 ; un get/put_frame = 1 champ ; second_field alterné par la lib). Le binaire passait le flag mais copiait à plat (plane_h inutilisé, slotsize TX figé) → incomplet. DÉCISION D'ARCHI : encapsuler les champs À LA FRONTIÈRE MTL, le shm MXL reste « 1 TRAME PLEINE par slot » (les consommateurs voient des trames normales). RX : weave des 2 champs reçus dans un slot trame-pleine (parité second_field+field_order, publication header/index AU 2e champ seulement). TX : dé-weave un slot trame-pleine en 2 champs émis (slot latché sur le 1er champ → pas de combing). conv8 (8↔10 bits) appliqué ligne à ligne. open_shm dimensionne le slot en trame pleine (shm_slotsize) ; répare l'invariant simu↔live (le simu était déjà en trame pleine). field_weave + field_parity ; field_order lu du JSON (parse_session_into) + signature de session (recrée si i/p ou tff change). Progressif strictement inchangé (gardé par if interlaced). ⚠️ À builder + tester sur le nœud E810 (non compilable/testable off-site)."
+    ],
+    "Nouveautés (0.17.0)": [
+      "Entrelacé (1080i50) — PASSTHROUGH du balayage RX→TX (côté orchestrateur/contrôleur). Le slot TX ne force plus interlaced=False : il ré-émet en entrelacé si la source câblée l'est. Le scan (i/p) + l'ordre de champ (tff/bff) suivent le format du PRODUCTEUR du shm câblé (résolu via la topologie, push :8081/tx scan/field_order + câblage :8082/input fmt) ; le SDP TX 2110-20 porte alors le flag « interlace » et conserve la cadence trame reçue (exactframerate inchangée). NMOS IS-04 : le flow expose le bon interlace_mode (interlaced_tff/interlaced_bff/progressive via app.scripts.nmos_interlace_mode) au lieu de « progressive » figé ; grain_rate = cadence TRAME (25 pour 1080i50). Source progressive → inchangé."
+    ],
+    "Nouveautés (0.16.0)": [
       "ANC / ST 2110-40 (st40) — RX+TX passthrough + TIMECODE. RX : un SDP smpte291 actif (essence=anc → nmos_recv_anc_{idx}.sdp) crée une session st40p_rx qui SÉRIALISE meta+udw dans /dev/shm/{hn}_anc_{idx}. TX : st40p_tx ré-émet ce shm verbatim (passthrough intégral, meta+udw recopiés) ; le shm ANC SUIT la vidéo câblée (mtl_0 → mtl_anc_0). TIMECODE : mtl_rx décode l'ATC (SMPTE ST 12-1 / RP 188, DID 0x60/SDID 0x60) → exposé dans les stats :8080 (essence anc) + détail NMOS + AFFICHÉ live sur la carte I/O Sources 2110 (HH:MM:SS:FF, indicateur drop-frame). NMOS : receivers + senders de format data (media_type video/smpte291), câblables comme vidéo/audio sur la page Câbles ; transportfile ANC désambiguïsé par essence. docker_driver : ANC_COUNT à l'env + dest ANC (anc_multicast_ip/port) poussée à :8081/tx. Manifeste : produces data (anc_count) ; deploy_defaults anc_count=0. Réconciliation à chaud inchangée (générique role/kind)."
     ],
     "Nouveautés (0.15.0)": [
