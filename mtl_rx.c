@@ -176,6 +176,7 @@ int main(int argc, char** argv) {
              *lcores = NULL, *stats_file = NULL, *pmd_s = "dpdk", *iface = NULL;
   int udp_port = 0, payload_type = 96, width = 1920, height = 1080, ring = 10, hdr = 64;
   int interlaced = 0;
+  int bit_depth = 10;   /* profondeur du plan de SORTIE (8|10|12) — conforme au pipeline MXL */
   double fps = 25.0;
 
   static struct option opts[] = {
@@ -184,7 +185,8 @@ int main(int argc, char** argv) {
     {"height", 1, 0, 'H'}, {"fps", 1, 0, 'F'}, {"interlaced", 0, 0, 'i'},
     {"shm", 1, 0, 'S'}, {"ring", 1, 0, 'R'}, {"hdr", 1, 0, 'D'},
     {"lcores", 1, 0, 'l'}, {"stats_file", 1, 0, 'f'},
-    {"pmd", 1, 0, 'M'}, {"iface", 1, 0, 'N'}, {0, 0, 0, 0}};
+    {"pmd", 1, 0, 'M'}, {"iface", 1, 0, 'N'}, {"bit_depth", 1, 0, 'B'},
+    {0, 0, 0, 0}};
   int o;
   while ((o = getopt_long(argc, argv, "", opts, NULL)) != -1) {
     switch (o) {
@@ -204,6 +206,7 @@ int main(int argc, char** argv) {
       case 'f': stats_file = optarg; break;
       case 'M': pmd_s = optarg; break;
       case 'N': iface = optarg; break;
+      case 'B': bit_depth = atoi(optarg); break;
       default: usage(argv[0]); return 1;
     }
   }
@@ -246,7 +249,12 @@ int main(int argc, char** argv) {
   c.hdr = hdr;
   c.copy_mode = use_kernel;   /* PMD noyau → frames internes + memcpy (pas de DMA ext-frame) */
 
-  c.out_fmt = ST_FRAME_FMT_YUV422PLANAR10LE;
+  /* Profondeur du plan de sortie conforme au pipeline MXL (force8 par défaut côté orchestrateur).
+   * libmtl convertit le transport 422-10 (RFC4175) vers le planar demandé. 422 conservé. */
+  enum st_frame_fmt _ofmt = (bit_depth == 8)  ? ST_FRAME_FMT_YUV422PLANAR8
+                          : (bit_depth == 12) ? ST_FRAME_FMT_YUV422PLANAR12LE
+                          :                     ST_FRAME_FMT_YUV422PLANAR10LE;
+  c.out_fmt = _ofmt;
   c.plane_h = interlaced ? height / 2 : height;  /* buffer ext = 1 champ si entrelacé */
   c.st = mtl_init(&p);
   if (!c.st) { fprintf(stderr, "mtl_rx: mtl_init fail\n"); return 1; }
@@ -266,7 +274,7 @@ int main(int argc, char** argv) {
   ops.fps = to_st_fps(fps);
   ops.interlaced = interlaced ? true : false;
   ops.transport_fmt = ST20_FMT_YUV_422_10BIT;
-  ops.output_fmt = ST_FRAME_FMT_YUV422PLANAR10LE;
+  ops.output_fmt = _ofmt;
   ops.device = ST_PLUGIN_DEVICE_AUTO;
   ops.framebuff_cnt = ring;
   ops.notify_frame_available = frame_available;
