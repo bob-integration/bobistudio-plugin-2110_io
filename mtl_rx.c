@@ -92,7 +92,8 @@ struct sess {
   size_t   src_framesize; int conv8;
   enum st_frame_fmt out_fmt; int plane_h;
   /* ── audio ── */
-  st30p_rx_handle ah;
+  st30p_rx_handle ah;      /* RX */
+  st30p_tx_handle a_tx;    /* TX */
   int      channels;
 };
 
@@ -397,6 +398,57 @@ static int setup_audio(struct sess* s) {
   return pthread_create(&s->thread, NULL, audio_rx_thread, s) == 0 ? (s->started = 1, 0) : -1;
 }
 
+/* ═══ AUDIO TX (shm→wire, st30p_tx) ═══════════════════════════════════════════ */
+/* Feeder audio TX : lit le chunk courant du shm d'entrée (L24 BE = wire-native) et l'émet TEL QUEL
+ * (passthrough, zéro conversion — le shm MXL audio est déjà en BE). shm mappé paresseusement. */
+static void* audio_tx_thread(void* arg) {
+  struct sess* s = arg;
+  struct target* t = &s->tg[0];
+  while (!s->stop) {
+    if (!t->shm_base) {
+      if (open_shm_in(s, t, (size_t)s->hdr + s->slotsize) != 0) { usleep(20000); continue; }
+    }
+    struct st30_frame* frame = st30p_tx_get_frame(s->a_tx);   /* bloque (BLOCK_GET) → pacing 1ms */
+    if (!frame) { usleep(500); continue; }
+    uint64_t ci = ((volatile uint64_t*)t->shm_base)[0];
+    long slot = (long)(ci % s->ring);
+    const uint8_t* src = t->frames_base + (size_t)slot * s->slotsize;
+    size_t n = frame->data_size < s->slotsize ? frame->data_size : s->slotsize;
+    memcpy(frame->addr, src, n);                              /* BE shm → BE fil = passthrough */
+    st30p_tx_put_frame(s->a_tx, frame);
+    t->index = ci; t->recv++;
+  }
+  return NULL;
+}
+
+static int setup_audio_tx(struct sess* s) {
+  if (s->channels <= 0) s->channels = 8;
+  if (s->ring < 2) s->ring = 2;
+  s->slotsize = (size_t)(48000 / 1000) * s->channels * 3;   /* 1 ms L24 = 1152 si 8ch */
+
+  struct st30p_tx_ops ops; memset(&ops, 0, sizeof(ops));
+  ops.name = "bobi_mtl_atx";
+  ops.priv = s;
+  ops.port.num_port = 1;
+  inet_pton(AF_INET, s->mcast, ops.port.dip_addr[MTL_SESSION_PORT_P]);   /* destination */
+  snprintf(ops.port.port[MTL_SESSION_PORT_P], MTL_PORT_MAX_LEN, "%s", s->portname);
+  ops.port.udp_port[MTL_SESSION_PORT_P] = s->udp_port;
+  ops.port.payload_type = s->payload_type;
+  ops.fmt = ST30_FMT_PCM24;
+  ops.channel = (uint16_t)s->channels;
+  ops.sampling = ST30_SAMPLING_48K;
+  ops.ptime = ST30_PTIME_1MS;
+  ops.framebuff_size = (uint32_t)s->slotsize;
+  ops.framebuff_cnt = 4;
+  ops.flags = ST30P_TX_FLAG_BLOCK_GET;
+
+  s->a_tx = st30p_tx_create(s->st, &ops);
+  if (!s->a_tx) { fprintf(stderr, "mtl_rx: st30p_tx_create fail (audio %s:%d)\n", s->mcast, s->udp_port); return -1; }
+  fprintf(stderr, "mtl_rx[audio TX] %dch L24/48k pt=%d → %s:%d (in shm=%s)\n",
+          s->channels, s->payload_type, s->mcast, s->udp_port, s->tg[0].shm_path);
+  return pthread_create(&s->thread, NULL, audio_tx_thread, s) == 0 ? (s->started = 1, 0) : -1;
+}
+
 /* ── parse config JSON ── */
 static const char* jstr(struct json_object* o, const char* k, const char* def) {
   struct json_object* v;
@@ -472,9 +524,11 @@ static void compute_sig(struct sess* s) {
 static void free_session(struct sess* s) {
   if (!s->used) return;
   if (s->started) { s->stop = 1; pthread_join(s->thread, NULL); }
-  if (s->role == ROLE_TX)      { if (s->vth) st20p_tx_free(s->vth); }
-  else if (s->kind == K_AUDIO) { if (s->ah) st30p_rx_free(s->ah); }
-  else                         { if (s->vh) st20p_rx_free(s->vh); }
+  if (s->role == ROLE_TX) {
+    if (s->kind == K_AUDIO) { if (s->a_tx) st30p_tx_free(s->a_tx); }
+    else                    { if (s->vth)  st20p_tx_free(s->vth); }
+  } else if (s->kind == K_AUDIO) { if (s->ah) st30p_rx_free(s->ah); }
+  else                           { if (s->vh) st20p_rx_free(s->vh); }
   for (int ti = 0; ti < s->ntg; ti++) {
     struct target* t = &s->tg[ti];
     if (t->shm_base && t->shm_base != MAP_FAILED) munmap(t->shm_base, t->shm_size);
@@ -508,8 +562,9 @@ static void reconcile(struct sess* reg, const char* path, mtl_handle st, const c
     struct sess* s = &reg[slot];
     *s = want;
     s->st = st; snprintf(s->portname, sizeof(s->portname), "%s", portname); s->stop = 0;
-    int r = (s->role == ROLE_TX) ? setup_video_tx(s)
-            : (s->kind == K_AUDIO) ? setup_audio(s) : setup_video(s);
+    int r = (s->role == ROLE_TX)
+            ? ((s->kind == K_AUDIO) ? setup_audio_tx(s) : setup_video_tx(s))
+            : ((s->kind == K_AUDIO) ? setup_audio(s) : setup_video(s));
     if (r == 0) { s->used = 1; s->seen = 1; }
     else { fprintf(stderr,"mtl_rx: création session %s:%d échouée\n", s->mcast, s->udp_port); memset(s,0,sizeof(*s)); }
   }
