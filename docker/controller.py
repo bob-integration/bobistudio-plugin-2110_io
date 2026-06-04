@@ -332,24 +332,38 @@ _last_launch = 0.0            # horodatage du dernier (re)lancement de mtl_rx
 _fail_streak = 0             # échecs rapides consécutifs (backoff)
 
 
+def _xdp_off():
+    """Détache tout programme XDP résiduel de l'interface (l'hôte est partagé en --network host).
+    INDISPENSABLE entre deux lancements de mtl_rx : même un arrêt gracieux ne détache pas toujours
+    le XDP (mtl_uninit incomplet, MtlManager qui ne peut pas remplacer un dispatcher existant) →
+    la mtl_init suivante échoue en boucle (`native xdp dev init fail -5`). On repart d'une interface
+    propre. Coût : refaute ptp4l ~15 s (auto-recovery), acceptable au (re)lancement."""
+    try:
+        subprocess.run(["ip", "link", "set", IFACE, "xdp", "off"],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=5)
+    except Exception as e:
+        print("xdp off échoué:", e, flush=True)
+
+
 def _kill_mtl():
     """Arrêt GRACIEUX de l'unique mtl_rx : SIGTERM + longue attente pour laisser mtl_uninit
-    détacher proprement le XDP et se désinscrire de MtlManager. SIGKILL en TOUT dernier recours
-    (un SIGKILL fait fuir le XDP → la session suivante ne peut plus s'attacher → crash-loop)."""
+    détacher proprement le XDP et se désinscrire de MtlManager. SIGKILL en TOUT dernier recours.
+    PUIS purge inconditionnelle du XDP résiduel (_xdp_off) : c'est ce qui débloque la relance après
+    un changement d'abonnement (sinon crash-loop permanent `native xdp dev init fail -5`)."""
     global _mtl_proc
-    if not _mtl_proc:
-        return
-    try:
-        _mtl_proc.terminate()
-        try: _mtl_proc.wait(timeout=10)
+    if _mtl_proc:
+        try:
+            _mtl_proc.terminate()
+            try: _mtl_proc.wait(timeout=10)
+            except Exception:
+                print("mtl_rx ne s'arrête pas — SIGKILL (XDP peut fuir)", flush=True)
+                _mtl_proc.kill()
+                try: _mtl_proc.wait(timeout=3)
+                except Exception: pass
         except Exception:
-            print("mtl_rx ne s'arrête pas — SIGKILL (XDP peut fuir)", flush=True)
-            _mtl_proc.kill()
-            try: _mtl_proc.wait(timeout=3)
-            except Exception: pass
-    except Exception:
-        pass
-    _mtl_proc = None
+            pass
+        _mtl_proc = None
+    _xdp_off()   # interface propre avant toute (re)lance — y compris le 1er lancement
 
 
 def _video_target(idx):
