@@ -24,7 +24,8 @@ import numpy as np
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
 HOSTNAME   = os.environ.get("HOSTNAME_RX") or os.environ.get("HOSTNAME") or "mtlrx"
-N_VIDEO    = int(os.environ.get("VIDEO_COUNT") or 1)
+N_VIDEO    = int(os.environ.get("RX_COUNT") or os.environ.get("VIDEO_COUNT") or 1)   # slots RX (receivers)
+N_TX       = int(os.environ.get("TX_COUNT") or 0)                                     # slots TX (senders)
 IFACE      = os.environ.get("IFACE") or "ens1f0np0"
 LCORES     = os.environ.get("LCORES") or "1,2,3"
 V_RING     = max(2, int(os.environ.get("RING") or 8))   # ring du pipeline (réglage) ; mtl_rx borne ≤8
@@ -206,33 +207,52 @@ class AgentHandler(BaseHTTPRequestHandler):
         return self._json(404, {"error": "not found"})
 
     def do_POST(self):
-        if self.path.rstrip("/") != "/nmos/subscribe":
-            return self._json(404, {"error": "not found"})
+        route = self.path.rstrip("/")
         try:
             n = int(self.headers.get("Content-Length") or 0)
             body = json.loads(self.rfile.read(n) or b"{}")
         except Exception as e:
             return self._json(400, {"error": str(e)})
-        essence = body.get("essence", "video")
-        idx     = int(body.get("receiver_index") or 0)
-        enabled = bool(body.get("enabled"))
-        sdp     = body.get("sdp")
-        if isinstance(sdp, list):          # SMPTE 2022-7 : on garde la leg 0 en v1
-            sdp = sdp[0] if sdp else None
-        # v1 : vidéo uniquement (le slot lit nmos_recv_v_{idx}.sdp)
-        if essence != "video":
-            return self._json(200, {"ok": True, "note": "audio ignoré en v1"})
-        path = os.path.join(SDP_DIR, "nmos_recv_v_{}.sdp".format(idx))
-        try:
-            if enabled and sdp:
-                with open(path, "w") as f:
-                    f.write(sdp)
-            else:
-                if os.path.exists(path):
+
+        if route == "/nmos/subscribe":           # ── RX : activation IS-05 (SDP) d'un slot receiver
+            essence = body.get("essence", "video")
+            idx     = int(body.get("receiver_index") or 0)
+            enabled = bool(body.get("enabled"))
+            sdp     = body.get("sdp")
+            if isinstance(sdp, list):            # SMPTE 2022-7 : on garde la leg 0 en v1
+                sdp = sdp[0] if sdp else None
+            if essence != "video":               # v1 : vidéo uniquement
+                return self._json(200, {"ok": True, "note": "audio ignoré en v1"})
+            path = os.path.join(SDP_DIR, "nmos_recv_v_{}.sdp".format(idx))
+            try:
+                if enabled and sdp:
+                    with open(path, "w") as f: f.write(sdp)
+                elif os.path.exists(path):
                     os.remove(path)
-        except Exception as e:
-            return self._json(500, {"error": str(e)})
-        return self._json(200, {"ok": True})
+            except Exception as e:
+                return self._json(500, {"error": str(e)})
+            return self._json(200, {"ok": True})
+
+        if route == "/tx":                       # ── TX : spec complète d'un slot sender (poussée par l'orchestrateur)
+            try:
+                idx = int(body.get("idx", 0))
+            except Exception:
+                idx = -1
+            if not (0 <= idx < N_TX):
+                return self._json(400, {"error": "idx TX hors limites"})
+            with _tx_lock:
+                t = _tx[idx]
+                t["enabled"] = bool(body.get("enabled"))
+                if "mcast"    in body: t["mcast"]    = body.get("mcast") or None
+                if "udp_port" in body: t["udp_port"] = int(body.get("udp_port") or 0)
+                if "pt"       in body: t["pt"]       = int(body.get("pt") or 96)
+                if "shm_in"   in body: t["shm_in"]   = (body.get("shm_in") or "").strip() or None
+                for k_in, k_st in (("width","w"),("height","h"),("fps","fps"),("bit_depth","bd"),("ring","ring")):
+                    if body.get(k_in):
+                        t[k_st] = (float(body[k_in]) if k_st == "fps" else int(body[k_in]))
+            return self._json(200, {"ok": True})
+
+        return self._json(404, {"error": "not found"})
 
     def log_message(self, *a): pass
 
@@ -331,6 +351,15 @@ _live = [False] * N_VIDEO     # slot vidéo idx actuellement servi par mtl_rx ?
 _last_launch = 0.0            # horodatage du dernier (re)lancement de mtl_rx
 _fail_streak = 0             # échecs rapides consécutifs (backoff)
 
+# ─── Slots TX (émetteurs) — poussés par l'orchestrateur via :8081/tx ──────────
+# Chaque slot TX = une destination (mcast/port) + un shm d'ENTRÉE câblé (+ son format). Le manager
+# en fait une session role=tx dans le config ; mtl_rx lit le shm et émet en 2110-20. Un slot sans
+# shm_in (non câblé) ou désactivé n'émet pas.
+_tx = [{"enabled": False, "mcast": None, "udp_port": 0, "pt": 96, "shm_in": None,
+        "w": WIDTH, "h": HEIGHT, "fps": FPS, "bd": BIT_DEPTH, "ring": V_RING}
+       for _ in range(N_TX)]
+_tx_lock = threading.Lock()
+
 
 def _xdp_off():
     """Détache tout programme XDP résiduel de l'interface (l'hôte est partagé en --network host).
@@ -386,6 +415,16 @@ def _video_session(info, idxs):
             "targets": [_video_target(i) for i in idxs]}
 
 
+def _tx_session(idx, t):
+    """Une session TX = lit le shm d'entrée câblé (t['shm_in'], au format du producteur) et émet en
+    2110-20 vers t['mcast']:t['udp_port']. Le format (w/h/bd/ring) est celui du shm consommé."""
+    return {"kind": "video", "role": "tx",
+            "mcast": t["mcast"], "udp_port": t["udp_port"], "payload_type": t["pt"],
+            "width": t["w"], "height": t["h"], "fps": t["fps"],
+            "interlaced": False, "bit_depth": t["bd"], "ring": t["ring"], "hdr": HDR,
+            "targets": [{"idx": idx, "shm": t["shm_in"], "stats": "/tmp/mtl_tx{}.json".format(idx)}]}
+
+
 # ─── Simulation (mire numpy, mêmes en-têtes shm) — fallback sans SDP ou GÉN forcé ──
 def _simu_frame(mm, fi, idx, lay):
     w, h = lay["w"], lay["h"]
@@ -423,7 +462,7 @@ def _write_config(sessions):
     désirées. Le daemon détecte le changement de mtime et RÉCONCILIE à chaud — aucune relance."""
     with open(_CONFIG_PATH, "w") as f:
         json.dump({"pmd": "af_xdp", "iface": IFACE, "lcores": LCORES,
-                   "rx_queues": max(1, N_VIDEO), "tx_queues": 1,
+                   "rx_queues": max(1, N_VIDEO), "tx_queues": max(1, N_TX + 1),
                    "sessions": sessions}, f)
 
 
@@ -460,6 +499,13 @@ def _manager_loop():
         active = set(t["idx"] for s in sessions for t in s["targets"])
         for idx in range(N_VIDEO):
             _live[idx] = idx in active
+
+        # Sessions TX : un slot émet s'il est activé, a une destination et un shm d'entrée câblé.
+        with _tx_lock:
+            for i in range(N_TX):
+                t = _tx[i]
+                if t["enabled"] and t["mcast"] and t["udp_port"] and t["shm_in"]:
+                    sessions.append(_tx_session(i, t))
 
         # 1) config : réécrit dès qu'il change → le daemon réconcilie à chaud (aucune relance/faute PTP)
         sig = json.dumps(sessions, sort_keys=True)
