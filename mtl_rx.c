@@ -29,6 +29,7 @@
 #include <string.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
+#include <sys/stat.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -61,6 +62,13 @@ struct rx_ctx {
   int copy_mode;          /* 1 = frames internes MTL + memcpy → shm (PMD noyau af_xdp/kernel) */
   int plane_h;            /* hauteur des plans dans le buffer (champ si entrelacé) */
   enum st_frame_fmt out_fmt; /* format de la frame externe (sortie planar) */
+  int width, height;      /* géométrie de la frame (pour l'incrustation IDENT) */
+  int bit_depth;          /* profondeur du plan SHM (8|10|12) — pour le décalage de l'overlay */
+  /* IDENT (incrustation 3 lignes, rendue par le contrôleur dans un fichier, lue ici) */
+  const char* ident_file; /* fichier patch [u32 bw][u32 bh][bh*bw octets Y8], ou NULL */
+  uint8_t* ident_patch;   /* patch Y 8 bits chargé (bh*bw), ou NULL */
+  int id_bw, id_bh;       /* dims du patch */
+  long id_mtime;          /* mtime du fichier au dernier chargement (recharge si change) */
   mtl_iova_t frames_iova; /* iova du début de la zone frames (dma_map) */
   /* compteurs */
   uint64_t frame_index;
@@ -114,6 +122,65 @@ static int frame_available(void* priv) {
   return 0;
 }
 
+/* IDENT : recharge le patch depuis le fichier (écrit par le contrôleur) si son mtime a changé.
+ * Coût quasi nul tant qu'IDENT off (un stat() par frame sur un fichier absent). */
+static void load_ident_patch(struct rx_ctx* c) {
+  if (!c->ident_file) return;
+  struct stat st;
+  if (stat(c->ident_file, &st) != 0) {       /* absent → IDENT off */
+    if (c->ident_patch) { free(c->ident_patch); c->ident_patch = NULL; }
+    c->id_bw = c->id_bh = 0; c->id_mtime = 0;
+    return;
+  }
+  if ((long)st.st_mtime == c->id_mtime && c->ident_patch) return;   /* inchangé */
+  FILE* f = fopen(c->ident_file, "rb");
+  if (!f) return;
+  uint32_t hdr[2];
+  if (fread(hdr, sizeof(uint32_t), 2, f) != 2) { fclose(f); return; }
+  int bw = (int)hdr[0], bh = (int)hdr[1];
+  if (bw <= 0 || bh <= 0 || bw > 8192 || bh > 8192) { fclose(f); return; }
+  size_t n = (size_t)bw * bh;
+  uint8_t* p = malloc(n);
+  if (!p) { fclose(f); return; }
+  if (fread(p, 1, n, f) != n) { free(p); fclose(f); return; }
+  fclose(f);
+  if (c->ident_patch) free(c->ident_patch);
+  c->ident_patch = p; c->id_bw = bw; c->id_bh = bh; c->id_mtime = (long)st.st_mtime;
+}
+
+/* Incruste le patch IDENT (Y + chroma neutre) dans le rectangle haut-droit du slot SHM `dst`.
+ * 422 ; gère 8/10/12 bits (décalage du patch Y 8 bits + neutre chroma à la profondeur). */
+static void overlay_ident(struct rx_ctx* c, uint8_t* dst) {
+  if (!c->ident_patch || c->id_bw <= 0) return;
+  int W = c->width, H = c->height, bw = c->id_bw, bh = c->id_bh;
+  if (bw > W || bh > H) return;
+  int x0 = W - bw - 8, y0 = 8;
+  x0 -= x0 & 1; y0 -= y0 & 1; if (x0 < 0) x0 = 0;
+  int deep = (c->bit_depth >= 10), shift = c->bit_depth - 8;
+  size_t ysz = (size_t)W * H, uvsz = (size_t)(W / 2) * H;
+  int bps = deep ? 2 : 1;
+  for (int r = 0; r < bh; r++) {
+    const uint8_t* s = c->ident_patch + (size_t)r * bw;
+    if (deep) { uint16_t* y = (uint16_t*)dst + (size_t)(y0 + r) * W + x0;
+                for (int x = 0; x < bw; x++) y[x] = (uint16_t)s[x] << shift; }
+    else      { uint8_t*  y = dst + (size_t)(y0 + r) * W + x0;
+                for (int x = 0; x < bw; x++) y[x] = s[x]; }
+  }
+  int neutral = 1 << (c->bit_depth - 1);
+  int ux0 = x0 / 2, ubw = bw / 2;
+  uint8_t* uplane = dst + ysz * bps;
+  uint8_t* vplane = uplane + uvsz * bps;
+  for (int pl = 0; pl < 2; pl++) {
+    uint8_t* plane = pl ? vplane : uplane;
+    for (int r = 0; r < bh; r++) {
+      if (deep) { uint16_t* row = (uint16_t*)plane + (size_t)(y0 + r) * (W / 2) + ux0;
+                  for (int x = 0; x < ubw; x++) row[x] = (uint16_t)neutral; }
+      else      { uint8_t*  row = plane + (size_t)(y0 + r) * (W / 2) + ux0;
+                  for (int x = 0; x < ubw; x++) row[x] = (uint8_t)neutral; }
+    }
+  }
+}
+
 /* thread RX : récupère les frames complètes (déjà dans le shm) et publie l'en-tête */
 static void* rx_thread(void* arg) {
   struct rx_ctx* c = arg;
@@ -151,6 +218,10 @@ static void* rx_thread(void* arg) {
       if ((fi % c->ring) != (uint64_t)slot)
         fi += ((uint64_t)slot - (fi % c->ring) + c->ring) % c->ring;
     }
+    if (c->ident_file) {            /* IDENT live : recharge si changé + incruste sur le slot */
+      load_ident_patch(c);
+      overlay_ident(c, c->frames_base + (size_t)(fi % c->ring) * c->framesize);
+    }
     write_shm_header(c, fi);
     c->frame_index = fi + 1;
     c->frames_recv++;
@@ -184,7 +255,8 @@ static void usage(const char* p) {
 
 int main(int argc, char** argv) {
   const char *pci = NULL, *sip = NULL, *mcast = NULL, *shm_path = NULL,
-             *lcores = NULL, *stats_file = NULL, *pmd_s = "dpdk", *iface = NULL;
+             *lcores = NULL, *stats_file = NULL, *pmd_s = "dpdk", *iface = NULL,
+             *ident_file = NULL;
   int udp_port = 0, payload_type = 96, width = 1920, height = 1080, ring = 10, hdr = 64;
   int interlaced = 0;
   int bit_depth = 10;   /* profondeur du plan de SORTIE (8|10|12) — conforme au pipeline MXL */
@@ -197,6 +269,7 @@ int main(int argc, char** argv) {
     {"shm", 1, 0, 'S'}, {"ring", 1, 0, 'R'}, {"hdr", 1, 0, 'D'},
     {"lcores", 1, 0, 'l'}, {"stats_file", 1, 0, 'f'},
     {"pmd", 1, 0, 'M'}, {"iface", 1, 0, 'N'}, {"bit_depth", 1, 0, 'B'},
+    {"ident_file", 1, 0, 'G'},
     {0, 0, 0, 0}};
   int o;
   while ((o = getopt_long(argc, argv, "", opts, NULL)) != -1) {
@@ -218,6 +291,7 @@ int main(int argc, char** argv) {
       case 'M': pmd_s = optarg; break;
       case 'N': iface = optarg; break;
       case 'B': bit_depth = atoi(optarg); break;
+      case 'G': ident_file = optarg; break;
       default: usage(argv[0]); return 1;
     }
   }
@@ -258,6 +332,8 @@ int main(int argc, char** argv) {
   memset(&c, 0, sizeof(c));
   c.ring = ring;
   c.hdr = hdr;
+  c.width = width; c.height = height; c.bit_depth = bit_depth;
+  c.ident_file = ident_file;   /* incrustation IDENT live (fichier écrit par le contrôleur) */
   c.copy_mode = use_kernel;   /* PMD noyau → frames internes + memcpy (pas de DMA ext-frame) */
 
   /* libmtl N'A PAS de converter 422-10 (RFC4175) → planar 8 bits (« st20_get_converter, plugin

@@ -57,6 +57,116 @@ metrics = [{"idx": i, "essence": "video", "fps": 0.0, "frame_index": 0, "mode": 
            for i in range(N_VIDEO)]
 metrics_lock = threading.Lock()
 
+# ─── Plan de contrôle par slot (:8082 /gen, /ident) — identique receiver_2110 ──────
+# gen        : force la mire locale (simu) sur ce slot, même si un SDP est actif.
+# ident      : incrustation 3 lignes (nom · source · format) en haut à droite, taille réglable.
+_ctl = [{"gen": False, "ident": False, "ident_size": 0, "info": None} for _ in range(N_VIDEO)]
+_ctl_lock = threading.Lock()
+# Patch IDENT pré-rendu par slot : (patch2D_uint8, bw, bh) ou None. Rendu À CHAQUE CHANGEMENT
+# (pas par frame) → coût CPU nul tant qu'IDENT off. Sert à l'overlay simu (numpy) ET au fichier
+# binaire lu par mtl_rx (incrustation live, Partie B).
+_ident_patch = [None] * N_VIDEO
+
+try:
+    from PIL import Image, ImageDraw, ImageFont
+    _HAS_PIL = True
+except Exception:
+    _HAS_PIL = False
+
+
+def _font(size):
+    for p in ("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+              "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"):
+        try:
+            return ImageFont.truetype(p, size)
+        except Exception:
+            pass
+    return ImageFont.load_default()
+
+
+def _ident_lines(idx):
+    """3 lignes : nom · source (mcast ou « Gen ») · format."""
+    rt = _ctl[idx]
+    info = rt.get("info")
+    l1 = "{} · RX{}".format(HOSTNAME, idx)
+    if rt.get("gen") or not info:
+        l2 = "Gen : mire"; w, h, fps = WIDTH, HEIGHT, FPS
+    else:
+        l2 = "{}:{}".format(info.get("mcast", "?"), info.get("port", "?"))
+        w, h, fps = info.get("width", WIDTH), info.get("height", HEIGHT), info.get("fps", FPS)
+    l3 = "{}x{} {} {:.0f}p".format(w, h, CHROMA, fps)
+    return [l1, l2, l3]
+
+
+def _render_ident(idx):
+    """Rend le patch IDENT (plan Y 8 bits) du slot. Renvoie (patch2D_uint8, bw, bh) ou None.
+    La position (haut-droite) est calculée par le consommateur (overlay simu ici, mtl_rx en C)
+    selon le W/H réel de la frame → patch indépendant de la résolution."""
+    if not (_HAS_PIL and _ctl[idx]["ident"]):
+        return None
+    size = int(_ctl[idx]["ident_size"]) or max(12, HEIGHT // 28)
+    size = max(10, min(size, HEIGHT // 4))
+    lines = _ident_lines(idx)
+    font = _font(size)
+    pad = max(3, size // 4); gap = max(1, size // 6)
+    probe = ImageDraw.Draw(Image.new("L", (1, 1)))
+    bboxes = [probe.textbbox((0, 0), t, font=font) for t in lines]
+    bw = max(b[2] - b[0] for b in bboxes) + 2 * pad
+    bh = sum(b[3] - b[1] for b in bboxes) + gap * (len(lines) - 1) + 2 * pad
+    bw += bw % 2; bh += bh % 2                       # dims paires (alignement chroma)
+    img = Image.new("L", (bw, bh), 16)               # fond Y=16
+    d = ImageDraw.Draw(img); cy = pad
+    for t, b in zip(lines, bboxes):
+        d.text((pad - b[0], cy - b[1]), t, font=font, fill=235); cy += (b[3] - b[1]) + gap
+    patch = np.frombuffer(img.tobytes(), dtype=np.uint8).reshape(bh, bw)
+    return patch, bw, bh
+
+
+def _ident_file(idx):
+    return "/dev/shm/{}_{}_ident".format(HOSTNAME, idx)
+
+
+def _update_ident(idx):
+    """Re-rend le patch IDENT et le PUBLIE : cache mémoire (overlay simu) + fichier binaire
+    [u32 bw][u32 bh][bh*bw octets Y8] lu par mtl_rx (live). Fichier supprimé si IDENT off."""
+    p = _render_ident(idx)
+    _ident_patch[idx] = p
+    fpath = _ident_file(idx)
+    try:
+        if p is None:
+            if os.path.exists(fpath):
+                os.remove(fpath)
+        else:
+            patch, bw, bh = p
+            tmp = fpath + ".tmp"
+            with open(tmp, "wb") as f:
+                f.write(struct.pack("II", bw, bh)); f.write(patch.tobytes())
+            os.replace(tmp, fpath)   # publication atomique (mtl_rx lit le mtime)
+    except Exception as e:
+        print("ident file err:", e, flush=True)
+
+
+def _overlay_simu(mm, off, idx):
+    """Incruste le patch IDENT (Y + chroma neutre) dans la frame simu (haut-droite), en place."""
+    p = _ident_patch[idx]
+    if not p:
+        return
+    patch, bw, bh = p
+    if bw > WIDTH or bh > HEIGHT:
+        return
+    margin = 8
+    x0 = WIDTH - bw - margin; y0 = margin
+    x0 -= x0 % 2; y0 -= y0 % 2
+    if x0 < 0:
+        x0 = 0
+    pp = (patch.astype(np.uint16) << (BIT_DEPTH - 8)) if _DEEP else patch
+    y = np.frombuffer(mm, dtype=np.dtype(_DT), count=Y_SIZE // _BPS, offset=off).reshape(HEIGHT, WIDTH)
+    y[y0:y0 + bh, x0:x0 + bw] = pp
+    ux0, uy0, ubw, ubh = x0 // _CW, y0 // _CH, bw // _CW, bh // _CH
+    for poff in (off + Y_SIZE, off + Y_SIZE + UV_SIZE):
+        c = np.frombuffer(mm, dtype=np.dtype(_DT), count=UV_SIZE // _BPS, offset=poff).reshape(UV_H, UV_W)
+        c[uy0:uy0 + ubh, ux0:ux0 + ubw] = _NEUTRAL
+
 
 # ─── :8080 métriques (format get_metrics) ────────────────────────────
 class MetricsHandler(BaseHTTPRequestHandler):
@@ -118,9 +228,50 @@ class AgentHandler(BaseHTTPRequestHandler):
     def log_message(self, *a): pass
 
 
+# ─── :8082 contrôle à chaud : /gen (générateur simu) + /ident (incrustation) ─────
+class ControlHandler(BaseHTTPRequestHandler):
+    def _json(self, code, obj):
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json")
+        self.end_headers()
+        self.wfile.write(json.dumps(obj).encode())
+
+    def do_POST(self):
+        path = self.path.rstrip("/")
+        try:
+            n = int(self.headers.get("Content-Length") or 0)
+            body = json.loads(self.rfile.read(n) or b"{}")
+        except Exception as e:
+            return self._json(400, {"error": str(e)})
+        try:
+            idx = int(body.get("idx", 0))
+        except Exception:
+            idx = -1
+        if not (0 <= idx < N_VIDEO):
+            return self._json(400, {"error": "idx hors limites"})
+        if path == "/gen":          # bascule générateur simu (force la mire sur ce slot)
+            with _ctl_lock:
+                _ctl[idx]["gen"] = bool(body.get("enabled"))
+            return self._json(200, {"ok": True})
+        if path == "/ident":        # bascule/taille de l'incrustation (à chaud, sans respawn)
+            with _ctl_lock:
+                if "enabled" in body:
+                    _ctl[idx]["ident"] = bool(body["enabled"])
+                if "size" in body:
+                    try: _ctl[idx]["ident_size"] = max(0, int(body["size"] or 0))
+                    except Exception: pass
+            _update_ident(idx)
+            return self._json(200, {"ok": True, "pil": _HAS_PIL})
+        return self._json(404, {"error": "not found"})
+
+    def log_message(self, *a): pass
+
+
 threading.Thread(target=lambda: HTTPServer(("0.0.0.0", 8080), MetricsHandler).serve_forever(),
                  daemon=True).start()
 threading.Thread(target=lambda: HTTPServer(("0.0.0.0", 8081), AgentHandler).serve_forever(),
+                 daemon=True).start()
+threading.Thread(target=lambda: HTTPServer(("0.0.0.0", 8082), ControlHandler).serve_forever(),
                  daemon=True).start()
 
 
@@ -173,6 +324,7 @@ def _launch_mtl_rx(idx, info):
             "--fps", str(info["fps"]),
             "--shm", shm, "--ring", str(V_RING), "--hdr", str(HDR),
             "--bit_depth", str(BIT_DEPTH),   # conforme au pipeline MXL (force8 → 8)
+            "--ident_file", _ident_file(idx),  # incrustation IDENT live (Partie B)
             "--lcores", LCORES, "--stats_file", stats]
     if info.get("interlaced"):
         args.append("--interlaced")
@@ -180,8 +332,8 @@ def _launch_mtl_rx(idx, info):
     return subprocess.Popen(args), stats
 
 
-# ─── Simulation (fallback sans SDP) — mire numpy, mêmes en-têtes shm ──
-def _simu_frame(mm, fi):
+# ─── Simulation (mire numpy, mêmes en-têtes shm) — fallback sans SDP ou GÉN forcé ──
+def _simu_frame(mm, fi, idx):
     base = np.full((HEIGHT, WIDTH), _BLACK, dtype=np.dtype(_DT))
     col = (fi * 8) % WIDTH
     base[:, col:min(col + 8, WIDTH)] = _WHITE
@@ -190,6 +342,7 @@ def _simu_frame(mm, fi):
     mm[off:off + Y_SIZE] = base.tobytes()
     mm[off + Y_SIZE:off + Y_SIZE + UV_SIZE] = neutral
     mm[off + Y_SIZE + UV_SIZE:off + Y_SIZE + 2 * UV_SIZE] = neutral
+    _overlay_simu(mm, off, idx)          # incrustation IDENT (coût nul si off)
     mm[0:16] = struct.pack("QQ", fi, time.time_ns())
 
 
@@ -221,8 +374,10 @@ def video_slot(idx):
     cur_key = None
     sim_mm = None
     fi = 0
+    prev_mode = None
     while True:
-        info = _parse_sdp(sdp_path) if os.path.exists(sdp_path) else None
+        gen = _ctl[idx]["gen"]   # GÉN forcé → mire locale même si un SDP est actif
+        info = None if gen else (_parse_sdp(sdp_path) if os.path.exists(sdp_path) else None)
         if info:
             key = (info["mcast"], info["port"], info["pt"], info["width"],
                    info["height"], info["fps"], info["interlaced"])
@@ -236,6 +391,10 @@ def video_slot(idx):
                 proc, stats = _launch_mtl_rx(idx, info)
                 _procs[idx] = proc
                 cur_key = key
+            # info courante (pour les lignes IDENT) ; re-rend le patch à la transition.
+            _ctl[idx]["info"] = info
+            if prev_mode != "mtl":
+                _update_ident(idx); prev_mode = "mtl"
             st = _read_stats(stats) if stats else None
             with metrics_lock:
                 metrics[idx]["mode"] = "mtl"
@@ -251,7 +410,10 @@ def video_slot(idx):
                 proc = None; cur_key = None; _procs.pop(idx, None)
             if sim_mm is None:
                 sim_mm = _open_shm("/dev/shm/{}_{}".format(HOSTNAME, idx), V_TOTAL_SIZE)
-            _simu_frame(sim_mm, fi)
+            _ctl[idx]["info"] = None
+            if prev_mode != "simu":
+                _update_ident(idx); prev_mode = "simu"
+            _simu_frame(sim_mm, fi, idx)
             fi += 1
             if fi % 25 == 0:
                 with metrics_lock:

@@ -1,8 +1,11 @@
 {
-  "version": "0.8.1",
+  "version": "0.9.0",
   "date": "2026-06-04",
   "changes": {
     "Nouveautés": [
+      "Contrôle à chaud GÉN + IDENT (panneau identique receiver_2110) : le contrôleur sert :8082 (/gen force la mire simu sur un slot ; /ident bascule/dimensionne l'incrustation 3 lignes). IDENT sur simu = overlay numpy (PIL) ; IDENT sur live MTL = mtl_rx lit le patch (fichier écrit par le contrôleur) et l'incruste en C (rect haut-droit, 8/10/12 bits). Coût CPU nul tant que GÉN/IDENT off (un stat() par frame). +python3-pil/fonts-dejavu."
+    ],
+    "Nouveautés (0.8.1)": [
       "Conversion 10→8 bits faite dans mtl_rx : libmtl n'a PAS de converter 422-10 → planar 8 (« plugin not found »), donc l'output_fmt PLANAR8 ne convertissait pas (image résiduellement dégradée). On reçoit désormais en PLANAR10LE (converter présent) et on convertit 10→8 (v>>2) à la copie quand le pipeline est en 8 bits (force8), en mode af_xdp/kernel. Corrige l'image verte/fantôme."
     ],
     "Nouveautés (0.8.0, remplacé)": [
