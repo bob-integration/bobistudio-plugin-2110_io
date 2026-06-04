@@ -130,7 +130,9 @@ window.MXLPlugins["receiver_2110_mtl"] = {
             : `Audio ${r.idx + 1}`)
         : `Vidéo ${r.idx + 1}`;
       // Bouton générateur : data-* lus par délégation (pas d'onclick global). Pas de GÉN pour l'ANC.
-      const genIcon = isAnc ? '' : `<span class="gen-wrap">
+      // Placeholder vide quand absent : la grille .flow-row place par position → sans cet espace
+      // réservé, le badge SDP se décalerait dans une colonne de gauche (désalignement audio/ANC vs vidéo).
+      const genIcon = isAnc ? '<span class="gen-wrap"></span>' : `<span class="gen-wrap">
           <span class="gen-badge ${r.simulated ? 'on' : 'off'}" role="button" tabindex="0"
                 data-essence="${ess}" data-idx="${r.idx}" data-enable="${r.simulated ? '0' : '1'}">GÉN</span>
           ${genTooltip(r, isAudio)}
@@ -139,7 +141,9 @@ window.MXLPlugins["receiver_2110_mtl"] = {
       // IDENT : badge marche/arrêt + petit rotatif compact pour la taille du texte
       // (glisser ↕ ou molette) — reste dans sa colonne, ne décale pas le badge GÉN.
       const identSz = r.ident_size || Math.max(12, Math.round((r.height || 720) / 28));
-      const identCtl = (isAudio || isAnc) ? '' : `<span class="ident-wrap">
+      // Placeholder vide pour audio/ANC (pas d'IDENT) → réserve la colonne 3 de la grille,
+      // sinon le badge SDP (colonne 4) remonte et n'est plus aligné avec celui de la vidéo.
+      const identCtl = (isAudio || isAnc) ? '<span class="ident-wrap"></span>' : `<span class="ident-wrap">
           <span class="ident-badge ${r.ident ? 'on' : 'off'}" role="button" tabindex="0"
                 data-idx="${r.idx}" data-enable="${r.ident ? '0' : '1'}"
                 title="Incrustation 3 lignes (nom · source/multicast · format), fond noir, haut-droite">IDENT</span>
