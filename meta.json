@@ -1,8 +1,11 @@
 {
-  "version": "0.14.0",
+  "version": "0.14.1",
   "date": "2026-06-04",
   "changes": {
     "Nouveautés": [
+      "Exposition moteur bi-rôle (sous-étapes 3-4) : CÂBLAGE des slots TX. Manifeste wiring.consumes (video, repeat tx_count, state_field tx{i}_shm, mode hot-wire) → les émetteurs apparaissent comme destinations MXL à droite sur la page Câbles. Contrôleur :8082 /input (câble un shm sur un slot TX, à chaud) + /state (shm câblé par slot). Hook topology_ports expose les ports TX ; before_deploy auto-alloue une destination mcast/port DISTINCTE par slot (évite le conflit de flow). docker_driver push_tx_slots combine destination (tx_slots) + shm câblé (tx{i}_shm) → :8081/tx. Reste : palette « +Émetteur » / find-or-create moteur (UI), puis test E2E sur CT 2000."
+    ],
+    "Nouveautés (0.14.0)": [
       "Exposition orchestrateur du moteur bi-rôle (sous-étape 1/N) : manifeste nmos_role=both + deploy_defaults tx_count/tx_slots (ADDITIF — video_count inchangé, les receivers existants ne bougent pas). NMOS rebuild_model rendu CUMULATIF (is_receiver/is_sender gèrent « both ») : un moteur expose ses receivers (video_count) ET un sender vidéo par entrée tx_slots (keyé sender:v:vmid:tx{idx}, _send_state porte tx_idx pour l'activation IS-05 à venir). Validé en isolation : engine(tx_slots) → receivers+senders ; receiver simple → 0 sender (aucune régression). Reste : activation IS-05 par sender + push destination vers :8081/tx, câblage shm→TX, palette Destinations + find-or-create moteur."
     ],
     "Nouveautés (0.13.0)": [

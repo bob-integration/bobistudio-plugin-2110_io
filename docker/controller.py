@@ -257,13 +257,21 @@ class AgentHandler(BaseHTTPRequestHandler):
     def log_message(self, *a): pass
 
 
-# ─── :8082 contrôle à chaud : /gen (générateur simu) + /ident (incrustation) ─────
+# ─── :8082 contrôle à chaud : /gen, /ident (RX) + /input, /state (câblage TX) ─────
 class ControlHandler(BaseHTTPRequestHandler):
     def _json(self, code, obj):
         self.send_response(code)
         self.send_header("Content-Type", "application/json")
         self.end_headers()
         self.wfile.write(json.dumps(obj).encode())
+
+    def do_GET(self):
+        # /state : shm câblé sur chaque slot TX (lu par la page Câbles via state_field tx{i}_shm)
+        if self.path.rstrip("/") == "/state":
+            with _tx_lock:
+                st = {"tx{}_shm".format(i): (_tx[i]["shm_in"] or "") for i in range(N_TX)}
+            return self._json(200, st)
+        return self._json(404, {"error": "not found"})
 
     def do_POST(self):
         path = self.path.rstrip("/")
@@ -272,6 +280,26 @@ class ControlHandler(BaseHTTPRequestHandler):
             body = json.loads(self.rfile.read(n) or b"{}")
         except Exception as e:
             return self._json(400, {"error": str(e)})
+
+        if path == "/input":        # câblage à chaud d'un shm vers un slot TX (générique plugin)
+            if body.get("essence", "video") != "video":
+                return self._json(200, {"ok": True, "note": "audio TX non implémenté"})
+            try: slot = int(body.get("slot", 0))
+            except Exception: slot = -1
+            if not (0 <= slot < N_TX):
+                return self._json(400, {"error": "slot TX hors limites"})
+            shm = (body.get("shm") or "").strip() or None
+            fmt = body.get("format") or {}
+            with _tx_lock:
+                t = _tx[slot]
+                t["shm_in"] = shm
+                t["enabled"] = bool(shm)            # n'émet que si câblé
+                if fmt.get("width"):     t["w"] = int(fmt["width"])
+                if fmt.get("height"):    t["h"] = int(fmt["height"])
+                if fmt.get("bit_depth"): t["bd"] = int(fmt["bit_depth"])
+                if fmt.get("fps"):       t["fps"] = float(fmt["fps"])
+            return self._json(200, {"ok": True})
+
         try:
             idx = int(body.get("idx", 0))
         except Exception:
