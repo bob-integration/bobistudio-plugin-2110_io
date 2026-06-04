@@ -1,8 +1,9 @@
 {
-  "version": "0.14.2",
+  "version": "0.14.3",
   "date": "2026-06-04",
   "changes": {
     "Nouveautés": [
+      "Fix émission TX : le shm câblé arrivait sans préfixe (ex. 'mtl_0') alors que le RX écrit en chemin complet (/dev/shm/mtl_0) → le feeder n'ouvrait rien (0 frame). _tx_session préfixe /dev/shm/ ; mtl_rx open_shm_in préfixe aussi (défensif). Vérifié : TX émet à 25 fps.",
       "Page Câbles : le moteur bi-rôle est SCINDÉ en deux nœuds (flag manifeste split_io) — RX dans la colonne Sources (gauche), TX dans la colonne Destinations (droite) — au lieu d'un nœud central « process ». RX (réseau→shm) et TX (shm→réseau) sont indépendants, pas un passthrough. Même vmid pour les deux nœuds (le câblage cible le vmid ; endpointOf choisit le nœud qui porte le port). Champ palette « Émetteurs (TX) » pour créer le moteur avec des slots TX."
     ],
     "Nouveautés (0.14.1)": [
