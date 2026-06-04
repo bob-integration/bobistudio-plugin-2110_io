@@ -229,9 +229,9 @@ int main(int argc, char** argv) {
   if (!strcmp(pmd_s, "af_xdp"))      snprintf(portname, sizeof(portname), "native_af_xdp:%s", iface);
   else if (!strcmp(pmd_s, "kernel")) snprintf(portname, sizeof(portname), "kernel:%s", iface);
   else                               snprintf(portname, sizeof(portname), "%s", pci);
-  /* MTL st20 RX transport limite framebuff_cnt à [2:8] → on cale le ring du shm dessus.
-   * (le ring « logique » du pipeline aval peut être plus grand côté consommateurs ; ici
-   * c'est le nombre de slots que MTL remplit en zéro-copie). */
+  /* MTL st20 limite framebuff_cnt à [2:8] → le ring du pipeline MXL est donc borné à 8 PARTOUT
+   * (producteurs ET consommateurs), réglage shm_video_ring inclus. Ici le ring SHM = le ring
+   * pipeline = framebuff_cnt (slot = frame_index % ring, identique côté consommateurs). */
   if (ring > 8) ring = 8;
   if (ring < 2) ring = 2;
   if (ring > MAX_FB) ring = MAX_FB;
