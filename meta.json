@@ -1,8 +1,11 @@
 {
-  "version": "0.11.1",
+  "version": "0.12.0",
   "date": "2026-06-04",
   "changes": {
-    "Corrections": [
+    "Nouveautés": [
+      "mtl_rx devient un DAEMON : mtl_init UNE fois (à vie), puis RÉCONCILIATION des sessions à chaud depuis le config (poll mtime) — plus de kill/relance à chaque changement d'abonnement. Le device auto-start/stop ne détache PAS le XDP (seul mtl_uninit le fait au stop du conteneur) → ptp4l ne faute qu'AU BOOT, plus jamais sur un abonnement/désabonnement/changement de slot. Threads + arrêt PROPRE par session (free_session : st20p_rx_free + munmap, device intact). Réconciliation par signature (identité réseau + format + cibles) : sig changé ⇒ flow recyclé sans toucher au device. Contrôleur : réécrit le config, lance le daemon 1× et le maintient (relance seulement s'il crashe, backoff + purge XDP). Validé en direct : +slot/−slot/→0/ré-abonnement = mtl_init 1×, 0 faute PTP hors boot, 0 crash-loop. Fondation du moteur de nœud bi-rôle (TX à venir)."
+    ],
+    "Corrections (0.11.1)": [
       "Crash-loop de RELANCE corrigé (bug : « video_count≥2, je change l'abonnement → reste en Idle, aucune image »). À chaque changement d'ensemble actif le manager tue+relance l'unique mtl_rx ; or l'arrêt gracieux ne détache pas toujours le XDP (mtl_uninit incomplet, MtlManager ne peut pas remplacer un dispatcher existant) → la mtl_init suivante échoue EN BOUCLE (native xdp dev init fail -5), mtl_rx ne tourne plus du tout. Fix : purge inconditionnelle du XDP de l'interface (ip link set <iface> xdp off) dans _kill_mtl, donc AVANT chaque (re)lancement (1er inclus). Validé en direct : relance immédiatement réussie après purge. Le 1er déploiement aussi en bénéficie (plus de crash-loop au boot). Coût : refaute ptp4l ~15 s au (re)lancement (auto-recovery)."
     ],
     "Nouveautés (0.11.0)": [
