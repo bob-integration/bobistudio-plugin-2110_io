@@ -1,8 +1,11 @@
 {
-  "version": "0.11.0",
+  "version": "0.11.1",
   "date": "2026-06-04",
   "changes": {
-    "Nouveautés": [
+    "Corrections": [
+      "Crash-loop de RELANCE corrigé (bug : « video_count≥2, je change l'abonnement → reste en Idle, aucune image »). À chaque changement d'ensemble actif le manager tue+relance l'unique mtl_rx ; or l'arrêt gracieux ne détache pas toujours le XDP (mtl_uninit incomplet, MtlManager ne peut pas remplacer un dispatcher existant) → la mtl_init suivante échoue EN BOUCLE (native xdp dev init fail -5), mtl_rx ne tourne plus du tout. Fix : purge inconditionnelle du XDP de l'interface (ip link set <iface> xdp off) dans _kill_mtl, donc AVANT chaque (re)lancement (1er inclus). Validé en direct : relance immédiatement réussie après purge. Le 1er déploiement aussi en bénéficie (plus de crash-loop au boot). Coût : refaute ptp4l ~15 s au (re)lancement (auto-recovery)."
+    ],
+    "Nouveautés (0.11.0)": [
       "Fan-out interne MÊME SOURCE → plusieurs slots : quand plusieurs récepteurs s'abonnent à la MÊME source (mcast:port identiques), l'AF_XDP refuse 2 files RX sur le même 5-tuple (rx_flow_create : socket add flow fail). On détecte le partage côté contrôleur (groupage des slots actifs par (mcast,port)) → UNE session MTL (un seul flow RX) décode la source UNE fois, et mtl_rx RECOPIE la frame décodée dans le shm de chaque slot (struct target[] : ring/index/IDENT propres par cible). Chaque slot reste un récepteur NMOS indépendant (GÉN/IDENT/monitoring propres) en partageant un unique décodage. Cas « 2 sources différentes » inchangé (2 sessions = 2 flows). Fan-out câblé aussi pour l'audio st30 (prêt pour la Phase B). Validé : 1 flow, 2 shm écrits en lockstep."
     ],
     "Nouveautés (0.10.1)": [
@@ -35,9 +38,8 @@
       "Aucune VF/SR-IOV/RDMA-netns pour le chemin AF_XDP : le PF reste kernel, PTP cohabite.",
       "Teardown : l'orchestrateur force ip link set <iface> xdp off après stop/rm (MtlManager n'a pas le temps de détacher)."
     ],
-    "Corrections": [],
     "Bugs connus": [
-      "v1 Docker = 1 session vidéo active par conteneur/port (un PF = un mtl_init) ; multi-session = plan de contrôle mtl_rx à venir. Audio st30 différé. Entrelacé : 1 champ/slot. Le détachement XDP fait fauter ptp4l ~15 s (auto-recovery)."
+      "Audio st30 câblé dans mtl_rx mais réception non encore activée côté contrôleur (Phase B). Entrelacé : 1 champ/slot. Tout (re)lancement de mtl_rx (changement d'abonnement) refaute ptp4l ~15 s (purge XDP, auto-recovery)."
     ]
   }
 }
