@@ -11,7 +11,7 @@
   },
   "nmos_role": "receiver",
   "deploy_order": 0,
-  "version": "0.6.0",
+  "version": "0.7.0",
   "description": "Receiver ST 2110 via Media Transport Library (MTL/DPDK, kernel-bypass). Réception st20p/st30p écrite en zéro-copie dans le ring shared memory par un binaire C natif (libmtl), exposé en NMOS IS-04/05. Variante haute performance de receiver_2110 (mêmes shm produits). Mode simulation par slot tant que la source n'est pas activée.",
   "nav": {
     "section": "sources",
@@ -25,7 +25,13 @@
         "method": "POST",
         "port": 8082,
         "path": "/gen",
-        "desc": "Active/désactive la simulation d'un slot (placeholder MTL : bascule simu↔RX)."
+        "desc": "Active/désactive la simulation d'un slot (bascule simu↔RX)."
+      },
+      "ident": {
+        "method": "POST",
+        "port": 8082,
+        "path": "/ident",
+        "desc": "Active/désactive et dimensionne l'incrustation IDENT (3 lignes) d'un slot vidéo."
       }
     }
   },

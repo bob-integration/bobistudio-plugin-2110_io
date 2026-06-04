@@ -1,8 +1,11 @@
 {
-  "version": "0.6.0",
+  "version": "0.7.0",
   "date": "2026-06-04",
   "changes": {
     "Nouveautés": [
+      "Panneau de contrôle identique à receiver_2110 : même carte (ensembles vidéo/audio, format, état NMOS, badges GÉN/IDENT/SDP, modale SDP d'abonnement manuel). Données via /api/nmos/receivers/<vmid>/detail + fps live :8080. Hooks control_action (gen/ident) portés. NB : le hot-wire GÉN/IDENT et l'overlay IDENT côté conteneur nécessitent la mise à jour du contrôleur (:8082) — sinon repli redeploy."
+    ],
+    "Nouveautés (0.6.0)": [
       "Type Docker-only : manifeste runtime:docker. Un receiver_2110_mtl se crée désormais en un coup sur un nœud Docker (create+deploy atomiques), plus sur un vaisseau LXC. L'orchestrateur refuse de créer un LXC pour ce type sans nœud (Déploiement → Nœuds)."
     ],
     "Nouveautés (0.5.0)": [
