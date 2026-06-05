@@ -540,6 +540,26 @@ def _xdp_off():
         print("xdp off échoué:", e, flush=True)
 
 
+def _flush_ntuple():
+    """Purge les règles ntuple (flow director) résiduelles de l'interface AVANT chaque (re)lancement
+    de mtl_rx. Un arrêt NON gracieux (SIGKILL via `docker rm -f`, ou crash) laisse les règles fdir
+    sur le MATÉRIEL (elles survivent au conteneur) ; la création d'un nouveau flow pour le même
+    5-tuple échoue alors (« socket add flow fail » → init_hw fail -5) → session muette sans retry.
+    On repart d'une table de flow propre — mtl_init réinstalle les règles voulues. Sûr : l'interface
+    (PF E810) est dédiée à MTL sur ce nœud."""
+    try:
+        out = subprocess.run(["ethtool", "-n", IFACE], capture_output=True, text=True, timeout=5).stdout
+        ids = re.findall(r"Filter:\s*(\d+)", out)
+        for rid in ids:
+            subprocess.run(["ethtool", "-N", IFACE, "delete", rid],
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=5)
+        if ids:
+            print("ntuple purge: {} règle(s) résiduelle(s) supprimée(s) avant mtl_init".format(len(ids)),
+                  flush=True)
+    except Exception as e:
+        print("ntuple purge échouée:", e, flush=True)
+
+
 def _kill_mtl():
     """Arrêt GRACIEUX de l'unique mtl_rx : SIGTERM + longue attente pour laisser mtl_uninit
     détacher proprement le XDP et se désinscrire de MtlManager. SIGKILL en TOUT dernier recours.
@@ -699,11 +719,13 @@ def _write_config(sessions):
 
 
 def _launch_mtl():
-    """(Re)lance le daemon mtl_rx. Purge d'abord le XDP résiduel : au 1er lancement (ou après un
-    crash) une instance précédente a pu laisser un programme XDP accroché → mtl_init échouerait en
-    boucle (`native xdp dev init fail -5`)."""
+    """(Re)lance le daemon mtl_rx. Purge d'abord le XDP ET les règles ntuple résiduels : au 1er
+    lancement (ou après un crash / `docker rm -f`) une instance précédente a pu laisser un programme
+    XDP accroché (`native xdp dev init fail -5`) ET/OU des règles fdir sur le matériel (« socket add
+    flow fail » → session muette). On repart d'une interface propre."""
     global _mtl_proc, _last_launch
     _xdp_off()
+    _flush_ntuple()
     _mtl_proc = subprocess.Popen([MTL_RX, "--config", _CONFIG_PATH])
     _last_launch = time.time()
     print("mtl_rx daemon (re)lancé", flush=True)
