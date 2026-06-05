@@ -1,7 +1,10 @@
 {
-  "version": "0.18.5",
+  "version": "0.19.0",
   "date": "2026-06-05",
   "changes": {
+    "Nouveautés": [
+      "Timestamps MÉDIA (RTP/PTP) dans le shm — fondation pour le sync A/V. mtl_rx écrit l'instant de CAPTURE (TAI ns via st10_get_tai sur frame->timestamp/tfmt, sampling 90 kHz vidéo / 48 kHz audio) à l'off16 du header shm, pour la vidéo (timestamp du 1er champ en entrelacé) ET l'audio — horloge PTP COMMUNE A/V (ST 2110-10), contrairement au write-ts (now_ns) qui dépend de la latence de pipeline (variable, ≠ audio/vidéo). Additif et rétro-compatible : [index, write_ts] inchangés, off16=0 signifie « inconnu » (consommateur → repli nominal). Simu (mire) écrit media_ts=0. Le consommateur (streamer monitor v0.6.0) l'exploite pour aligner A/V. DIFFÉRÉ : restitution du media_ts à l'émission TX 2110 (nécessite ST20P_TX_FLAG_USER_TIMESTAMP = changement du modèle de pacing TX → à valider au banc, ne pas risquer le passthrough actuel) ; propagation à travers les étages de calcul."
+    ],
     "Corrections": [
       "Règles ntuple (flow director) résiduelles — purge au lancement du daemon. Un arrêt NON gracieux (SIGKILL via `docker rm -f`, ou crash) laisse les règles fdir sur le MATÉRIEL (survivent au conteneur) → la création d'un nouveau flow pour le même 5-tuple échoue (« socket add flow fail » → init_hw fail -5) → session muette sans retry (cas vécu : audio jamais monté après un redéploiement). controller `_flush_ntuple()` purge `ethtool -N <iface> delete` toute règle résiduelle dans `_launch_mtl` AVANT mtl_init → départ propre à chaque (re)lancement (interface PF dédiée MTL). Complément orchestrateur (docker_driver) : `docker stop` gracieux avant `rm -f` au déploiement (SIGTERM → mtl_uninit purge ses propres règles).",
       "Réconciliation mtl_rx : FREE-BEFORE-CREATE. La boucle créait les nouvelles sessions AVANT de libérer les périmées → au changement de source (ex. audio .201→.101), recréer le flux AF_XDP échouait (« create flow fail -5 ») tant que l'ancienne session tenait sa file/flow, puis l'ancienne était libérée → plus AUCUNE session (audio muet, sans retry). Désormais 3 passes : match (garde l'inchangé, ex. vidéo → pas de faute PTP) → free des périmées (release file/flow) → create des absentes. Le hot-swap de source audio/vidéo fonctionne.",
