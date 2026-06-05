@@ -59,6 +59,25 @@ static uint64_t now_ns(void) {
   return (uint64_t)ts.tv_sec * 1000000000ULL + ts.tv_nsec;
 }
 
+/* Timestamp média de la frame → TAI ns ABSOLU (instant de capture, horloge PTP commune A/V).
+ * Le RX libmtl fournit en pratique tfmt=MEDIA_CLK : un compteur 32 bits qui WRAPPE (~47721 s à
+ * 90 kHz, ~89478 s à 48 kHz). st10_media_clk_to_ns ne donne que la position DANS la fenêtre →
+ * vidéo (90k) et audio (48k) ne sont alors PAS comparables. On reconstruit l'absolu en recollant
+ * la fenêtre courante à partir de l'horloge PTP (mtl_ptp_read_time_raw = TAI ns), la même qui
+ * cadence les media-clocks ST 2110-10. tfmt=TAI → renvoyé tel quel. */
+static uint64_t media_ts_to_tai(mtl_handle st, enum st10_timestamp_fmt tfmt,
+                                uint64_t ts, uint32_t rate) {
+  if (tfmt == ST10_TIMESTAMP_FMT_TAI) return ts;
+  uint64_t within = st10_media_clk_to_ns((uint32_t)ts, rate);     /* ns dans [0, window) */
+  uint64_t window = (uint64_t)(((double)(1ULL << 32) * 1e9) / (double)rate);
+  uint64_t ptp = mtl_ptp_read_time_raw(st);                       /* TAI ns courant */
+  if (!window) return ptp;
+  uint64_t tai = (ptp / window) * window + within;
+  if      ((int64_t)(tai - ptp) >  (int64_t)(window / 2)) tai -= window;  /* fenêtre précédente */
+  else if ((int64_t)(ptp - tai) >  (int64_t)(window / 2)) tai += window;  /* fenêtre suivante */
+  return tai;
+}
+
 /* Une cible = un shm de sortie. Une session en porte 1..N (fan-out même-source → N slots).
  * Chaque cible a son propre état d'écriture (index/recv) et son propre IDENT (par slot). */
 struct target {
@@ -239,7 +258,7 @@ static void* video_rx_thread(void* arg) {
     if (!frame->addr[0]) { st20p_rx_put_frame(s->vh, frame); continue; }
     /* Timestamp MÉDIA (capture) de la frame, en TAI ns — commun audio/vidéo via PTP (ST 2110-10).
      * st10_get_tai normalise TAI ou media-clk → ns (sampling 90 kHz vidéo). */
-    uint64_t mts = st10_get_tai(frame->tfmt, frame->timestamp, MEDIA_CLK_VIDEO);
+    uint64_t mts = media_ts_to_tai(s->st, frame->tfmt, frame->timestamp, MEDIA_CLK_VIDEO);
     /* af_xdp/copy_mode : décodage unique → fan-out vers chaque cible (slot shm).
      * Chaque cible a son propre ring/index + son propre IDENT. */
     if (s->interlaced) {
@@ -294,7 +313,7 @@ static void* audio_rx_thread(void* arg) {
     if (!frame) { usleep(500); continue; }
     size_t n = frame->data_size < s->slotsize ? frame->data_size : s->slotsize;
     /* Timestamp MÉDIA (capture) du chunk, TAI ns — MÊME horloge PTP que la vidéo (sampling 48 kHz). */
-    uint64_t mts = st10_get_tai(frame->tfmt, frame->timestamp, MEDIA_CLK_AUDIO);
+    uint64_t mts = media_ts_to_tai(s->st, frame->tfmt, frame->timestamp, MEDIA_CLK_AUDIO);
     for (int ti = 0; ti < s->ntg; ti++) {        /* fan-out (même source audio → N slots) */
       struct target* t = &s->tg[ti];
       uint64_t ci = t->index;
