@@ -681,7 +681,9 @@ def _simu_frame(mm, fi, idx, lay):
     mm[off + lay["y"]:off + lay["y"] + lay["uv"]] = neutral
     mm[off + lay["y"] + lay["uv"]:off + lay["y"] + 2 * lay["uv"]] = neutral
     _overlay_simu(mm, off, idx, lay)     # incrustation IDENT (coût nul si off)
-    mm[0:16] = struct.pack("QQ", fi, time.time_ns())
+    # [index, write_ts, media_ts] — la simu (mire) n'a pas d'horloge média → media_ts=0 (off16),
+    # sinon une valeur RX périmée resterait au basculement RX→simu (les consos retombent au nominal).
+    mm[0:24] = struct.pack("QQQ", fi, time.time_ns(), 0)
 
 
 def _open_shm(path, size):

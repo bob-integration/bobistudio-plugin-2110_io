@@ -119,6 +119,16 @@ static void write_shm_header(struct target* t, uint64_t i) {
   h[0] = i; h[1] = now_ns();
 }
 
+/* off 16 du header shm : timestamp MÉDIA (RTP/PTP), en nanosecondes TAI (0 = inconnu). C'est
+ * l'instant de CAPTURE (commun audio/vidéo via le grandmaster PTP, ST 2110-10), pas l'heure
+ * d'écriture (now_ns). Additif au contrat [index, write_ts] → rétro-compatible. */
+static void write_shm_media_ts(struct target* t, uint64_t media_ts) {
+  ((uint64_t*)t->shm_base)[2] = media_ts;
+}
+/* sampling de l'horloge média ST 2110-10 : 90 kHz vidéo, 48 kHz audio (pour st10_get_tai). */
+#define MEDIA_CLK_VIDEO 90000u
+#define MEDIA_CLK_AUDIO 48000u
+
 /* ═══ VIDÉO ═══════════════════════════════════════════════════════════════════ */
 
 static int frame_available(void* priv) { (void)priv; return 0; }
@@ -222,10 +232,14 @@ static inline int field_parity(int second_field, int tff) {
 
 static void* video_rx_thread(void* arg) {
   struct sess* s = arg;
+  uint64_t mts_latch = 0;     /* entrelacé : timestamp média du 1er champ (= capture de la trame) */
   while (!s->stop) {
     struct st_frame* frame = st20p_rx_get_frame(s->vh);
     if (!frame) { usleep(1000); continue; }
     if (!frame->addr[0]) { st20p_rx_put_frame(s->vh, frame); continue; }
+    /* Timestamp MÉDIA (capture) de la frame, en TAI ns — commun audio/vidéo via PTP (ST 2110-10).
+     * st10_get_tai normalise TAI ou media-clk → ns (sampling 90 kHz vidéo). */
+    uint64_t mts = st10_get_tai(frame->tfmt, frame->timestamp, MEDIA_CLK_VIDEO);
     /* af_xdp/copy_mode : décodage unique → fan-out vers chaque cible (slot shm).
      * Chaque cible a son propre ring/index + son propre IDENT. */
     if (s->interlaced) {
@@ -234,6 +248,7 @@ static void* video_rx_thread(void* arg) {
        * consommateurs lisent toujours une trame complète, jamais une demi-trame. */
       int sf = frame->second_field ? 1 : 0;
       int parity = field_parity(sf, s->tff);
+      if (!sf) mts_latch = mts;                    /* capture = instant du 1er champ */
       for (int ti = 0; ti < s->ntg; ti++) {
         struct target* t = &s->tg[ti];
         uint64_t fi = t->index;                    /* index NON bumpé tant que la trame est partielle */
@@ -242,6 +257,7 @@ static void* video_rx_thread(void* arg) {
         if (sf) {                                  /* 2e champ : trame complète */
           if (t->has_ident) { load_ident_patch(t); overlay_ident(s, t, dst); }
           write_shm_header(t, fi);
+          write_shm_media_ts(t, mts_latch);
           t->index = fi + 1; t->recv++;
         }
       }
@@ -259,6 +275,7 @@ static void* video_rx_thread(void* arg) {
         }
         if (t->has_ident) { load_ident_patch(t); overlay_ident(s, t, dst); }
         write_shm_header(t, fi);
+        write_shm_media_ts(t, mts);
         t->index = fi + 1; t->recv++;
       }
     }
@@ -276,6 +293,8 @@ static void* audio_rx_thread(void* arg) {
     struct st30_frame* frame = st30p_rx_get_frame(s->ah);
     if (!frame) { usleep(500); continue; }
     size_t n = frame->data_size < s->slotsize ? frame->data_size : s->slotsize;
+    /* Timestamp MÉDIA (capture) du chunk, TAI ns — MÊME horloge PTP que la vidéo (sampling 48 kHz). */
+    uint64_t mts = st10_get_tai(frame->tfmt, frame->timestamp, MEDIA_CLK_AUDIO);
     for (int ti = 0; ti < s->ntg; ti++) {        /* fan-out (même source audio → N slots) */
       struct target* t = &s->tg[ti];
       uint64_t ci = t->index;
@@ -283,6 +302,7 @@ static void* audio_rx_thread(void* arg) {
       memcpy(dst, frame->addr, n);
       if (n < s->slotsize) memset(dst + n, 0, s->slotsize - n);
       write_shm_header(t, ci);
+      write_shm_media_ts(t, mts);
       t->index = ci + 1; t->recv++;
     }
     st30p_rx_put_frame(s->ah, frame);
