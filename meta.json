@@ -1,7 +1,10 @@
 {
-  "version": "0.19.0",
+  "version": "0.19.1",
   "date": "2026-06-05",
   "changes": {
+    "Corrections": [
+      "media_ts : reconstruction du TAI ABSOLU. Le RX libmtl fournit en pratique tfmt=MEDIA_CLK (compteur 32 bits qui wrappe), pas TAI. st10_get_tai ne donnait alors que la position DANS la fenêtre (≈144 s vidéo @90k / ≈24005 s audio @48k → échelles différentes, NON comparables) → le streamer rejetait (|Δ| énorme) → aucune correction A/V (constat live : pas synchro). Nouveau helper media_ts_to_tai() reconstruit l'absolu en recollant la fenêtre courante via l'horloge PTP (mtl_ptp_read_time_raw) → video_ts ≈ audio_ts → le -itsoffset du streamer s'active. tfmt=TAI → renvoyé tel quel."
+    ],
     "Nouveautés": [
       "Timestamps MÉDIA (RTP/PTP) dans le shm — fondation pour le sync A/V. mtl_rx écrit l'instant de CAPTURE (TAI ns via st10_get_tai sur frame->timestamp/tfmt, sampling 90 kHz vidéo / 48 kHz audio) à l'off16 du header shm, pour la vidéo (timestamp du 1er champ en entrelacé) ET l'audio — horloge PTP COMMUNE A/V (ST 2110-10), contrairement au write-ts (now_ns) qui dépend de la latence de pipeline (variable, ≠ audio/vidéo). Additif et rétro-compatible : [index, write_ts] inchangés, off16=0 signifie « inconnu » (consommateur → repli nominal). Simu (mire) écrit media_ts=0. Le consommateur (streamer monitor v0.6.0) l'exploite pour aligner A/V. DIFFÉRÉ : restitution du media_ts à l'émission TX 2110 (nécessite ST20P_TX_FLAG_USER_TIMESTAMP = changement du modèle de pacing TX → à valider au banc, ne pas risquer le passthrough actuel) ; propagation à travers les étages de calcul."
     ],
