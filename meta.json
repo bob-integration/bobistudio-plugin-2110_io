@@ -1,7 +1,18 @@
 {
-  "version": "0.19.1",
-  "date": "2026-06-05",
+  "version": "0.20.0",
+  "date": "2026-06-08",
   "changes": {
+    "Nouveautés (0.20.0)": [
+      "Audio TX (×2) + ANC TX : les slots TX émettent désormais jusqu'à 2 flux audio 2110-30 et 1 flux ANC 2110-40 en parallèle de la vidéo. Les shm audio/ANC suivent automatiquement la vidéo câblée (mtl_0 → mtl_audio_0/1, mtl_anc_0). before_deploy auto-alloue les IP multicast (239.10.40-41.x pour audio, 239.10.50.x pour ANC) et ports à chaque slot TX. docker_driver passe la liste audios (remplace les champs singuliers audio_mcast/port). controller : _tx.audios[0/1] + boucle TX par entrée de la liste + _derive_audio_shm(video_shm, idx). NMOS IS-04 : senders audio + ANC enregistrés par slot TX (au lieu de la liste globale du sender_2110). routes api_mtl_tx_dest : paramètre audio_idx pour cibler le flux audio 0 ou 1 indépendamment."
+    ],
+    "Nouveautés": [
+      "TX adapts_input : le manifeste porte adapts_input=true → le format de la source câblée (width/height/chroma/bit_depth/fps/scan) est injecté automatiquement par l'orchestrateur via :8082/input au câblage (déjà supporté par le contrôleur). Le gate format ne bloque plus les sources de format différent du défaut CONFIG.",
+      "Fallback format → préférences DB : normalize_receiver_params reçoit les settings de la DB → le format placeholder/simu par défaut (WIDTH/HEIGHT/FPS/CHROMA) suit Réglages → MXL → Format vidéo par défaut, plus 1280×720 hardcodé.",
+      "inputs_latency_ms TX : thread passif de monitoring latence (10 Hz, 16 octets/slot) lit ts_ns (offset 8 du header SHM) de la source câblée et calcule (now_ns − ts_ns) / 1e6. Résultat exposé dans :8080 metrics.senders[].inputs_latency_ms — âge total du signal depuis sa capture originale (receiver Rx ou source interne)."
+    ],
+    "Corrections (0.19.2)": [
+      "Watchdog mtl_rx : détection de crash + redémarrage automatique 5 s après. Avant, un crash du binaire C mtl_rx était silencieux (le slot restait figé). Désormais : log immédiat du code de retour, métriques mode='crashed'/fps=0, attente 5 s, puis relance. La reconnexion suit le chemin normal (_launch_mtl_rx avec la même clé SDP)."
+    ],
     "Corrections": [
       "media_ts : reconstruction du TAI ABSOLU. Le RX libmtl fournit en pratique tfmt=MEDIA_CLK (compteur 32 bits qui wrappe), pas TAI. st10_get_tai ne donnait alors que la position DANS la fenêtre (≈144 s vidéo @90k / ≈24005 s audio @48k → échelles différentes, NON comparables) → le streamer rejetait (|Δ| énorme) → aucune correction A/V (constat live : pas synchro). Nouveau helper media_ts_to_tai() reconstruit l'absolu en recollant la fenêtre courante via l'horloge PTP (mtl_ptp_read_time_raw) → video_ts ≈ audio_ts → le -itsoffset du streamer s'active. tfmt=TAI → renvoyé tel quel."
     ],

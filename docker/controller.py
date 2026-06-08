@@ -228,10 +228,14 @@ class MetricsHandler(BaseHTTPRequestHandler):
                 t = _tx[i]
                 if not (t["enabled"] and t["shm_in"]):
                     continue
+                lat = t.get("lat_ms")
+                inputs_lat = {t["shm_in"]: lat} if lat is not None else {}
                 if t["mcast"] and t["udp_port"]:
-                    senders.append({"tx_idx": i, "essence": "video", "sdp": _tx_sdp(i, t)})
+                    senders.append({"tx_idx": i, "essence": "video", "sdp": _tx_sdp(i, t),
+                                    "inputs_latency_ms": inputs_lat})
                 if t.get("anc_mcast") and t.get("anc_port"):
-                    senders.append({"tx_idx": i, "essence": "anc", "sdp": _anc_sdp(i, t)})
+                    senders.append({"tx_idx": i, "essence": "anc", "sdp": _anc_sdp(i, t),
+                                    "inputs_latency_ms": inputs_lat})
         payload = {"fps": top_fps, "receivers": recs, "senders": senders}
         self.wfile.write(json.dumps(payload).encode())
     def log_message(self, *a): pass
@@ -292,9 +296,11 @@ class AgentHandler(BaseHTTPRequestHandler):
                 if "udp_port" in body: t["udp_port"] = int(body.get("udp_port") or 0)
                 if "pt"       in body: t["pt"]       = int(body.get("pt") or 96)
                 if "shm_in"   in body: t["shm_in"]   = (body.get("shm_in") or "").strip() or None
-                if "audio_mcast" in body: t["audio_mcast"] = body.get("audio_mcast") or None
-                if "audio_port"  in body: t["audio_port"]  = int(body.get("audio_port") or 0)
-                if "audio_pt"    in body: t["audio_pt"]    = int(body.get("audio_pt") or 97)
+                if "audios" in body:
+                    t["audios"] = [{"mcast": a.get("mcast") or None,
+                                    "port": int(a.get("port") or 0),
+                                    "pt": int(a.get("pt") or 97)}
+                                   for a in (body.get("audios") or [])[:2]]
                 if "anc_mcast"   in body: t["anc_mcast"]   = body.get("anc_mcast") or None
                 if "anc_port"    in body: t["anc_port"]    = int(body.get("anc_port") or 0)
                 if "anc_pt"      in body: t["anc_pt"]      = int(body.get("anc_pt") or 97)
@@ -454,15 +460,15 @@ def _audio_session(idx, info):
             "targets": [{"idx": idx, "shm": "/dev/shm/{}_audio_{}".format(HOSTNAME, idx),
                          "stats": "/tmp/mtl_a{}.json".format(idx)}]}
 
-def _derive_audio_shm(video_shm):
-    """shm vidéo câblé → shm audio associé : 'mtl_0' → 'mtl_audio_0' (None si pas de _N final)."""
+def _derive_audio_shm(video_shm, idx=0):
+    """shm vidéo câblé → shm audio associé : 'host_0' + idx=1 → 'host_audio_1'."""
     m = re.match(r"^(.*)_(\d+)$", (video_shm or "").strip())
-    return "{}_audio_{}".format(m.group(1), m.group(2)) if m else None
+    return "{}_audio_{}".format(m.group(1), idx) if m else None
 
-def _audio_tx_session(idx, t, shm_in):
-    """Session TX audio st30 : émet le shm audio d'entrée (BE passthrough) vers la dest audio du slot."""
+def _audio_tx_session(idx, acfg, shm_in):
+    """Session TX audio st30 : émet le shm audio d'entrée (BE passthrough) vers la dest audio."""
     return {"kind": "audio", "role": "tx",
-            "mcast": t["audio_mcast"], "udp_port": t["audio_port"], "payload_type": t.get("audio_pt", 97),
+            "mcast": acfg["mcast"], "udp_port": acfg["port"], "payload_type": acfg.get("pt", 97),
             "channels": A_CHANNELS, "ptime": A_PTIME_DEF, "ring": A_RING, "hdr": HDR,
             "targets": [{"idx": idx, "shm": shm_in, "stats": "/tmp/mtl_atx{}.json".format(idx)}]}
 
@@ -521,10 +527,40 @@ _fail_streak = 0             # échecs rapides consécutifs (backoff)
 _tx = [{"enabled": False, "mcast": None, "udp_port": 0, "pt": 96, "shm_in": None,
         "w": WIDTH, "h": HEIGHT, "fps": FPS, "bd": BIT_DEPTH, "ring": V_RING,
         "scan": "p", "field_order": "tff",   # passthrough entrelacé : suit le format de la source câblée
-        "audio_mcast": None, "audio_port": 0, "audio_pt": 97,
-        "anc_mcast": None, "anc_port": 0, "anc_pt": 97}
+        "audios": [],       # liste de {mcast, port, pt} — jusqu'à 2 flux 2110-30
+        "anc_mcast": None, "anc_port": 0, "anc_pt": 97,
+        "lat_ms": None}     # âge du signal depuis la capture originale (ts_ns header SHM)
        for _ in range(N_TX)]
 _tx_lock = threading.Lock()
+
+
+def _tx_lat_monitor():
+    """Thread passif : lit ts_ns (offset 8, uint64) dans le header SHM de chaque slot Tx actif
+    et calcule l'âge du signal depuis sa capture originale. Ne lit que 16 octets par slot (très
+    léger). Expose le résultat dans _tx[i]["lat_ms"] pour les métriques :8080."""
+    while True:
+        with _tx_lock:
+            slots = [(i, t["shm_in"]) for i, t in enumerate(_tx) if t["enabled"] and t["shm_in"]]
+        now_ns = time.time_ns()
+        for idx, shm_name in slots:
+            path = shm_name if shm_name.startswith("/") else "/dev/shm/" + shm_name
+            try:
+                with open(path, "rb") as f:
+                    f.seek(8)
+                    raw = f.read(8)
+                if len(raw) == 8:
+                    ts_ns = struct.unpack("<Q", raw)[0]
+                    if ts_ns > 0:
+                        lat_ms = round((now_ns - ts_ns) / 1_000_000, 1)
+                        with _tx_lock:
+                            _tx[idx]["lat_ms"] = lat_ms if 0 < lat_ms < 30_000 else None
+            except Exception:
+                with _tx_lock:
+                    _tx[idx]["lat_ms"] = None
+        time.sleep(0.1)   # 10 Hz — header uniquement, coût négligeable
+
+
+threading.Thread(target=_tx_lat_monitor, daemon=True).start()
 
 
 def _xdp_off():
@@ -776,12 +812,15 @@ def _manager_loop():
                 t = _tx[i]
                 if t["enabled"] and t["mcast"] and t["udp_port"] and t["shm_in"]:
                     sessions.append(_tx_session(i, t))
-                # TX audio : suit la vidéo (shm audio dérivé) si une dest audio est réglée sur le slot.
-                ashm = _derive_audio_shm(t["shm_in"])
-                if t["enabled"] and t.get("audio_mcast") and t.get("audio_port") and ashm:
-                    if not ashm.startswith("/"):
-                        ashm = "/dev/shm/" + ashm
-                    sessions.append(_audio_tx_session(i, t, ashm))
+                # TX audio : jusqu'à 2 flux, shm audio dérivé de la vidéo câblée.
+                for ai, acfg in enumerate(t.get("audios") or []):
+                    if not acfg.get("mcast") or not acfg.get("port"):
+                        continue
+                    ashm = _derive_audio_shm(t["shm_in"], ai)
+                    if t["enabled"] and ashm:
+                        if not ashm.startswith("/"):
+                            ashm = "/dev/shm/" + ashm
+                        sessions.append(_audio_tx_session(i * 2 + ai, acfg, ashm))
                 # TX ANC : suit la vidéo (shm ANC dérivé) si une dest ANC est réglée sur le slot.
                 dshm = _derive_anc_shm(t["shm_in"])
                 if t["enabled"] and t.get("anc_mcast") and t.get("anc_port") and dshm:
