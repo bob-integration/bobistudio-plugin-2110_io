@@ -65,7 +65,7 @@ def topology_ports(hostname, params, ctx):
         shm = params.get(f"tx{i}_shm") or ""
         t = txs[i] if i < len(txs) else {}
         dest = "{}:{}".format(t.get("multicast_ip"), t.get("dest_port") or 5000) if t.get("multicast_ip") else ""
-        port = {"kind": "video", "slot": i, "label": f"Émetteur 2110-20 #{i + 1}",
+        port = {"kind": "video", "slot": i, "label": f"TX #{i + 1}",
                 "shm": shm, "dest": dest}   # dest = destination 2110-20 (éditable à chaud)
         if not shm:
             port["disconnected"] = True
