@@ -221,10 +221,53 @@ window.MXLPlugins["receiver_2110_mtl"] = {
       return groups;
     }
 
+    function renderTXSection(senders){
+      // Groupe les senders TX par slot (tx_idx), puis affiche vidéo + audios + ANC.
+      if (!senders || !senders.length) return '';
+      const bySlot = {};
+      senders.forEach(s => {
+        const ti = s.tx_idx != null ? s.tx_idx : 0;
+        (bySlot[ti] = bySlot[ti] || []).push(s);
+      });
+      const slotIds = Object.keys(bySlot).sort((a,b) => Number(a) - Number(b));
+      if (!slotIds.length) return '';
+      const rows = slotIds.map(ti => {
+        const sl = bySlot[ti];
+        const vid  = sl.find(s => s.essence === 'video');
+        const auds = sl.filter(s => s.essence === 'audio').sort((a,b) => (a.audio_idx||0) - (b.audio_idx||0));
+        const anc  = sl.find(s => s.essence === 'anc');
+        const fmtDest = (s) => {
+          if (!s) return '<span style="color:var(--text-muted)">non configuré</span>';
+          const fp = fmtFps(s.fps);
+          const dest = s.multicast_ip ? `${s.multicast_ip}:${s.destination_port ?? '?'}` : '—';
+          return `<span style="color:var(--text-muted)">${esc(dest)}</span> ${fp} fps`;
+        };
+        const lines = [];
+        if (vid) lines.push(`<div class="flow-row" style="gap:8px;align-items:center">
+          <span class="badge" style="background:var(--bg-input,var(--bg));border:1px solid var(--border)">2110-20</span>
+          ${fmtDest(vid)}</div>`);
+        auds.forEach((a,i) => lines.push(`<div class="flow-row" style="gap:8px;align-items:center">
+          <span class="badge" style="background:var(--bg-input,var(--bg));border:1px solid var(--border)">2110-30 #${i+1}</span>
+          ${fmtDest(a)}</div>`));
+        if (anc) lines.push(`<div class="flow-row" style="gap:8px;align-items:center">
+          <span class="badge" style="background:var(--bg-input,var(--bg));border:1px solid var(--border)">2110-40</span>
+          ${fmtDest(anc)}</div>`);
+        return `<div class="ens">
+          <div class="ens-title">Slot TX #${ti}</div>
+          ${lines.join('')}
+        </div>`;
+      }).join('');
+      return `<div class="meta" style="margin-top:10px;padding-top:8px;border-top:1px solid var(--border-soft);font-weight:600">Sorties (TX)</div>`
+           + rows;
+    }
+
     async function refresh(){
-      let c;
+      let c, cs;
       try { c = await (await fetch(`/api/nmos/receivers/${vmid}/detail`)).json(); }
       catch(e){ body.innerHTML = '<div class="meta">Détail NMOS indisponible.</div>'; return; }
+      try { const cd = await (await fetch(`/api/nmos/senders/${vmid}/detail`)).json();
+            cs = (cd && cd.length) ? cd[0] : null; }
+      catch(e){ cs = null; }
       const recvs = (c && c.receivers) || [];
       const ensembles = groupEnsembles(recvs);
       const activeCount = recvs.filter(x => x.active).length;
@@ -244,9 +287,10 @@ window.MXLPlugins["receiver_2110_mtl"] = {
               ${rows.join('')}
             </div>`;
           }).join('');
+      const txHtml = renderTXSection(cs && cs.senders);
       body.innerHTML =
         `<div class="meta rx-meta">IP : ${esc((c && c.ip) || '—')} — ${recvs.length} receiver(s) NMOS · ${activeCount}/${recvs.length} actif(s)</div>`
-        + inner;
+        + inner + txHtml;
     }
 
     // Délégation : clic sur un badge IDENT → bascule l'incrustation de ce slot vidéo.
