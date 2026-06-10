@@ -284,12 +284,12 @@ window.MXLPlugins["2110_io"] = {
             </div>`;
           }).join('');
       const moreBtn = remaining > 0
-        ? `<button class="io2110-more-btn">+ ${remaining} source${remaining > 1 ? 's' : ''} de plus</button>`
+        ? `<button class="io2110-more-btn">+ Ajouter une source</button>`
         : '';
       body.innerHTML = _cachedMeta + inner + moreBtn + _cachedTxHtml;
       if (remaining > 0) {
         body.querySelector('.io2110-more-btn').onclick = () => {
-          _visibleGroups += IO_PAGE;
+          _visibleGroups += 1;
           _renderBody();
         };
       }
