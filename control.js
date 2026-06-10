@@ -3,12 +3,12 @@
 // Auteur : Cyril Mazouer, pour le compte de BOBI SAS
 // Distribué sous licence GNU GPL v3 (ou ultérieure) ; voir le fichier LICENSE.
 
-// Carte de contrôle receiver_2110_mtl (identique à receiver_2110). Enregistrée sur window.MXLPlugins["receiver_2110_mtl"].
+// Carte de contrôle 2110_io. Enregistrée sur window.MXLPlugins["2110_io"].
 // mount(el, vmid, ctx) est appelée par le shell Sources après injection de control.html.
 // Données par-vmid : GET /api/nmos/receivers/<vmid>/detail. Générateur par slot :
 // POST /api/nmos/receivers/<vmid>/gen/<essence>/<idx>. Auto-refresh interne (5 s).
 window.MXLPlugins = window.MXLPlugins || {};
-window.MXLPlugins["receiver_2110_mtl"] = {
+window.MXLPlugins["2110_io"] = {
   _timers: {},
 
   mount(el, vmid, ctx){
@@ -20,10 +20,10 @@ window.MXLPlugins["receiver_2110_mtl"] = {
     }[c]));
 
     const VIDEO_PATTERNS = {
-      testsrc2:   'testsrc2 — couleurs animées',
-      testsrc:    'testsrc — barres + timer',
-      smptebars:  'barres SMPTE',
-      rgbtestsrc: 'mire RGB',
+      bars:     'Barres SMPTE',
+      gradient: 'Dégradé gris',
+      black:    'Fond noir',
+      moving:   'Barre animée',
     };
 
     // SDP actif courant par index de flux vidéo (rempli au rendu, lu par la modale).
@@ -68,7 +68,7 @@ window.MXLPlugins["receiver_2110_mtl"] = {
           chans.push(`<span class="${cls}" title="canal ${i+1} — ${tip}">${i+1}</span>`);
         }
         const nOn = active.filter(Boolean).length;
-        return `<div class="gen-tip">
+        return `<div class="gen-tip"><div class="gen-tip-inner">
           <h5>⚙ Générateur sine local</h5>
           <div class="gt-row"><span>Fréquence</span><span>${esc(freq)}</span></div>
           <div class="gt-row"><span>Niveau</span><span>${esc(level)}</span></div>
@@ -77,17 +77,9 @@ window.MXLPlugins["receiver_2110_mtl"] = {
           <div style="margin-top:6px; color:var(--text-muted); font-size:0.92em">
             Vert = actif · Rouge = ruptures · Grisé = muet</div>
           ${hint}
-        </div>`;
+        </div></div>`;
       }
-      const pat = g.pattern || 'testsrc2';
-      const patLabel = VIDEO_PATTERNS[pat] || pat;
-      const res = (r.width && r.height) ? `${r.width}×${r.height}${r.scan === 'i' ? 'i' : ''}` : '—';
-      return `<div class="gen-tip">
-        <h5>⚙ Générateur de mire local</h5>
-        <div class="gt-row"><span>Mire</span><span>${esc(patLabel)}</span></div>
-        <div class="gt-row"><span>Résolution</span><span>${esc(res)}</span></div>
-        ${hint}
-      </div>`;
+      return '';
     }
     // Couples multicast:port lus dans le SDP (une entrée par section m=). Couvre le
     // SDP manuel (transport_params vides) et le multi-flux DUP/2022-7. Ignore le
@@ -132,9 +124,13 @@ window.MXLPlugins["receiver_2110_mtl"] = {
       // Bouton générateur : data-* lus par délégation (pas d'onclick global). Pas de GÉN pour l'ANC.
       // Placeholder vide quand absent : la grille .flow-row place par position → sans cet espace
       // réservé, le badge SDP se décalerait dans une colonne de gauche (désalignement audio/ANC vs vidéo).
+      const _genPat = (r.gen && r.gen.pattern) || 'bars';
+      const _patOpts = Object.entries(VIDEO_PATTERNS).map(([k,v]) =>
+        `<option value="${k}"${k===_genPat?' selected':''}>${esc(v)}</option>`).join('');
       const genIcon = isAnc ? '<span class="gen-wrap"></span>' : `<span class="gen-wrap">
           <span class="gen-badge ${r.simulated ? 'on' : 'off'}" role="button" tabindex="0"
                 data-essence="${ess}" data-idx="${r.idx}" data-enable="${r.simulated ? '0' : '1'}">GÉN</span>
+          ${(!isAudio && r.simulated) ? `<span class="gen-pat-wrap"><select class="gen-pat-sel" data-essence="video" data-idx="${r.idx}">${_patOpts}</select></span>` : ''}
           ${genTooltip(r, isAudio)}
         </span>`;
       // IDENT : incrustation 3 lignes (nom/source/format) — slots vidéo uniquement.
@@ -391,6 +387,24 @@ window.MXLPlugins["receiver_2110_mtl"] = {
         badge.classList.remove('busy');
       }
     }
+    // Délégation : changement de pattern dans le <select> du tooltip GÉN.
+    async function onPatternChange(e){
+      const sel = e.target.closest('.gen-pat-sel');
+      if (!sel || !body.contains(sel)) return;
+      const essence = sel.dataset.essence;
+      const idx = parseInt(sel.dataset.idx, 10);
+      const pattern = sel.value;
+      try {
+        const resp = await fetch(`/api/containers/${vmid}/control/gen`, {
+          method: 'POST', headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({essence, idx, enabled: true, pattern}),
+        });
+        if (!resp.ok) { const j = await resp.json().catch(()=>({})); throw new Error(j.error || ('HTTP ' + resp.status)); }
+      } catch(err) {
+        toast('Échec du changement de mire : ' + err.message, 'error');
+      }
+    }
+
     // ── SDP : ouverture de la modale d'affichage / abonnement manuel ──────────
     function _closeSdpModal(){ const m = document.getElementById('rx-sdp-modal'); if (m) m.remove(); }
     async function _sdpApply(essence, idx, enable){
@@ -457,6 +471,7 @@ window.MXLPlugins["receiver_2110_mtl"] = {
     body.addEventListener('click', onClick);
     body.addEventListener('click', onClickIdent);
     body.addEventListener('click', onClickSdp);
+    body.addEventListener('change', onPatternChange);
     body.addEventListener('pointerdown', onKnobDown);
     body.addEventListener('pointermove', onKnobMove);
     body.addEventListener('pointerup', onKnobUp);

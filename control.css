@@ -24,7 +24,7 @@
 .mxl-path { grid-row:2; grid-column:6 / 7; }
 
 /* Badge « générateur local » cliquable (marche/arrêt) + tooltip riche au survol */
-.gen-wrap { position:relative; justify-self:center; }
+.gen-wrap { position:relative; justify-self:center; display:inline-flex; align-items:center; }
 .gen-badge { display:inline-flex; align-items:center; gap:3px; cursor:pointer;
     font-size:0.66em; font-weight:700; letter-spacing:0.04em; line-height:1;
     padding:3px 5px; border-radius:4px; border:1px solid transparent;
@@ -68,14 +68,26 @@
 .ident-size-val { font-size:0.72em; color:var(--text-muted); font-family:var(--font-mono);
     min-width:30px; display:inline-block; }
 
-.gen-tip { display:none; position:absolute; bottom:calc(100% + 6px); left:50%; transform:translateX(-50%);
-    z-index:50; min-width:200px; max-width:300px; padding:8px 10px;
+/* Sélecteur de mire — flotte en absolu sous le badge GÉN, n'affecte pas la grille */
+.gen-pat-wrap { position:absolute; top:calc(100% + 4px); left:50%; transform:translateX(-50%);
+    z-index:20; }
+.gen-pat-sel { display:block; font-size:0.78em; font-weight:500;
+    font-family:var(--font-ui, Inter, 'Segoe UI', system-ui, sans-serif);
+    background:var(--bg-input); color:var(--text); border:1px solid var(--border);
+    border-radius:4px; padding:3px 7px; cursor:pointer; white-space:nowrap;
+    transition:border-color 120ms; }
+.gen-pat-sel:hover { border-color:var(--accent, #7aa2c8); }
+.gen-pat-sel:focus { outline:none; border-color:var(--accent, #7aa2c8); }
+.gen-tip { display:none; position:absolute; bottom:100%; padding-bottom:6px; left:50%; transform:translateX(-50%);
+    z-index:50; min-width:200px; max-width:300px;
     background:var(--bg-input); color:var(--text); border:1px solid var(--border-soft);
     border-radius:6px; box-shadow:0 4px 16px rgba(0,0,0,0.45); font-size:0.82em;
     line-height:1.45; text-align:left; white-space:normal; font-weight:400; letter-spacing:normal; }
-.gen-wrap:hover .gen-tip { display:block; }
+.gen-tip-inner { padding:8px 10px; }
+.gen-wrap:hover .gen-tip,
+.gen-wrap:focus-within .gen-tip { display:block; }
 .gen-tip h5 { margin:0 0 5px; font-size:0.95em; color:#e8a33d; }
-.gen-tip .gt-row { display:flex; justify-content:space-between; gap:10px; }
+.gen-tip .gt-row { display:flex; justify-content:space-between; align-items:center; gap:10px; }
 .gen-tip .gt-row span:last-child { color:var(--text-muted); font-family:var(--font-mono); }
 .gen-tip .gt-chans { display:flex; flex-wrap:wrap; gap:3px; margin-top:6px; }
 .gt-ch { width:18px; height:18px; border-radius:3px; display:flex; align-items:center; justify-content:center;
