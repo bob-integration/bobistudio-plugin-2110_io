@@ -50,6 +50,9 @@
     "tx_count": 25,
     "active_rx_count": 8,
     "active_tx_count": 8,
+    "width": 1920,
+    "height": 1080,
+    "fps": 25,
     "tx_slots": [],
     "smpte_2022_7": false,
     "tx_fallback": "black"
