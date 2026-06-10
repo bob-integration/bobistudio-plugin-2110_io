@@ -35,6 +35,39 @@ A_RING     = max(2, int(os.environ.get("AUDIO_RING") or 100))   # ring shm audio
 A_PTIME_DEF = float(os.environ.get("AUDIO_PTIME") or 1.0)
 _cpu_last_usec = None
 _cpu_last_time = None
+_bw_last = {}
+# subsystem_device → (label, aggregate_gbps)  — source: Intel product brief + sysfs
+_E810_MODELS = {
+    "0x0002": ("E810-CQDA2", 100),   # E810-C for QSFP 2-port, 1 controller (pvemxl confirmé)
+    "0x0003": ("E810-2CQDA2", 200),  # E810-C for QSFP 2×2-port, 2 controllers indépendants
+    "0x0004": ("E810-CQDA1", 100),   # E810-C for QSFP 1-port
+    "0x0005": ("E810-CQDA2", 100),   # variante OEM
+}
+
+
+def _nic_model(iface):
+    try:
+        sub = open(f"/sys/class/net/{iface}/device/subsystem_device").read().strip().lower()
+        return _E810_MODELS.get(sub, ("E810 QSFP", 100))
+    except Exception:
+        return ("E810 QSFP", 100)
+
+
+def _nic_bps(iface):
+    global _bw_last
+    try:
+        rx  = int(open(f"/sys/class/net/{iface}/statistics/rx_bytes").read())
+        tx  = int(open(f"/sys/class/net/{iface}/statistics/tx_bytes").read())
+        cap = int(open(f"/sys/class/net/{iface}/speed").read().strip()) / 1000
+    except Exception:
+        return None, None, 100.0
+    now = time.monotonic()
+    last, _bw_last = _bw_last, {"rx": rx, "tx": tx, "t": now}
+    if last and last.get("rx") is not None and now > last.get("t", 0) + 0.5:
+        dt = now - last["t"]
+        return (round((rx - last["rx"]) * 8 / dt / 1e9, 2),
+                round((tx - last["tx"]) * 8 / dt / 1e9, 2), cap)
+    return None, None, cap
 
 
 def _cgroup_cpu_usec():
@@ -284,7 +317,13 @@ class MetricsHandler(BaseHTTPRequestHandler):
                 if t.get("anc_mcast") and t.get("anc_port"):
                     senders.append({"tx_idx": i, "essence": "anc", "sdp": _anc_sdp(i, t),
                                     "inputs_latency_ms": inputs_lat})
-        payload = {"fps": top_fps, "receivers": recs, "senders": senders}
+        rx_gbps, tx_gbps, port_cap = _nic_bps(IFACE)
+        model_label, aggregate_gbps = _nic_model(IFACE)
+        payload = {"fps": top_fps, "receivers": recs, "senders": senders,
+                   "nic": {"rx_gbps": rx_gbps, "tx_gbps": tx_gbps,
+                            "port_capacity_gbps": port_cap,
+                            "aggregate_gbps": aggregate_gbps,
+                            "model": model_label}}
         self.wfile.write(json.dumps(payload).encode())
     def log_message(self, *a): pass
 

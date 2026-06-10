@@ -94,3 +94,13 @@
     font-size:0.72em; font-family:var(--font-mono); border:1px solid var(--border-soft); color:var(--text-muted); }
 .gt-ch.on  { background:#34d399; color:#06281c; border-color:#34d399; }
 .gt-ch.rup { background:#ef5350; color:#2a0a09; border-color:#ef5350; }
+
+/* Barre utilisation NIC (RX côté Sources, TX côté Destinations) */
+.nic-bar-wrap { display:flex; align-items:center; gap:6px; margin:3px 0 6px; font-size:0.82em; line-height:1.3; }
+.nic-bar-lbl  { color:var(--text-muted); width:24px; flex-shrink:0; font-weight:600; }
+.nic-bar-val  { min-width:160px; font-variant-numeric:tabular-nums; }
+.nic-bar-track { flex:1; height:4px; background:var(--border); border-radius:2px; overflow:hidden; }
+.nic-bar-fill  { height:100%; border-radius:2px; transition:width .6s; }
+.nic-bar-est  { font-style:italic; color:var(--text-muted); }
+.nic-model-lbl { font-size:0.76em; color:var(--text-muted); margin:2px 0 1px; }
+.nic-shared   { color:#e8a33d; }

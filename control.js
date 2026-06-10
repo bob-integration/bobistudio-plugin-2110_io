@@ -257,6 +257,25 @@ window.MXLPlugins["2110_io"] = {
            + rows;
     }
 
+    function _nicBar(gbps, estGbps, cap, label) {
+      const val = gbps != null ? gbps : estGbps;
+      const isEst = gbps == null && estGbps != null;
+      if (val == null) return '';
+      const pct = Math.min(100, Math.round(val / cap * 100));
+      const col = pct > 80 ? 'var(--status-stopped-fg,#f87171)' : pct > 60 ? '#e8a33d' : 'var(--status-running-fg,#22c55e)';
+      return `<div class="nic-bar-wrap">
+        <span class="nic-bar-lbl">${label}</span>
+        <span class="nic-bar-val${isEst ? ' nic-bar-est' : ''}" style="color:${col}">${isEst ? '~' : ''}${val.toFixed(1)} / ${cap} Gbps (${pct}%)</span>
+        <div class="nic-bar-track"><div class="nic-bar-fill" style="width:${pct}%;background:${col}"></div></div>
+      </div>`;
+    }
+
+    function _nicHeader(model, aggregateGbps) {
+      if (!model) return '';
+      const shared = aggregateGbps <= 100 ? ' · <span class="nic-shared">agrégé 100G</span>' : '';
+      return `<div class="nic-model-lbl">${esc(model)}${shared}</div>`;
+    }
+
     let _cachedEnsembles = [];
     let _cachedMeta      = '';
     let _cachedTxHtml    = '';
@@ -312,7 +331,14 @@ window.MXLPlugins["2110_io"] = {
       const activeCount = recvs.filter(x => x.active).length;
       _cachedVideoCount = (c && c.video_count) || recvs.length;
       _cachedEnsembles = groupEnsembles(recvs);
-      _cachedMeta      = `<div class="meta rx-meta">IP : ${esc((c && c.ip) || '—')} — ${recvs.length} / ${_cachedVideoCount} sources · ${activeCount} abonné${activeCount > 1 ? 's' : ''}</div>`;
+      const _nicPortCap = (c && c.nic_port_capacity_gbps) || 100;
+      const _nicAgg     = (c && c.nic_aggregate_gbps)     || 100;
+      const _nicH   = _nicHeader((c && c.nic_model) || '', _nicAgg);
+      const _nicRxBar = _nicBar(
+        (c && c.nic_rx_gbps != null) ? c.nic_rx_gbps : null,
+        (c && c.nic_rx_estimated_gbps != null) ? c.nic_rx_estimated_gbps : null,
+        _nicPortCap, 'RX');
+      _cachedMeta = `<div class="meta rx-meta">IP : ${esc((c && c.ip) || '—')} — ${recvs.length} / ${_cachedVideoCount} sources · ${activeCount} abonné${activeCount > 1 ? 's' : ''}</div>${_nicH}${_nicRxBar}`;
       _cachedTxHtml    = renderTXSection(cs && cs.senders);
       _renderBody();
     }
