@@ -269,15 +269,15 @@ class MetricsHandler(BaseHTTPRequestHandler):
             recs.append(rec)
         # fps agrégé = premier slot actif (compat get_metrics qui lit .fps top-level)
         top_fps = next((m["fps"] for m in recs if m.get("mode") == "mtl"), recs[0]["fps"] if recs else 0.0)
-        # Senders TX actifs (câblés) : SDP exposé pour le transportfile NMOS (manifest_href).
+        # Senders TX : SDP exposé dès que la destination est configurée (même sans câblage).
+        # Permet aux receivers NMOS de préparer leur abonnement IS-05 avant câblage de la source.
         with _tx_lock:
             senders = []
             for i in range(N_TX):
                 t = _tx[i]
-                if not (t["enabled"] and t["shm_in"]):
-                    continue
-                lat = t.get("lat_ms")
-                inputs_lat = {t["shm_in"]: lat} if lat is not None else {}
+                inputs_lat = {}
+                if t["enabled"] and t["shm_in"] and t.get("lat_ms") is not None:
+                    inputs_lat = {t["shm_in"]: t["lat_ms"]}
                 if t["mcast"] and t["udp_port"]:
                     senders.append({"tx_idx": i, "essence": "video", "sdp": _tx_sdp(i, t),
                                     "inputs_latency_ms": inputs_lat})
@@ -333,7 +333,7 @@ class AgentHandler(BaseHTTPRequestHandler):
             idx     = int(body.get("receiver_index") or 0)
             enabled = bool(body.get("enabled"))
             sdp     = body.get("sdp")
-            if isinstance(sdp, list):            # SMPTE 2022-7 : on garde la leg 0 en v1
+            if isinstance(sdp, list):            # compat ancien format (deux SDP séparés) → on garde leg0
                 sdp = sdp[0] if sdp else None
             if essence not in ("video", "audio", "anc"):
                 return self._json(200, {"ok": True, "note": "{} ignoré".format(essence)})
@@ -358,17 +358,23 @@ class AgentHandler(BaseHTTPRequestHandler):
             with _tx_lock:
                 t = _tx[idx]
                 t["enabled"] = bool(body.get("enabled"))
-                if "mcast"    in body: t["mcast"]    = body.get("mcast") or None
-                if "udp_port" in body: t["udp_port"] = int(body.get("udp_port") or 0)
-                if "pt"       in body: t["pt"]       = int(body.get("pt") or 96)
-                if "shm_in"   in body: t["shm_in"]   = (body.get("shm_in") or "").strip() or None
+                if "mcast"     in body: t["mcast"]     = body.get("mcast") or None
+                if "udp_port"  in body: t["udp_port"]  = int(body.get("udp_port") or 0)
+                if "mcast2"    in body: t["mcast2"]    = body.get("mcast2") or None
+                if "udp_port2" in body: t["udp_port2"] = int(body.get("udp_port2") or 0)
+                if "pt"        in body: t["pt"]        = int(body.get("pt") or 96)
+                if "shm_in"    in body: t["shm_in"]    = (body.get("shm_in") or "").strip() or None
                 if "audios" in body:
                     t["audios"] = [{"mcast": a.get("mcast") or None,
                                     "port": int(a.get("port") or 0),
-                                    "pt": int(a.get("pt") or 97)}
+                                    "pt": int(a.get("pt") or 97),
+                                    "mcast2": a.get("mcast2") or None,
+                                    "port2": int(a.get("port2") or 0)}
                                    for a in (body.get("audios") or [])[:2]]
                 if "anc_mcast"   in body: t["anc_mcast"]   = body.get("anc_mcast") or None
                 if "anc_port"    in body: t["anc_port"]    = int(body.get("anc_port") or 0)
+                if "anc_mcast2"  in body: t["anc_mcast2"]  = body.get("anc_mcast2") or None
+                if "anc_port2"   in body: t["anc_port2"]   = int(body.get("anc_port2") or 0)
                 if "anc_pt"      in body: t["anc_pt"]      = int(body.get("anc_pt") or 97)
                 # scan/field_order : ne clobber QUE si fournis (le câblage :8082/input porte le
                 # format réel de la source ; un push /tx de dest seule ne doit pas les écraser).
@@ -377,6 +383,17 @@ class AgentHandler(BaseHTTPRequestHandler):
                 for k_in, k_st in (("width","w"),("height","h"),("fps","fps"),("bit_depth","bd"),("ring","ring")):
                     if body.get(k_in):
                         t[k_st] = (float(body[k_in]) if k_st == "fps" else int(body[k_in]))
+            if "gen_enabled" in body:
+                with _tx_gen_lock:
+                    _tx_gen[idx]["user_enabled"] = bool(body.get("gen_enabled"))
+            if "gen_pattern" in body:
+                with _tx_gen_lock:
+                    _tx_gen[idx]["pattern"] = str(body.get("gen_pattern") or "bars")
+            if "fallback_mode" in body:
+                v = str(body.get("fallback_mode") or "none")
+                with _tx_lock:
+                    _tx[idx]["fallback_mode"] = v if v in ("none", "black", "bars") else "none"
+            _tx_gen_apply(idx)
             return self._json(200, {"ok": True})
 
         return self._json(404, {"error": "not found"})
@@ -396,7 +413,7 @@ class ControlHandler(BaseHTTPRequestHandler):
         # /state : shm câblé sur chaque slot TX (lu par la page Câbles via state_field tx{i}_shm)
         if self.path.rstrip("/") == "/state":
             with _tx_lock:
-                st = {"tx{}_shm".format(i): (_tx[i]["shm_in"] or "") for i in range(N_TX)}
+                st = {"tx{}_shm".format(i): (_tx[i].get("cable_shm") or "") for i in range(N_TX)}
             return self._json(200, st)
         return self._json(404, {"error": "not found"})
 
@@ -421,8 +438,7 @@ class ControlHandler(BaseHTTPRequestHandler):
             fmt = body.get("format") or {}
             with _tx_lock:
                 t = _tx[slot]
-                t["shm_in"] = shm
-                t["enabled"] = bool(shm)            # n'émet que si câblé
+                t["cable_shm"] = shm                # mémorise le câblage réel (séparé de shm_in qui peut pointer txgen)
                 if fmt.get("width"):     t["w"] = int(fmt["width"])
                 if fmt.get("height"):    t["h"] = int(fmt["height"])
                 if fmt.get("bit_depth"): t["bd"] = int(fmt["bit_depth"])
@@ -430,6 +446,8 @@ class ControlHandler(BaseHTTPRequestHandler):
                 # Mode de balayage de la SOURCE → passthrough entrelacé (émis tel quel en 2110-20).
                 if "scan" in fmt:        t["scan"] = "i" if str(fmt.get("scan")).lower() == "i" else "p"
                 if fmt.get("field_order"): t["field_order"] = "bff" if str(fmt["field_order"]).lower() == "bff" else "tff"
+            # shm_in et enabled recalculés : câblage prime toujours sur gen
+            _tx_gen_apply(slot)
             return self._json(200, {"ok": True})
 
         try:
@@ -453,6 +471,19 @@ class ControlHandler(BaseHTTPRequestHandler):
                     except Exception: pass
             _update_ident(idx)
             return self._json(200, {"ok": True, "pil": _HAS_PIL})
+
+        if path == "/gen_tx":       # bascule le générateur de mire sur un slot TX
+            try: tx_idx = int(body.get("idx", -1))
+            except Exception: tx_idx = -1
+            if not (0 <= tx_idx < N_TX):
+                return self._json(400, {"error": "idx TX hors limites"})
+            with _tx_gen_lock:
+                _tx_gen[tx_idx]["user_enabled"] = bool(body.get("enabled"))
+                if "pattern" in body:
+                    _tx_gen[tx_idx]["pattern"] = str(body["pattern"])
+            _tx_gen_apply(tx_idx)
+            return self._json(200, {"ok": True})
+
         return self._json(404, {"error": "not found"})
 
     def log_message(self, *a): pass
@@ -592,14 +623,24 @@ _fail_streak = 0             # échecs rapides consécutifs (backoff)
 # Chaque slot TX = une destination (mcast/port) + un shm d'ENTRÉE câblé (+ son format). Le manager
 # en fait une session role=tx dans le config ; mtl_rx lit le shm et émet en 2110-20. Un slot sans
 # shm_in (non câblé) ou désactivé n'émet pas.
-_tx = [{"enabled": False, "mcast": None, "udp_port": 0, "pt": 96, "shm_in": None,
+_tx = [{"enabled": False, "mcast": None, "udp_port": 0, "pt": 96,
+        "mcast2": None, "udp_port2": 0,      # leg1 SMPTE 2022-7 (vidéo)
+        "shm_in": None, "cable_shm": None,   # cable_shm = shm câblé réel (distinct de shm_in qui peut pointer vers txgen)
+        "fallback_mode": "black",             # repli automatique sans câble : "none"|"black"|"bars"
         "w": WIDTH, "h": HEIGHT, "fps": FPS, "bd": BIT_DEPTH, "ring": V_RING,
         "scan": "p", "field_order": "tff",   # passthrough entrelacé : suit le format de la source câblée
-        "audios": [],       # liste de {mcast, port, pt} — jusqu'à 2 flux 2110-30
+        "audios": [],       # liste de {mcast, port, pt, mcast2, port2} — jusqu'à 2 flux 2110-30
         "anc_mcast": None, "anc_port": 0, "anc_pt": 97,
+        "anc_mcast2": None, "anc_port2": 0,  # leg1 ANC (SMPTE 2022-7)
         "lat_ms": None}     # âge du signal depuis la capture originale (ts_ns header SHM)
        for _ in range(N_TX)]
 _tx_lock = threading.Lock()
+
+# Générateur TX : mire synthétique + silence audio (gen explicite ou repli auto selon fallback_mode).
+# user_enabled = ON/OFF explicite depuis l'UI ; enabled = état effectif (inclut le fallback auto).
+# câblé → shm câblé prime toujours ; user_gen > fallback > rien.
+_tx_gen = [{"user_enabled": False, "enabled": False, "pattern": "bars"} for _ in range(N_TX)]
+_tx_gen_lock = threading.Lock()
 
 
 def _tx_lat_monitor():
@@ -733,44 +774,65 @@ def _fps_str(fps):
     return _FR.get(f) or (str(int(f)) if float(f).is_integer() else "{}/1001".format(int(round(f + 1))))
 
 def _tx_sdp(i, t):
-    """SDP ST 2110-20 d'un slot TX. Transport = 422-10 (depth=10 même si le shm est en 8 bits).
-    sip = IP du PF (source des paquets). L'orchestrateur ajoute ts-refclk (PTP) au fetch.
-    Entrelacé : flag `interlace` dans le fmtp (passthrough) ; exactframerate = cadence reçue
-    (fps de la source câblée), conservée telle quelle pour rester aligné sur le flux source."""
-    scan = "interlace; " if t.get("scan") == "i" else ""
-    return (
-        "v=0\r\n"
-        "o=- 0 0 IN IP4 {sip}\r\n"
-        "s={hn} TX{i}\r\n"
-        "t=0 0\r\n"
+    """SDP ST 2110-20 d'un slot TX. Si mcast2/udp_port2 présents (SMPTE 2022-7),
+    génère un unique SDP avec deux sections m=video (leg0 + leg1)."""
+    sip   = SIP or "0.0.0.0"
+    scan  = "interlace; " if t.get("scan") == "i" else ""
+    pt    = int(t.get("pt") or 96)
+    w, h  = int(t.get("w") or 1920), int(t.get("h") or 1080)
+    fr    = _fps_str(t.get("fps"))
+    fmtp  = ("sampling=YCbCr-4:2:2; width={w}; height={h}; exactframerate={fr}; depth=10; "
+             "{scan}colorimetry=BT709; PM=2110GPM; SSN=ST2110-20:2017; TP=2110TPN;").format(
+             w=w, h=h, fr=fr, scan=scan)
+    leg0 = (
         "m=video {port} RTP/AVP {pt}\r\n"
         "c=IN IP4 {mcast}/64\r\n"
         "a=source-filter: incl IN IP4 {mcast} {sip}\r\n"
         "a=rtpmap:{pt} raw/90000\r\n"
-        "a=fmtp:{pt} sampling=YCbCr-4:2:2; width={w}; height={h}; exactframerate={fr}; depth=10; "
-        "{scan}colorimetry=BT709; PM=2110GPM; SSN=ST2110-20:2017; TP=2110TPN;\r\n"
+        "a=fmtp:{pt} {fmtp}\r\n"
         "a=mediaclk:direct=0\r\n"
-    ).format(sip=SIP or "0.0.0.0", hn=HOSTNAME, i=i,
-             port=int(t.get("udp_port") or 0), pt=int(t.get("pt") or 96),
-             mcast=t.get("mcast") or "0.0.0.0", w=int(t.get("w") or 1920),
-             h=int(t.get("h") or 1080), fr=_fps_str(t.get("fps")), scan=scan)
+    ).format(port=int(t.get("udp_port") or 0), pt=pt, mcast=t.get("mcast") or "0.0.0.0",
+             sip=sip, fmtp=fmtp)
+    sdp = "v=0\r\no=- 0 0 IN IP4 {sip}\r\ns={hn} TX{i}\r\nt=0 0\r\n".format(
+          sip=sip, hn=HOSTNAME, i=i) + leg0
+    if t.get("mcast2") and t.get("udp_port2"):
+        leg1 = (
+            "m=video {port} RTP/AVP {pt}\r\n"
+            "c=IN IP4 {mcast}/64\r\n"
+            "a=source-filter: incl IN IP4 {mcast} {sip}\r\n"
+            "a=rtpmap:{pt} raw/90000\r\n"
+            "a=fmtp:{pt} {fmtp}\r\n"
+            "a=mediaclk:direct=0\r\n"
+        ).format(port=int(t["udp_port2"]), pt=pt, mcast=t["mcast2"], sip=sip, fmtp=fmtp)
+        sdp += leg1
+    return sdp
 
 def _anc_sdp(i, t):
-    """SDP ST 2110-40 (ANC / SMPTE 291) d'un slot TX. dest = anc_mcast/anc_port du slot."""
-    return (
-        "v=0\r\n"
-        "o=- 0 0 IN IP4 {sip}\r\n"
-        "s={hn} TX{i} ANC\r\n"
-        "t=0 0\r\n"
+    """SDP ST 2110-40 (ANC) d'un slot TX. Dual-section si anc_mcast2/anc_port2 présents (2022-7)."""
+    sip  = SIP or "0.0.0.0"
+    pt   = int(t.get("anc_pt") or 97)
+    leg0 = (
         "m=video {port} RTP/AVP {pt}\r\n"
         "c=IN IP4 {mcast}/64\r\n"
         "a=source-filter: incl IN IP4 {mcast} {sip}\r\n"
         "a=rtpmap:{pt} smpte291/90000\r\n"
         "a=fmtp:{pt} TP=2110TPN; SSN=ST2110-40:2018;\r\n"
         "a=mediaclk:direct=0\r\n"
-    ).format(sip=SIP or "0.0.0.0", hn=HOSTNAME, i=i,
-             port=int(t.get("anc_port") or 0), pt=int(t.get("anc_pt") or 97),
-             mcast=t.get("anc_mcast") or "0.0.0.0")
+    ).format(port=int(t.get("anc_port") or 0), pt=pt,
+             mcast=t.get("anc_mcast") or "0.0.0.0", sip=sip)
+    sdp = "v=0\r\no=- 0 0 IN IP4 {sip}\r\ns={hn} TX{i} ANC\r\nt=0 0\r\n".format(
+          sip=sip, hn=HOSTNAME, i=i) + leg0
+    if t.get("anc_mcast2") and t.get("anc_port2"):
+        leg1 = (
+            "m=video {port} RTP/AVP {pt}\r\n"
+            "c=IN IP4 {mcast}/64\r\n"
+            "a=source-filter: incl IN IP4 {mcast} {sip}\r\n"
+            "a=rtpmap:{pt} smpte291/90000\r\n"
+            "a=fmtp:{pt} TP=2110TPN; SSN=ST2110-40:2018;\r\n"
+            "a=mediaclk:direct=0\r\n"
+        ).format(port=int(t["anc_port2"]), pt=pt, mcast=t["anc_mcast2"], sip=sip)
+        sdp += leg1
+    return sdp
 
 
 # ─── Patterns numpy (simu) ───────────────────────────────────────────
@@ -883,6 +945,93 @@ def _launch_mtl():
     print("mtl_rx daemon (re)lancé", flush=True)
 
 
+def _tx_gen_apply(idx):
+    """Recalcule shm_in/enabled d'un slot TX selon la priorité : câblage réel > gen > fallback > rien.
+    Appelé après tout changement de cable_shm, user_enabled ou fallback_mode."""
+    with _tx_lock:
+        cable    = _tx[idx].get("cable_shm") or ""
+        fallback = _tx[idx].get("fallback_mode") or "none"
+    with _tx_gen_lock:
+        user_gen = _tx_gen[idx]["user_enabled"]
+
+    if cable:
+        with _tx_lock:
+            _tx[idx]["shm_in"] = cable
+            _tx[idx]["enabled"] = True
+        with _tx_gen_lock:
+            _tx_gen[idx]["enabled"] = False
+    elif user_gen:
+        shm_name = "/dev/shm/{}_txgen_{}".format(HOSTNAME, idx)
+        with _tx_lock:
+            _tx[idx]["shm_in"] = shm_name
+            _tx[idx]["enabled"] = True
+        with _tx_gen_lock:
+            _tx_gen[idx]["enabled"] = True
+    elif fallback != "none":
+        shm_name = "/dev/shm/{}_txgen_{}".format(HOSTNAME, idx)
+        with _tx_lock:
+            _tx[idx]["shm_in"] = shm_name
+            _tx[idx]["enabled"] = True
+        with _tx_gen_lock:
+            _tx_gen[idx]["enabled"] = True
+            _tx_gen[idx]["pattern"] = fallback   # le repli impose sa mire
+    else:
+        with _tx_lock:
+            _tx[idx]["shm_in"] = None
+            _tx[idx]["enabled"] = False
+        with _tx_gen_lock:
+            _tx_gen[idx]["enabled"] = False
+
+
+def _overlay_patch(mm, off, patch_data, lay):
+    """Overlay générique d'un patch ident (plan Y+chroma neutre) haut-droit d'une frame."""
+    if not patch_data:
+        return
+    patch, bw, bh = patch_data
+    w, h = lay["w"], lay["h"]
+    if bw > w or bh > h:
+        return
+    x0 = w - bw - 8; y0 = 8
+    x0 -= x0 % 2; y0 -= y0 % 2
+    if x0 < 0: x0 = 0
+    pp = (patch.astype(np.uint16) << (BIT_DEPTH - 8)) if _DEEP else patch
+    yy = np.frombuffer(mm, dtype=np.dtype(_DT), count=lay["y"] // _BPS, offset=off).reshape(h, w)
+    yy[y0:y0 + bh, x0:x0 + bw] = pp
+    ux0, uy0, ubw, ubh = x0 // _CW, y0 // _CH, bw // _CW, bh // _CH
+    for poff in (off + lay["y"], off + lay["y"] + lay["uv"]):
+        c = np.frombuffer(mm, dtype=np.dtype(_DT), count=lay["uv"] // _BPS, offset=poff).reshape(lay["uv_h"], lay["uv_w"])
+        c[uy0:uy0 + ubh, ux0:ux0 + ubw] = _NEUTRAL
+
+
+def _txgen_ident_patch(idx):
+    """Patch ident pour le générateur TX : nom + mode (GEN/REPLI) + destination."""
+    if not _HAS_PIL:
+        return None
+    with _tx_lock:
+        mcast_s  = _tx[idx].get("mcast") or "?"
+        port_s   = str(_tx[idx].get("udp_port") or 0)
+    with _tx_gen_lock:
+        pat_name  = _tx_gen[idx]["pattern"]
+        user_gen  = _tx_gen[idx]["user_enabled"]
+    mode_label = "GEN" if user_gen else "REPLI"
+    h_ref = HEIGHT
+    size = max(12, h_ref // 28)
+    lines = ["{} TX{}".format(HOSTNAME, idx), "{} · {}".format(mode_label, pat_name), "{}:{}".format(mcast_s, port_s)]
+    font = _font(size)
+    pad = max(3, size // 4); gap = max(1, size // 6)
+    probe = ImageDraw.Draw(Image.new("L", (1, 1)))
+    bboxes = [probe.textbbox((0, 0), ln, font=font) for ln in lines]
+    bw = max(b[2] - b[0] for b in bboxes) + 2 * pad
+    bh = sum(b[3] - b[1] for b in bboxes) + gap * (len(lines) - 1) + 2 * pad
+    bw += bw % 2; bh += bh % 2
+    img = Image.new("L", (bw, bh), 16)
+    d = ImageDraw.Draw(img); cy = pad
+    for ln, b in zip(lines, bboxes):
+        d.text((pad - b[0], cy - b[1]), ln, font=font, fill=235); cy += (b[3] - b[1]) + gap
+    patch = np.frombuffer(img.tobytes(), dtype=np.uint8).reshape(bh, bw)
+    return patch, bw, bh
+
+
 def _manager_loop():
     """Calcule l'ensemble RX voulu (SDP actifs, groupés par source pour le fan-out) et RÉÉCRIT le
     config. Le daemon mtl_rx — lancé UNE fois et MAINTENU en vie (mtl_init à vie) — réconcilie les
@@ -926,11 +1075,14 @@ def _manager_loop():
                 t = _tx[i]
                 if t["enabled"] and t["mcast"] and t["udp_port"] and t["shm_in"]:
                     sessions.append(_tx_session(i, t))
-                # TX audio : jusqu'à 2 flux, shm audio dérivé de la vidéo câblée.
+                # TX audio : jusqu'à 2 flux — shm dérivé si câblé, shm txgen audio si gen sans câblage.
                 for ai, acfg in enumerate(t.get("audios") or []):
                     if not acfg.get("mcast") or not acfg.get("port"):
                         continue
-                    ashm = _derive_audio_shm(t["shm_in"], ai)
+                    if not t.get("cable_shm") and _tx_gen[i]["enabled"]:
+                        ashm = "/dev/shm/{}_audio_txgen_{}_{}".format(HOSTNAME, i, ai)
+                    else:
+                        ashm = _derive_audio_shm(t["shm_in"], ai)
                     if t["enabled"] and ashm:
                         if not ashm.startswith("/"):
                             ashm = "/dev/shm/" + ashm
@@ -999,6 +1151,70 @@ def _simu_loop(idx):
         time.sleep(1.0 / 25)
 
 
+def _txgen_loop(idx):
+    """Écrit une mire SMPTE dans le shm txgen d'un slot TX quand gen est actif.
+    Le shm a le même format que les shm RX (header 64 bytes + ring V_RING × vf) → mtl_rx
+    le lit sans modification. Overlay ident (nom + GEN + destination) via PIL si disponible."""
+    shm_path = "/dev/shm/{}_txgen_{}".format(HOSTNAME, idx)
+    mm = None; res = None; fi = 0; patch = None; patch_age = 0
+    while True:
+        with _tx_gen_lock:
+            gen_on = _tx_gen[idx]["enabled"]
+        if not gen_on:
+            if mm is not None:
+                mm.close(); mm = None; res = None
+            time.sleep(0.1)
+            continue
+        with _tx_lock:
+            w, h, fps = _tx[idx]["w"], _tx[idx]["h"], _tx[idx]["fps"]
+        with _tx_gen_lock:
+            pat = _tx_gen[idx]["pattern"]
+        fps = max(1.0, float(fps or FPS))
+        lay = _layout(w, h)
+        if mm is None or res != (w, h):
+            if mm is not None: mm.close()
+            mm = _open_shm(shm_path, lay["total"]); res = (w, h)
+            patch = None; patch_age = 0   # forcer recalcul ident après resize
+        y_arr, cb_arr, cr_arr = _get_pattern(pat, fi, lay)
+        off = HDR + (fi % V_RING) * lay["vf"]
+        mm[off:off + lay["y"]]                           = y_arr.tobytes()
+        mm[off + lay["y"]:off + lay["y"] + lay["uv"]]   = cb_arr.tobytes()
+        mm[off + lay["y"] + lay["uv"]:off + lay["vf"]]  = cr_arr.tobytes()
+        if patch_age <= 0 or patch is None:
+            patch = _txgen_ident_patch(idx); patch_age = int(fps)  # recalcul 1× par seconde
+        else:
+            patch_age -= 1
+        _overlay_patch(mm, off, patch, lay)
+        mm[0:24] = struct.pack("QQQ", fi, time.time_ns(), 0)
+        fi += 1
+        time.sleep(1.0 / fps)
+
+
+def _txgen_audio_loop(idx, ai):
+    """Génère du silence (s24be 8ch, 1ms par chunk) dans un shm audio txgen d'un slot TX.
+    Utilisé par les sessions audio TX quand gen est actif sans câblage vidéo réel."""
+    A_CHUNK = (48000 // 1000) * A_CHANNELS * 3   # 1152 bytes (1ms, s24be 8ch)
+    shm_path = "/dev/shm/{}_audio_txgen_{}_{}".format(HOSTNAME, idx, ai)
+    size = HDR + A_RING * A_CHUNK
+    silence = bytes(A_CHUNK)
+    mm = None; fi = 0
+    while True:
+        with _tx_gen_lock:
+            gen_on = _tx_gen[idx]["enabled"]
+        if not gen_on:
+            if mm is not None:
+                mm.close(); mm = None
+            time.sleep(0.1)
+            continue
+        if mm is None:
+            mm = _open_shm(shm_path, size)
+        off = HDR + (fi % A_RING) * A_CHUNK
+        mm[off:off + A_CHUNK] = silence
+        mm[0:24] = struct.pack("QQQ", fi, time.time_ns(), 0)
+        fi += 1
+        time.sleep(0.001)   # 1ms
+
+
 def _cleanup(*a):
     # Arrêt du conteneur : teardown gracieux du daemon (SIGTERM → free sessions + mtl_stop/uninit)
     # puis purge XDP (_kill_mtl). C'est le SEUL endroit qui arrête mtl_rx (plus de kill par changement).
@@ -1015,6 +1231,11 @@ signal.signal(signal.SIGINT, _cleanup)
 for _i in range(N_VIDEO):
     threading.Thread(target=_simu_loop, args=(_i,), daemon=True).start()
 threading.Thread(target=_manager_loop, daemon=True).start()
+# Générateur TX : un thread vidéo + 2 threads audio par slot TX (restent en veille si gen off).
+for _i in range(N_TX):
+    threading.Thread(target=_txgen_loop, args=(_i,), daemon=True).start()
+    for _ai in range(2):
+        threading.Thread(target=_txgen_audio_loop, args=(_i, _ai), daemon=True).start()
 
 print("2110_io (docker/af_xdp) multi-session : {}v iface={} lcores={} ring={}".format(
     N_VIDEO, IFACE, LCORES, V_RING), flush=True)

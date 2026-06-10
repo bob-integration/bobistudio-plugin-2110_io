@@ -257,19 +257,19 @@ window.MXLPlugins["2110_io"] = {
            + rows;
     }
 
-    async function refresh(){
-      let c, cs;
-      try { c = await (await fetch(`/api/nmos/receivers/${vmid}/detail`)).json(); }
-      catch(e){ body.innerHTML = '<div class="meta">Détail NMOS indisponible.</div>'; return; }
-      try { const cd = await (await fetch(`/api/nmos/senders/${vmid}/detail`)).json();
-            cs = (cd && cd.length) ? cd[0] : null; }
-      catch(e){ cs = null; }
-      const recvs = (c && c.receivers) || [];
-      const ensembles = groupEnsembles(recvs);
-      const activeCount = recvs.filter(x => x.active).length;
-      const inner = ensembles.length === 0
+    const IO_PAGE = 8;
+    let _visibleGroups  = IO_PAGE;
+    let _cachedEnsembles = [];
+    let _cachedMeta      = '';
+    let _cachedTxHtml    = '';
+
+    function _renderBody() {
+      const ens = _cachedEnsembles;
+      const visible = ens.slice(0, _visibleGroups);
+      const remaining = ens.length - _visibleGroups;
+      const inner = ens.length === 0
         ? `<div class="meta" style="padding:8px 0">Aucun receiver actif</div>`
-        : ensembles.map((g, i) => {
+        : visible.map((g, i) => {
             const rows = [];
             if (g.video) rows.push(rowReceiver(g.video));
             g.audios.forEach(a => rows.push(rowReceiver(a)));
@@ -283,10 +283,31 @@ window.MXLPlugins["2110_io"] = {
               ${rows.join('')}
             </div>`;
           }).join('');
-      const txHtml = renderTXSection(cs && cs.senders);
-      body.innerHTML =
-        `<div class="meta rx-meta">IP : ${esc((c && c.ip) || '—')} — ${recvs.length} receiver(s) NMOS · ${activeCount}/${recvs.length} actif(s)</div>`
-        + inner + txHtml;
+      const moreBtn = remaining > 0
+        ? `<button class="io2110-more-btn">+ ${remaining} source${remaining > 1 ? 's' : ''} de plus</button>`
+        : '';
+      body.innerHTML = _cachedMeta + inner + moreBtn + _cachedTxHtml;
+      if (remaining > 0) {
+        body.querySelector('.io2110-more-btn').onclick = () => {
+          _visibleGroups += IO_PAGE;
+          _renderBody();
+        };
+      }
+    }
+
+    async function refresh(){
+      let c, cs;
+      try { c = await (await fetch(`/api/nmos/receivers/${vmid}/detail`)).json(); }
+      catch(e){ body.innerHTML = '<div class="meta">Détail NMOS indisponible.</div>'; return; }
+      try { const cd = await (await fetch(`/api/nmos/senders/${vmid}/detail`)).json();
+            cs = (cd && cd.length) ? cd[0] : null; }
+      catch(e){ cs = null; }
+      const recvs = (c && c.receivers) || [];
+      const activeCount = recvs.filter(x => x.active).length;
+      _cachedEnsembles = groupEnsembles(recvs);
+      _cachedMeta      = `<div class="meta rx-meta">IP : ${esc((c && c.ip) || '—')} — ${recvs.length} receiver(s) NMOS · ${activeCount}/${recvs.length} actif(s)</div>`;
+      _cachedTxHtml    = renderTXSection(cs && cs.senders);
+      _renderBody();
     }
 
     // Délégation : clic sur un badge IDENT → bascule l'incrustation de ce slot vidéo.

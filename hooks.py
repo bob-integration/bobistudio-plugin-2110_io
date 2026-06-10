@@ -36,6 +36,16 @@ def before_deploy(params, context):
         # ANC TX (1 flux) : plage 239.10.50.x
         t.setdefault("anc_multicast_ip", f"239.10.50.{(vmid + i) % 254 + 1}")
         t.setdefault("anc_dest_port", 5008 + i * 2)
+        # SMPTE 2022-7 — leg1 auto-allouée une seule fois (setdefault : ne pas écraser)
+        if params.get("smpte_2022_7"):
+            t.setdefault("multicast_ip_leg1", f"239.10.130.{(vmid + i) % 254 + 1}")
+            t.setdefault("dest_port_leg1", t.get("dest_port") or 5000)
+            audios = t.get("audios") or []
+            for ai, a in enumerate(audios):
+                a.setdefault("multicast_ip_leg1", f"239.10.{140 + ai}.{base_a}")
+                a.setdefault("dest_port_leg1", a.get("dest_port") or 5004)
+            t.setdefault("anc_multicast_ip_leg1", f"239.10.150.{(vmid + i) % 254 + 1}")
+            t.setdefault("anc_dest_port_leg1", t.get("anc_dest_port") or 5008)
     params["tx_slots"] = slots[:n_tx]
     return params
 
@@ -135,6 +145,22 @@ def control_action(action, body, params, ctx):
         return {"params": params, "hot_endpoint": "/ident",
                 "hot_body": {"idx": idx, "enabled": enabled, "size": size},
                 "vmid": vmid, "idx": idx, "ident": enabled, "size": size}
+
+    if action == "gen_tx":
+        try: idx = int(body.get("idx", -1))
+        except (TypeError, ValueError): idx = -1
+        tx_slots = list(params.get("tx_slots") or [])
+        if not (0 <= idx < len(tx_slots)):
+            raise ValueError(f"slot TX #{idx} hors limites")
+        slots = [dict(s or {}) for s in tx_slots]
+        slots[idx]["gen_enabled"] = bool(body.get("enabled", False))
+        if "pattern" in body:
+            slots[idx]["gen_pattern"] = str(body["pattern"])
+        params = dict(params); params["tx_slots"] = slots
+        return {"params": params, "hot_endpoint": "/gen_tx",
+                "hot_body": {"idx": idx, "enabled": slots[idx]["gen_enabled"],
+                             "pattern": slots[idx].get("gen_pattern", "bars")},
+                "vmid": vmid}
 
     return None
 
