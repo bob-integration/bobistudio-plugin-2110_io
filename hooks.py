@@ -3,7 +3,7 @@
 # Auteur : Cyril Mazouer, pour le compte de BOBI SAS
 # Distribué sous licence GNU GPL v3 (ou ultérieure) ; voir le fichier LICENSE.
 
-"""Hooks orchestrateur (in-process) du plugin receiver_2110_mtl.
+"""Hooks orchestrateur (in-process) du plugin 2110_io.
 
 Même contrat de topologie/ports que receiver_2110 (mêmes shm produits) — le pipeline aval
 (mixer, monitoring…) ne voit aucune différence. La normalisation des comptes/slots réutilise
@@ -103,6 +103,8 @@ def control_action(action, body, params, ctx):
         if not (0 <= idx < len(slots)):
             raise ValueError(f"slot {essence} #{idx} hors limites")
         slots[idx]["enabled"] = enabled
+        if essence == "video" and "pattern" in body:
+            slots[idx]["pattern"] = str(body["pattern"])
         params = dict(params); params[key] = slots
         if enabled:
             params["sim_master"] = True

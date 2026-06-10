@@ -4,7 +4,7 @@
 # Auteur : Cyril Mazouer, pour le compte de BOBI SAS
 # Distribué sous licence GNU GPL v3 (ou ultérieure) ; voir le fichier LICENSE.
 #
-# Contrôleur receiver_2110_mtl — variante DOCKER / AF_XDP (PF, pas de VF).
+# Contrôleur 2110_io — variante DOCKER / AF_XDP (PF, pas de VF).
 #
 # Joue le rôle agent+contrôleur attendu par l'orchestrateur : sert :8080 (métriques, même
 # format que get_metrics) et :8081 (/nmos/subscribe pour recevoir le SDP IS-05 + /status pour
@@ -90,7 +90,8 @@ metrics_lock = threading.Lock()
 # ─── Plan de contrôle par slot (:8082 /gen, /ident) — identique receiver_2110 ──────
 # gen        : force la mire locale (simu) sur ce slot, même si un SDP est actif.
 # ident      : incrustation 3 lignes (nom · source · format) en haut à droite, taille réglable.
-_ctl = [{"gen": False, "ident": False, "ident_size": 0, "info": None} for _ in range(N_VIDEO)]
+_ctl = [{"gen": False, "ident": False, "ident_size": 0, "info": None, "pattern": "bars"}
+        for _ in range(N_VIDEO)]
 _ctl_lock = threading.Lock()
 # Patch IDENT pré-rendu par slot : (patch2D_uint8, bw, bh) ou None. Rendu À CHAQUE CHANGEMENT
 # (pas par frame) → coût CPU nul tant qu'IDENT off. Sert à l'overlay simu (numpy) ET au fichier
@@ -375,6 +376,8 @@ class ControlHandler(BaseHTTPRequestHandler):
         if path == "/gen":          # bascule générateur simu (force la mire sur ce slot)
             with _ctl_lock:
                 _ctl[idx]["gen"] = bool(body.get("enabled"))
+                if "pattern" in body:
+                    _ctl[idx]["pattern"] = str(body["pattern"])
             return self._json(200, {"ok": True})
         if path == "/ident":        # bascule/taille de l'incrustation (à chaud, sans respawn)
             with _ctl_lock:
@@ -705,17 +708,63 @@ def _anc_sdp(i, t):
              mcast=t.get("anc_mcast") or "0.0.0.0")
 
 
+# ─── Patterns numpy (simu) ───────────────────────────────────────────
+_SMPTE_BARS_YUV = [
+    (235, 128, 128), (210,  16, 146), (170, 166,  16), (145,  54,  34),
+    (106, 202, 222), ( 81,  90, 240), ( 41, 240, 110),
+]
+_pattern_cache = {}   # (name, w, h) → (y, cb, cr) arrays
+
+def _scale8(v):
+    return (v << (BIT_DEPTH - 8)) if _DEEP else v
+
+def _build_pattern(name, w, h):
+    dt = np.dtype(_DT)
+    uv_w, uv_h = w // _CW, h // _CH
+    if name == "bars":
+        n = len(_SMPTE_BARS_YUV)
+        bw = w // n
+        y_c, cb_c, cr_c = [], [], []
+        for i, (y, cb, cr) in enumerate(_SMPTE_BARS_YUV):
+            sw  = w   - bw * (n - 1) if i == n - 1 else bw
+            swc = uv_w - (bw // _CW) * (n - 1) if i == n - 1 else bw // _CW
+            y_c.append(np.full((h,    sw),  _scale8(y),  dtype=dt))
+            cb_c.append(np.full((uv_h, swc), _scale8(cb), dtype=dt))
+            cr_c.append(np.full((uv_h, swc), _scale8(cr), dtype=dt))
+        return np.hstack(y_c), np.hstack(cb_c), np.hstack(cr_c)
+    elif name == "gradient":
+        y  = np.tile(np.linspace(_scale8(16), _scale8(235), w).astype(dt), (h, 1))
+        uv = np.full((uv_h, uv_w), _NEUTRAL, dtype=dt)
+        return y, uv, uv.copy()
+    else:  # "black" + fallback
+        y  = np.full((h,    w),    _BLACK,   dtype=dt)
+        uv = np.full((uv_h, uv_w), _NEUTRAL, dtype=dt)
+        return y, uv, uv.copy()
+
+def _get_pattern(name, fi, lay):
+    w, h = lay["w"], lay["h"]
+    dt = np.dtype(_DT)
+    if name == "moving":
+        y   = np.full((h, w), _BLACK, dtype=dt)
+        col = (fi * 8) % w
+        y[:, col:min(col + 8, w)] = _WHITE
+        uv  = np.full((lay["uv_h"], lay["uv_w"]), _NEUTRAL, dtype=dt)
+        return y, uv, uv
+    key = (name, w, h)
+    if key not in _pattern_cache:
+        _pattern_cache[key] = _build_pattern(name, w, h)
+    return _pattern_cache[key]
+
+
 # ─── Simulation (mire numpy, mêmes en-têtes shm) — fallback sans SDP ou GÉN forcé ──
 def _simu_frame(mm, fi, idx, lay):
-    w, h = lay["w"], lay["h"]
-    base = np.full((h, w), _BLACK, dtype=np.dtype(_DT))
-    col = (fi * 8) % w
-    base[:, col:min(col + 8, w)] = _WHITE
-    neutral = np.full((lay["uv_h"], lay["uv_w"]), _NEUTRAL, dtype=np.dtype(_DT)).tobytes()
+    with _ctl_lock:
+        pat = _ctl[idx]["pattern"]
+    y, cb, cr = _get_pattern(pat, fi, lay)
     off = HDR + (fi % V_RING) * lay["vf"]
-    mm[off:off + lay["y"]] = base.tobytes()
-    mm[off + lay["y"]:off + lay["y"] + lay["uv"]] = neutral
-    mm[off + lay["y"] + lay["uv"]:off + lay["y"] + 2 * lay["uv"]] = neutral
+    mm[off:off + lay["y"]]                          = y.tobytes()
+    mm[off + lay["y"]:off + lay["y"] + lay["uv"]]  = cb.tobytes()
+    mm[off + lay["y"] + lay["uv"]:off + lay["vf"]] = cr.tobytes()
     _overlay_simu(mm, off, idx, lay)     # incrustation IDENT (coût nul si off)
     # [index, write_ts, media_ts] — la simu (mire) n'a pas d'horloge média → media_ts=0 (off16),
     # sinon une valeur RX périmée resterait au basculement RX→simu (les consos retombent au nominal).
@@ -902,7 +951,7 @@ for _i in range(N_VIDEO):
     threading.Thread(target=_simu_loop, args=(_i,), daemon=True).start()
 threading.Thread(target=_manager_loop, daemon=True).start()
 
-print("receiver_2110_mtl (docker/af_xdp) multi-session : {}v iface={} lcores={} ring={}".format(
+print("2110_io (docker/af_xdp) multi-session : {}v iface={} lcores={} ring={}".format(
     N_VIDEO, IFACE, LCORES, V_RING), flush=True)
 
 while True:

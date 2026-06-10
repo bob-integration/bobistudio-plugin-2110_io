@@ -1,7 +1,10 @@
 {
-  "version": "0.20.0",
-  "date": "2026-06-08",
+  "version": "0.22.0",
+  "date": "2026-06-09",
   "changes": {
+    "Nouveautés (0.22.0)": [
+      "Patterns de simulation réels dans docker/controller.py (le vrai fichier exécuté par les containers Docker MTL, contrairement à script.py qui est inutilisé pour ce type). 4 patterns numpy pré-calculés : barres SMPTE 100% (7 barres YUV planaires, cachées par (name,w,h)), rampe de luminance, fond noir, barre animée. Cache dynamique adapté à la résolution live (lay). ControlHandler /gen accepte désormais {pattern} et met à jour _ctl[idx]['pattern'] à chaud. UI : sélecteur de mire affiché directement sous le badge GÉN quand il est actif (comme le knob IDENT), plus de tooltip vidéo trompeur."
+    ],
     "Nouveautés (0.20.0)": [
       "Audio TX (×2) + ANC TX : les slots TX émettent désormais jusqu'à 2 flux audio 2110-30 et 1 flux ANC 2110-40 en parallèle de la vidéo. Les shm audio/ANC suivent automatiquement la vidéo câblée (mtl_0 → mtl_audio_0/1, mtl_anc_0). before_deploy auto-alloue les IP multicast (239.10.40-41.x pour audio, 239.10.50.x pour ANC) et ports à chaque slot TX. docker_driver passe la liste audios (remplace les champs singuliers audio_mcast/port). controller : _tx.audios[0/1] + boucle TX par entrée de la liste + _derive_audio_shm(video_shm, idx). NMOS IS-04 : senders audio + ANC enregistrés par slot TX (au lieu de la liste globale du sender_2110). routes api_mtl_tx_dest : paramètre audio_idx pour cibler le flux audio 0 ou 1 indépendamment."
     ],
@@ -85,7 +88,7 @@
       "Panneau de contrôle identique à receiver_2110 : même carte (ensembles vidéo/audio, format, état NMOS, badges GÉN/IDENT/SDP, modale SDP d'abonnement manuel). Données via /api/nmos/receivers/<vmid>/detail + fps live :8080. Hooks control_action (gen/ident) portés. NB : le hot-wire GÉN/IDENT et l'overlay IDENT côté conteneur nécessitent la mise à jour du contrôleur (:8082) — sinon repli redeploy."
     ],
     "Nouveautés (0.6.0)": [
-      "Type Docker-only : manifeste runtime:docker. Un receiver_2110_mtl se crée désormais en un coup sur un nœud Docker (create+deploy atomiques), plus sur un vaisseau LXC. L'orchestrateur refuse de créer un LXC pour ce type sans nœud (Déploiement → Nœuds)."
+      "Type Docker-only : manifeste runtime:docker. Un 2110_io se crée désormais en un coup sur un nœud Docker (create+deploy atomiques), plus sur un vaisseau LXC. L'orchestrateur refuse de créer un LXC pour ce type sans nœud (Déploiement → Nœuds)."
     ],
     "Nouveautés (0.5.0)": [
       "Backend DOCKER (E810 + AF_XDP sur PF, --network host) : nouvelle image self-contained avec un contrôleur Python (docker/controller.py) qui joue le rôle agent+contrôleur — sert :8080 (métriques) et :8081 (/nmos/subscribe pour le SDP IS-05 + /status). À l'activation NMOS, il lance mtl_rx --pmd af_xdp --iface <PF> → shm zéro-copie. Sans SDP : simulation. Piloté par le nouveau driver app/docker_driver.py de l'orchestrateur (fondation cluster multi-nœud).",

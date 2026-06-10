@@ -3,7 +3,7 @@
 # Auteur : Cyril Mazouer, pour le compte de BOBI SAS
 # Distribué sous licence GNU GPL v3 (ou ultérieure) ; voir le fichier LICENSE.
 #
-# receiver_2110_mtl — wrapper Python déployé par l'agent (C3a).
+# 2110_io — wrapper Python déployé par l'agent (C3a).
 # Rôle : à l'activation NMOS IS-05, le service NMOS pousse le SDP dans le container
 # (/tmp/nmos_recv_v_{{idx}}.sdp). Le wrapper le détecte, le PARSE (mcast/port/PT/format) et
 # lance le binaire C `mtl_rx` (libmtl/DPDK) qui reçoit le flux ST 2110 et l'écrit en ZÉRO-COPIE
@@ -16,6 +16,14 @@
 import json, mmap, os, re, signal, struct, subprocess, threading, time
 import numpy as np
 from http.server import HTTPServer, BaseHTTPRequestHandler
+
+try:
+    from PIL import Image, ImageDraw, ImageFont as _IFont
+    _PIL_OK = True
+except ImportError:
+    _PIL_OK = False
+
+_FONT_PATH = "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"
 
 CONFIG          = {config}
 HOSTNAME        = "{hostname}"
@@ -76,6 +84,16 @@ metrics = [{{"idx": i, "essence": "video", "fps": 0.0, "frame_index": 0, "mode":
            for i in range(N_VIDEO)]
 metrics_lock = threading.Lock()
 
+_saved_vslots = CONFIG.get("sim_video_slots") or []
+def _init_slot(i):
+    s = _saved_vslots[i] if i < len(_saved_vslots) else {{}}
+    return {{
+        "pattern":    str(s.get("pattern") or "bars"),
+        "ident":      bool(s.get("ident", False)),
+        "ident_size": max(8, int(s.get("ident_size") or 12)),
+    }}
+sim_state = {{i: _init_slot(i) for i in range(N_VIDEO)}}
+
 
 class MetricsHandler(BaseHTTPRequestHandler):
     def do_GET(self):
@@ -90,10 +108,30 @@ class MetricsHandler(BaseHTTPRequestHandler):
 
 class ControlHandler(BaseHTTPRequestHandler):
     def do_POST(self):
+        try:
+            n = int(self.headers.get("Content-Length") or 0)
+            body = json.loads(self.rfile.read(n)) if n else {{}}
+        except Exception:
+            body = {{}}
+        path = self.path.rstrip("/")
+        if path == "/gen":
+            idx = int(body.get("idx", 0))
+            if 0 <= idx < N_VIDEO:
+                with metrics_lock:
+                    if "pattern" in body:
+                        sim_state[idx]["pattern"] = str(body["pattern"])
+        elif path == "/ident":
+            idx = int(body.get("idx", 0))
+            if 0 <= idx < N_VIDEO:
+                with metrics_lock:
+                    if "enable" in body:
+                        sim_state[idx]["ident"] = bool(int(body["enable"]))
+                    if "size" in body:
+                        sim_state[idx]["ident_size"] = max(8, min(120, int(body["size"])))
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
         self.end_headers()
-        self.wfile.write(b'{{"ok": true, "note": "receiver_2110_mtl"}}')
+        self.wfile.write(b'{{"ok": true}}')
     def log_message(self, *a): pass
 
 
@@ -177,16 +215,96 @@ def _launch_mtl_rx(idx, info):
     return subprocess.Popen(args), stats
 
 
+# ─── Patterns numpy ──────────────────────────────────────────────────
+_SMPTE_BARS_YUV = [
+    (235, 128, 128),
+    (210,  16, 146),
+    (170, 166,  16),
+    (145,  54,  34),
+    (106, 202, 222),
+    ( 81,  90, 240),
+    ( 41, 240, 110),
+]
+_pattern_cache = {{}}
+
+def _scale8(v):
+    return (v << (BIT_DEPTH - 8)) if _DEEP else v
+
+def _build_pattern(name):
+    dt = np.dtype(_DT)
+    if name == "bars":
+        n = len(_SMPTE_BARS_YUV)
+        bw = WIDTH // n
+        y_c, cb_c, cr_c = [], [], []
+        for i, (y, cb, cr) in enumerate(_SMPTE_BARS_YUV):
+            w  = WIDTH  - bw * (n - 1) if i == n - 1 else bw
+            wc = UV_W   - (bw // _CW) * (n - 1) if i == n - 1 else bw // _CW
+            y_c.append(np.full((HEIGHT, w),   _scale8(y),  dtype=dt))
+            cb_c.append(np.full((UV_H,  wc),  _scale8(cb), dtype=dt))
+            cr_c.append(np.full((UV_H,  wc),  _scale8(cr), dtype=dt))
+        return np.hstack(y_c), np.hstack(cb_c), np.hstack(cr_c)
+    elif name == "gradient":
+        y  = np.tile(np.linspace(_scale8(16), _scale8(235), WIDTH).astype(dt), (HEIGHT, 1))
+        uv = np.full((UV_H, UV_W), _NEUTRAL, dtype=dt)
+        return y, uv, uv.copy()
+    else:  # black + fallback
+        y  = np.full((HEIGHT, WIDTH), _BLACK, dtype=dt)
+        uv = np.full((UV_H, UV_W), _NEUTRAL, dtype=dt)
+        return y, uv, uv.copy()
+
+def _get_pattern(name, fi):
+    dt = np.dtype(_DT)
+    if name == "moving":
+        y   = np.full((HEIGHT, WIDTH), _BLACK, dtype=dt)
+        col = (fi * 8) % WIDTH
+        y[:, col:min(col + 8, WIDTH)] = _WHITE
+        uv  = np.full((UV_H, UV_W), _NEUTRAL, dtype=dt)
+        return y, uv, uv
+    if name not in _pattern_cache:
+        _pattern_cache[name] = _build_pattern(name)
+    return _pattern_cache[name]
+
+# ─── Overlay IDENT (Pillow) ──────────────────────────────────────────
+_ident_cache = {{}}
+
+def _render_ident(y_arr, size):
+    if not _PIL_OK:
+        return y_arr
+    ts  = time.strftime("%H:%M:%S")
+    key = (HOSTNAME, ts, size)
+    if key not in _ident_cache:
+        try:
+            font = _IFont.truetype(_FONT_PATH, size)
+        except Exception:
+            font = _IFont.load_default()
+        text = HOSTNAME + "\n" + ts
+        tmp  = Image.new("L", (1, 1))
+        bb   = ImageDraw.Draw(tmp).multiline_textbbox((0, 0), text, font=font)
+        tw, th = bb[2] - bb[0] + 6, bb[3] - bb[1] + 6
+        img  = Image.new("L", (tw, th), 16)
+        ImageDraw.Draw(img).multiline_text((3, 3), text, fill=235, font=font)
+        raw = np.array(img, dtype=np.uint16)
+        arr = (raw << (BIT_DEPTH - 8)).astype(np.dtype(_DT)) if _DEEP else raw.astype(np.dtype(_DT))
+        _ident_cache.clear()
+        _ident_cache[key] = arr
+    bmp = _ident_cache[key]
+    bh, bw = bmp.shape
+    y0 = max(0, HEIGHT - bh - 6);  y1 = min(HEIGHT, y0 + bh)
+    x0 = 6;                         x1 = min(WIDTH,  x0 + bw)
+    y_arr[y0:y1, x0:x1] = bmp[:y1 - y0, :x1 - x0]
+    return y_arr
+
 # ─── Simulation (fallback sans SDP) — mire numpy, mêmes en-têtes shm ──
-def _simu_frame(mm, fi):
-    base = np.full((HEIGHT, WIDTH), _BLACK, dtype=np.dtype(_DT))
-    col = (fi * 8) % WIDTH
-    base[:, col:min(col + 8, WIDTH)] = _WHITE
-    neutral = np.full((UV_H, UV_W), _NEUTRAL, dtype=np.dtype(_DT)).tobytes()
+def _simu_frame(mm, fi, idx):
+    with metrics_lock:
+        state = dict(sim_state[idx])
+    y, cb, cr = _get_pattern(state["pattern"], fi)
+    if state["ident"]:
+        y = _render_ident(y.copy(), state["ident_size"])
     off = HDR + (fi % V_RING) * V_FRAME_SIZE
-    mm[off:off + Y_SIZE] = base.tobytes()
-    mm[off + Y_SIZE:off + Y_SIZE + UV_SIZE] = neutral
-    mm[off + Y_SIZE + UV_SIZE:off + Y_SIZE + 2 * UV_SIZE] = neutral
+    mm[off:off + Y_SIZE]                          = y.tobytes()
+    mm[off + Y_SIZE:off + Y_SIZE + UV_SIZE]       = cb.tobytes()
+    mm[off + Y_SIZE + UV_SIZE:off + V_FRAME_SIZE] = cr.tobytes()
     mm[0:16] = struct.pack("QQ", fi, time.time_ns())
 
 
@@ -221,10 +339,18 @@ def video_slot(idx):
         if info:
             key = (info["mcast"], info["port"], info["pt"], info["width"],
                    info["height"], info["fps"], info["interlaced"])
-            if key != cur_key or (proc and proc.poll() is not None):
+            crashed = proc and proc.poll() is not None
+            if crashed:
+                rc = proc.poll()
+                print("mtl_rx crash idx={{}} rc={{}} — redémarrage dans 5 s".format(idx, rc), flush=True)
+                with metrics_lock:
+                    metrics[idx]["mode"] = "crashed"
+                    metrics[idx]["fps"] = 0.0
+                time.sleep(5)
+            if key != cur_key or crashed:
                 if sim_mm is not None:
                     sim_mm.close(); sim_mm = None
-                if proc:
+                if proc and not crashed:
                     proc.terminate()
                     try: proc.wait(timeout=3)
                     except Exception: proc.kill()
@@ -246,7 +372,7 @@ def video_slot(idx):
                 proc = None; cur_key = None
             if sim_mm is None:
                 sim_mm = _open_shm("/dev/shm/{{}}_{{}}".format(HOSTNAME, idx), V_TOTAL_SIZE)
-            _simu_frame(sim_mm, fi)
+            _simu_frame(sim_mm, fi, idx)
             fi += 1
             if fi % 25 == 0:
                 with metrics_lock:
@@ -263,7 +389,7 @@ signal.signal(signal.SIGTERM, _cleanup)
 for _i in range(N_VIDEO):
     threading.Thread(target=video_slot, args=(_i,), daemon=True).start()
 
-print("receiver_2110_mtl {{}} : {{}}v/{{}}a, vf={{}} lcores={{}} ring={{}} mtl_rx={{}} (C3a)".format(
+print("2110_io {{}} : {{}}v/{{}}a, vf={{}} lcores={{}} ring={{}} mtl_rx={{}} (C3a)".format(
     PLUGIN_VERSION, N_VIDEO, N_AUDIO, VF_PCI or "-", LCORES or "-", V_RING, MTL_RX), flush=True)
 
 while True:

@@ -1,18 +1,19 @@
 {
   "license": "GPL-3.0-or-later",
-  "type": "receiver_2110_mtl",
-  "label": "receiver_2110_mtl",
+  "type": "2110_io",
+  "label": "2110_io",
   "runtime": "docker",
   "needs_nic": true,
   "needs_dpdk": true,
   "badge": {
     "label": "MTL",
-    "class": "mode-receiver"
+    "class": "mode-receiver",
+    "oklch": "0.76 0.05 220"
   },
   "nmos_role": "both",
   "split_io": true,
   "deploy_order": 0,
-  "version": "0.20.0",
+  "version": "0.22.0",
   "adapts_input": true,
   "description": "Receiver ST 2110 via Media Transport Library (MTL/DPDK, kernel-bypass). Réception st20p/st30p écrite en zéro-copie dans le ring shared memory par un binaire C natif (libmtl), exposé en NMOS IS-04/05. Variante haute performance de receiver_2110 (mêmes shm produits). Mode simulation par slot tant que la source n'est pas activée.",
   "nav": {
