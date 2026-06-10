@@ -44,12 +44,13 @@
     "control_css": "control.css"
   },
   "deploy_defaults": {
-    "video_count": 1,
-    "audio_count": 0,
-    "anc_count": 0,
-    "tx_count": 0,
+    "video_count": 25,
+    "audio_count": 50,
+    "anc_count": 1,
+    "tx_count": 25,
     "tx_slots": [],
-    "smpte_2022_7": false
+    "smpte_2022_7": false,
+    "tx_fallback": "black"
   },
   "config_schema": [
     {
@@ -57,6 +58,13 @@
       "type": "bool",
       "label": "SMPTE 2022-7 (dual-path redondant)",
       "default": false
+    },
+    {
+      "key": "tx_fallback",
+      "type": "select",
+      "label": "Repli TX sans signal (toutes sorties)",
+      "options": ["none", "black", "bars"],
+      "default": "black"
     }
   ],
   "wiring": {
