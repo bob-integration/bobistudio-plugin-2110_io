@@ -48,6 +48,8 @@
     "audio_count": 50,
     "anc_count": 1,
     "tx_count": 25,
+    "active_rx_count": 8,
+    "active_tx_count": 8,
     "tx_slots": [],
     "smpte_2022_7": false,
     "tx_fallback": "black"
