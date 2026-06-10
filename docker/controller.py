@@ -33,6 +33,53 @@ A_RING     = max(2, int(os.environ.get("AUDIO_RING") or 100))   # ring shm audio
 # Ptime audio (ST 2110-30) par DÉFAUT (ms) — repli quand le SDP n'a pas d'a=ptime. Réglable par
 # installation (setting mtl_audio_ptime → env AUDIO_PTIME). Le SDP a=ptime PRIME (auto par entrée).
 A_PTIME_DEF = float(os.environ.get("AUDIO_PTIME") or 1.0)
+_cpu_last_usec = None
+_cpu_last_time = None
+
+
+def _cgroup_cpu_usec():
+    try:
+        with open("/sys/fs/cgroup/cpu.stat") as f:
+            for line in f:
+                if line.startswith("usage_usec"):
+                    return int(line.split()[1])
+    except Exception:
+        pass
+    return None
+
+
+def _cgroup_mem():
+    used = limit = None
+    try:
+        with open("/sys/fs/cgroup/memory.current") as f:
+            used = int(f.read().strip())
+    except Exception:
+        pass
+    try:
+        with open("/sys/fs/cgroup/memory.max") as f:
+            s = f.read().strip()
+            limit = 0 if s == "max" else int(s)
+    except Exception:
+        pass
+    return used, limit
+
+
+def _get_n_cpus():
+    """Cores alloués : quota cpu.max (--cpus X) prioritaire, sinon affinity (--cpuset-cpus)."""
+    try:
+        with open("/sys/fs/cgroup/cpu.max") as f:
+            parts = f.read().strip().split()
+            if parts[0] != "max":
+                return max(1, round(int(parts[0]) / int(parts[1])))
+    except Exception:
+        pass
+    try:
+        return max(1, len(os.sched_getaffinity(0)))
+    except Exception:
+        pass
+    return 1
+
+
 IFACE      = os.environ.get("IFACE") or "ens1f0np0"
 LCORES     = os.environ.get("LCORES") or "1,2,3"
 V_RING     = max(2, int(os.environ.get("RING") or 8))   # ring du pipeline (réglage) ; mtl_rx borne ≤8
@@ -253,6 +300,24 @@ class AgentHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         if self.path.rstrip("/") == "/status":
             return self._json(200, {"running": True})
+        if self.path.rstrip("/") == "/stats":
+            global _cpu_last_usec, _cpu_last_time
+            now  = time.monotonic()
+            usec = _cgroup_cpu_usec()
+            mem_used, mem_limit = _cgroup_mem()
+            n_cpus = _get_n_cpus()
+            cpu_pct = None
+            if usec is not None and _cpu_last_usec is not None and _cpu_last_time is not None:
+                delta_wall = (now - _cpu_last_time) * 1_000_000
+                if delta_wall > 0:
+                    cpu_pct = round(
+                        max(0.0, min(100.0, (usec - _cpu_last_usec) / delta_wall / n_cpus * 100)), 1
+                    )
+            if usec is not None:
+                _cpu_last_usec = usec
+                _cpu_last_time = now
+            return self._json(200, {"cpu_pct": cpu_pct, "mem_used": mem_used,
+                                    "mem_limit": mem_limit, "cpu_count": n_cpus})
         return self._json(404, {"error": "not found"})
 
     def do_POST(self):
