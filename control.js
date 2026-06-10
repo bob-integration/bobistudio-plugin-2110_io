@@ -257,19 +257,16 @@ window.MXLPlugins["2110_io"] = {
            + rows;
     }
 
-    const IO_PAGE = 8;
-    let _visibleGroups  = IO_PAGE;
     let _cachedEnsembles = [];
     let _cachedMeta      = '';
     let _cachedTxHtml    = '';
+    let _cachedVideoCount = 0;  // capacité totale déployée
 
     function _renderBody() {
       const ens = _cachedEnsembles;
-      const visible = ens.slice(0, _visibleGroups);
-      const remaining = ens.length - _visibleGroups;
       const inner = ens.length === 0
         ? `<div class="meta" style="padding:8px 0">Aucun receiver actif</div>`
-        : visible.map((g, i) => {
+        : ens.map((g, i) => {
             const rows = [];
             if (g.video) rows.push(rowReceiver(g.video));
             g.audios.forEach(a => rows.push(rowReceiver(a)));
@@ -283,14 +280,23 @@ window.MXLPlugins["2110_io"] = {
               ${rows.join('')}
             </div>`;
           }).join('');
+      const remaining = _cachedVideoCount - ens.length;
       const moreBtn = remaining > 0
-        ? `<button class="io2110-more-btn">+ Ajouter une source</button>`
+        ? `<button class="io2110-more-btn">+ Ajouter une source · ${remaining} disponible${remaining > 1 ? 's' : ''}</button>`
         : '';
       body.innerHTML = _cachedMeta + inner + moreBtn + _cachedTxHtml;
       if (remaining > 0) {
-        body.querySelector('.io2110-more-btn').onclick = () => {
-          _visibleGroups += 1;
-          _renderBody();
+        body.querySelector('.io2110-more-btn').onclick = async (btn) => {
+          const el = body.querySelector('.io2110-more-btn');
+          if (el) el.disabled = true;
+          try {
+            const r = await fetch(`/api/mtl/${vmid}/activate`, {
+              method: 'POST', headers: {'Content-Type': 'application/json'},
+              body: JSON.stringify({kind: 'rx'}),
+            });
+            if (!r.ok) { const j = await r.json().catch(()=>({})); toast(j.error || 'Erreur activation RX', 'error'); }
+          } catch(e) { toast('Erreur réseau', 'error'); }
+          await refresh();
         };
       }
     }
@@ -304,8 +310,9 @@ window.MXLPlugins["2110_io"] = {
       catch(e){ cs = null; }
       const recvs = (c && c.receivers) || [];
       const activeCount = recvs.filter(x => x.active).length;
+      _cachedVideoCount = (c && c.video_count) || recvs.length;
       _cachedEnsembles = groupEnsembles(recvs);
-      _cachedMeta      = `<div class="meta rx-meta">IP : ${esc((c && c.ip) || '—')} — ${recvs.length} receiver(s) NMOS · ${activeCount}/${recvs.length} actif(s)</div>`;
+      _cachedMeta      = `<div class="meta rx-meta">IP : ${esc((c && c.ip) || '—')} — ${recvs.length} / ${_cachedVideoCount} sources · ${activeCount} abonné${activeCount > 1 ? 's' : ''}</div>`;
       _cachedTxHtml    = renderTXSection(cs && cs.senders);
       _renderBody();
     }

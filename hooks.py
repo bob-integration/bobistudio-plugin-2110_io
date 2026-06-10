@@ -47,6 +47,13 @@ def before_deploy(params, context):
             t.setdefault("anc_multicast_ip_leg1", f"239.10.150.{(vmid + i) % 254 + 1}")
             t.setdefault("anc_dest_port_leg1", t.get("anc_dest_port") or 5008)
     params["tx_slots"] = slots[:n_tx]
+    # active_rx_count / active_tx_count : combien de slots apparaissent dans NMOS.
+    # setdefault → préservé lors des re-déploiements (l'opérateur a peut-être activé des slots).
+    nv = int(params.get("video_count") or 0)
+    params.setdefault("active_rx_count", min(8, nv))
+    params["active_rx_count"] = max(0, min(int(params["active_rx_count"] or 0), nv))
+    params.setdefault("active_tx_count", min(8, n_tx))
+    params["active_tx_count"] = max(0, min(int(params["active_tx_count"] or 0), n_tx))
     return params
 
 
