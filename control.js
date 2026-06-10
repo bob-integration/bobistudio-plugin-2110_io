@@ -265,7 +265,7 @@ window.MXLPlugins["2110_io"] = {
       const col = pct > 80 ? 'var(--status-stopped-fg,#f87171)' : pct > 60 ? '#e8a33d' : 'var(--status-running-fg,#22c55e)';
       return `<div class="nic-bar-wrap">
         <span class="nic-bar-lbl">${label}</span>
-        <span class="nic-bar-val${isEst ? ' nic-bar-est' : ''}" style="color:${col}">${isEst ? '~' : ''}${val.toFixed(1)} / ${cap} Gbps (${pct}%)</span>
+        <span class="nic-bar-val${isEst ? ' nic-bar-est' : ''}" style="color:${col}">${isEst ? '~' : ''}${val.toFixed(1)} / ${cap} Gbps (${pct}%)${isEst ? ' (estimation)' : ''}</span>
         <div class="nic-bar-track"><div class="nic-bar-fill" style="width:${pct}%;background:${col}"></div></div>
       </div>`;
     }
