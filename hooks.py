@@ -19,6 +19,10 @@ def before_deploy(params, context):
     params = normalize_receiver_params(params, settings=context.get("settings"))
     vmid = int(context.get("vmid", 0))
     n_tx = int(params.get("tx_count") or 0)
+    # Nombre de flux audio PAR slot TX = ratio audio_count/tx_count (≥1). Chaque slot actif consomme
+    # ainsi 1 vidéo + N audio + 1 ANC ; avec N=1 → 3 queues AF_XDP/slot, ce qui fait coller la maths
+    # du budget (active*3) côté orchestrateur et évite la sur-souscription des queues.
+    n_aud_per_tx = max(1, (int(params.get("audio_count") or 0) // n_tx) if n_tx else 1)
     slots = [dict(t or {}) for t in (params.get("tx_slots") or [])]
     while len(slots) < n_tx:
         slots.append({})
@@ -26,13 +30,16 @@ def before_deploy(params, context):
         t.setdefault("multicast_ip", f"239.10.30.{(vmid + i) % 254 + 1}")
         t.setdefault("dest_port", 5000)
         t.setdefault("payload_type", 96)
-        # Audio TX (jusqu'à 2 flux) : plages 239.10.40.x et 239.10.41.x
+        # Audio TX : n_aud_per_tx flux — plages 239.10.40.x, 239.10.41.x, …
         base_a = (vmid * 2 + i) % 254 + 1
         audios_alloc = [
             {"multicast_ip": f"239.10.{40 + ai}.{base_a}", "dest_port": 5004 + i * 4 + ai * 2}
-            for ai in range(2)
+            for ai in range(n_aud_per_tx)
         ]
-        t.setdefault("audios", audios_alloc)
+        # Complète depuis l'existant si présent, sinon alloue ; TRONQUE au ratio (un container
+        # legacy provisionné avec 2 audios/slot repasse à 1 au prochain redéploiement → fin de la
+        # sur-souscription « 2 audios par TX »).
+        t["audios"] = ((t.get("audios") or []) + audios_alloc)[:n_aud_per_tx]
         # ANC TX (1 flux) : plage 239.10.50.x
         t.setdefault("anc_multicast_ip", f"239.10.50.{(vmid + i) % 254 + 1}")
         t.setdefault("anc_dest_port", 5008 + i * 2)

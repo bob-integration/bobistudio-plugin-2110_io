@@ -1,7 +1,11 @@
 {
-  "version": "0.22.0",
-  "date": "2026-06-09",
+  "version": "0.22.1",
+  "date": "2026-06-11",
   "changes": {
+    "Corrections (0.22.1)": [
+      "Sur-souscription des queues AF_XDP corrigée. Le repli (tx_fallback=black, défaut) activait l'émission de noir sur TOUS les slots TX provisionnés (jusqu'à tx_count) → avec tx_count=25, 25 slots × (1 vidéo + 2 audio + 1 ANC) = ~100 sessions saturant les 48 combined queues de la NIC (hw_xdp_available=0) → la réception 2110 réelle ne pouvait plus obtenir de queue. Désormais : (1) controller _tx_gen_apply force enabled=False sur tout slot d'indice ≥ ACTIVE_TX_C (aucune émission, même pas le repli noir) et la boucle de sessions TX est plafonnée à min(N_TX, ACTIVE_TX_C) ; (2) hook before_deploy alloue n_aud_per_tx = max(1, audio_count // tx_count) flux audio par slot (1 quand 1:1) et TRONQUE les slots legacy à 2 audios → chaque slot actif = 3 queues, la maths du budget (active*3) tient. Seuls les ACTIVE_TX_C premiers slots émettent ; les slots provisionnés au-delà restent silencieux (réserve pour le bouton « + Ajouter un TX » jusqu'au budget de queues).",
+      "Orchestrateur (sans rebuild) : _compute_receivers_detail ne lève plus de 500 quand le /metrics :8080 d'un container est injoignable (data={} initialisé avant le fetch ; le passthrough XDP référençait data sans garde) — la page Sources et l'onglet Destinations 2110 dégradent proprement au lieu de casser."
+    ],
     "Nouveautés (0.22.0)": [
       "Patterns de simulation réels dans docker/controller.py (le vrai fichier exécuté par les containers Docker MTL, contrairement à script.py qui est inutilisé pour ce type). 4 patterns numpy pré-calculés : barres SMPTE 100% (7 barres YUV planaires, cachées par (name,w,h)), rampe de luminance, fond noir, barre animée. Cache dynamique adapté à la résolution live (lay). ControlHandler /gen accepte désormais {pattern} et met à jour _ctl[idx]['pattern'] à chaud. UI : sélecteur de mire affiché directement sous le badge GÉN quand il est actif (comme le knob IDENT), plus de tooltip vidéo trompeur."
     ],
