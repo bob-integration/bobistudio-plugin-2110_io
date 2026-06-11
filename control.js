@@ -280,6 +280,7 @@ window.MXLPlugins["2110_io"] = {
     let _cachedMeta      = '';
     let _cachedTxHtml    = '';
     let _cachedVideoCount = 0;  // capacité totale déployée
+    let _cachedActiveRx   = 0;  // slots simultanés autorisés (active_rx_count)
 
     function _renderBody() {
       const ens = _cachedEnsembles;
@@ -299,7 +300,7 @@ window.MXLPlugins["2110_io"] = {
               ${rows.join('')}
             </div>`;
           }).join('');
-      const remaining = _cachedVideoCount - ens.length;
+      const remaining = _cachedActiveRx - ens.length;
       const moreBtn = remaining > 0
         ? `<button class="io2110-more-btn">+ Ajouter une source · ${remaining} disponible${remaining > 1 ? 's' : ''}</button>`
         : '';
@@ -330,6 +331,7 @@ window.MXLPlugins["2110_io"] = {
       const recvs = (c && c.receivers) || [];
       const activeCount = recvs.filter(x => x.active).length;
       _cachedVideoCount = (c && c.video_count) || recvs.length;
+      _cachedActiveRx   = (c && c.active_rx_count) || _cachedVideoCount;
       _cachedEnsembles = groupEnsembles(recvs);
       const _nicPortCap = (c && c.nic_port_capacity_gbps) || 100;
       const _nicAgg     = (c && c.nic_aggregate_gbps)     || 100;
@@ -338,7 +340,27 @@ window.MXLPlugins["2110_io"] = {
         (c && c.nic_rx_gbps != null) ? c.nic_rx_gbps : null,
         (c && c.nic_rx_estimated_gbps != null) ? c.nic_rx_estimated_gbps : null,
         _nicPortCap, 'RX');
-      _cachedMeta = `<div class="meta rx-meta">IP : ${esc((c && c.ip) || '—')} — ${recvs.length} / ${_cachedVideoCount} sources · ${activeCount} abonné${activeCount > 1 ? 's' : ''}</div>${_nicH}${_nicRxBar}`;
+      const _xdpAlloc   = c && c.xdp_allocated;
+      const _xdpAct     = (c && c.xdp_active) ?? 0;
+      const _xdpHwMax   = c && c.xdp_hw_max_combined;
+      const _xdpHwCur   = c && c.xdp_hw_current_combined;
+      const _xdpHwAvail = c && c.xdp_hw_xdp_available;
+      const _xdpUsedPct = _xdpAlloc ? Math.min(100, Math.round(_xdpAct / _xdpAlloc * 100)) : 0;
+      const _xdpHwPct   = _xdpHwMax  ? Math.min(100, Math.round(_xdpHwAvail / _xdpHwMax * 100)) : 0;
+      const _xdpColU = _xdpUsedPct > 80 ? 'var(--status-stopped-fg,#f87171)' : _xdpUsedPct > 60 ? '#e8a33d' : 'var(--status-running-fg,#22c55e)';
+      const _xdpColH = (_xdpHwAvail != null && _xdpHwAvail < (_xdpAlloc || 0))
+          ? 'var(--status-stopped-fg,#f87171)' : 'var(--status-running-fg,#22c55e)';
+      const _nicXdpBar = _xdpAlloc != null ? `<div class="nic-bar-wrap">
+        <span class="nic-bar-lbl">XDP sessions</span>
+        <span class="nic-bar-val" style="color:${_xdpColU}">${_xdpAct} / ${_xdpAlloc} allouées (${_xdpUsedPct}%)</span>
+        <div class="nic-bar-track"><div class="nic-bar-fill" style="width:${_xdpUsedPct}%;background:${_xdpColU}"></div></div>
+      </div>
+      <div class="nic-bar-wrap">
+        <span class="nic-bar-lbl">Queues XDP dispo</span>
+        <span class="nic-bar-val" style="color:${_xdpColH}">${_xdpHwAvail ?? '?'} / ${_xdpHwMax ?? '?'} <span class="nic-bar-est">(kernel: ${_xdpHwCur ?? '?'})</span></span>
+        <div class="nic-bar-track"><div class="nic-bar-fill" style="width:${_xdpHwPct}%;background:${_xdpColH}"></div></div>
+      </div>` : '';
+      _cachedMeta = `<div class="meta rx-meta">IP : ${esc((c && c.ip) || '—')} — ${recvs.length} / ${_cachedVideoCount} sources · ${activeCount} abonné${activeCount > 1 ? 's' : ''}</div>${_nicH}${_nicRxBar}${_nicXdpBar}`;
       _cachedTxHtml    = renderTXSection(cs && cs.senders);
       _renderBody();
     }

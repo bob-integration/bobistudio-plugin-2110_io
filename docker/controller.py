@@ -33,9 +33,12 @@ A_RING     = max(2, int(os.environ.get("AUDIO_RING") or 100))   # ring shm audio
 # Ptime audio (ST 2110-30) par DÉFAUT (ms) — repli quand le SDP n'a pas d'a=ptime. Réglable par
 # installation (setting mtl_audio_ptime → env AUDIO_PTIME). Le SDP a=ptime PRIME (auto par entrée).
 A_PTIME_DEF = float(os.environ.get("AUDIO_PTIME") or 1.0)
+ACTIVE_RX   = int(os.environ.get("ACTIVE_RX_COUNT") or min(6, max(1, N_VIDEO)))
+ACTIVE_TX_C = int(os.environ.get("ACTIVE_TX_COUNT") or min(6, max(0, N_TX)))
 _cpu_last_usec = None
 _cpu_last_time = None
 _bw_last = {}
+_xdp_sessions_active = 0
 # subsystem_device → (label, aggregate_gbps)  — source: Intel product brief + sysfs
 _E810_MODELS = {
     "0x0002": ("E810-CQDA2", 100),   # E810-C for QSFP 2-port, 1 controller (node-1 confirmé)
@@ -53,21 +56,59 @@ def _nic_model(iface):
         return ("E810 QSFP", 100)
 
 
-def _nic_bps(iface):
-    global _bw_last
+def _nic_hw_queues(iface):
+    """Lit le nombre de combined queues via ethtool -l (max carte + actuel kernel).
+    Retourne {"max": 48, "current": 4, "xdp_available": 44} ou None en cas d'erreur.
+    Ré-interrogé à chaque appel (valeur change après réglage depuis l'UI Réglages)."""
     try:
-        rx  = int(open(f"/sys/class/net/{iface}/statistics/rx_bytes").read())
-        tx  = int(open(f"/sys/class/net/{iface}/statistics/tx_bytes").read())
+        out = subprocess.run(["ethtool", "-l", iface],
+                             capture_output=True, text=True, timeout=3).stdout
+        m_max = re.search(r"Pre-set maximums.*?Combined:\s*(\d+)", out, re.S)
+        m_cur = re.search(r"Current hardware settings.*?Combined:\s*(\d+)", out, re.S)
+        if not m_max or not m_cur:
+            return None
+        hw_max = int(m_max.group(1))
+        hw_cur = int(m_cur.group(1))
+        return {"max": hw_max, "current": hw_cur, "xdp_available": hw_max - hw_cur}
+    except Exception:
+        return None
+
+
+def _nic_bps(iface):
+    """Débit RX/TX via ethtool -S (compteurs matériels, inclut AF_XDP zero-copy).
+    sysfs statistics/tx_bytes ne compte PAS le trafic AF_XDP → toujours 0 pour MTL."""
+    global _bw_last
+    now = time.monotonic()
+    try:
         cap = int(open(f"/sys/class/net/{iface}/speed").read().strip()) / 1000
     except Exception:
-        return None, None, 100.0
-    now = time.monotonic()
-    last, _bw_last = _bw_last, {"rx": rx, "tx": tx, "t": now}
+        cap = 100.0
+    last = _bw_last
+    # Cache : évite d'appeler ethtool à chaque requête :8080 (coût ~3 ms)
+    if last and now < last.get("t", 0) + 0.5:
+        return last.get("rx_gbps"), last.get("tx_gbps"), cap
+    try:
+        out = subprocess.run(["ethtool", "-S", iface],
+                             capture_output=True, text=True, timeout=3).stdout
+        def _stat(name):
+            vals = re.findall(r"^\s+" + re.escape(name) + r":\s*(\d+)", out, re.M)
+            return int(vals[-1]) if vals else None
+        rx = _stat("rx_bytes")
+        tx = _stat("tx_bytes")
+    except Exception:
+        _bw_last = {"rx": None, "tx": None, "t": now, "rx_gbps": None, "tx_gbps": None}
+        return None, None, cap
+    if rx is None or tx is None:
+        _bw_last = {"rx": None, "tx": None, "t": now, "rx_gbps": None, "tx_gbps": None}
+        return None, None, cap
+    rx_gbps = tx_gbps = None
     if last and last.get("rx") is not None and now > last.get("t", 0) + 0.5:
         dt = now - last["t"]
-        return (round((rx - last["rx"]) * 8 / dt / 1e9, 2),
-                round((tx - last["tx"]) * 8 / dt / 1e9, 2), cap)
-    return None, None, cap
+        if dt > 0:
+            rx_gbps = round((rx - last["rx"]) * 8 / dt / 1e9, 2)
+            tx_gbps = round((tx - last["tx"]) * 8 / dt / 1e9, 2)
+    _bw_last = {"rx": rx, "tx": tx, "t": now, "rx_gbps": rx_gbps, "tx_gbps": tx_gbps}
+    return rx_gbps, tx_gbps, cap
 
 
 def _cgroup_cpu_usec():
@@ -280,6 +321,15 @@ def _overlay_simu(mm, off, idx, lay):
         c[uy0:uy0 + ubh, ux0:ux0 + ubw] = _NEUTRAL
 
 
+def _read_tx_fps(idx):
+    try:
+        with open("/tmp/mtl_tx{}.json".format(idx)) as f:
+            d = json.load(f)
+        return float(d.get("fps", 0.0))
+    except Exception:
+        return None
+
+
 # ─── :8080 métriques (format get_metrics) ────────────────────────────
 class MetricsHandler(BaseHTTPRequestHandler):
     def do_GET(self):
@@ -312,18 +362,27 @@ class MetricsHandler(BaseHTTPRequestHandler):
                 if t["enabled"] and t["shm_in"] and t.get("lat_ms") is not None:
                     inputs_lat = {t["shm_in"]: t["lat_ms"]}
                 if t["mcast"] and t["udp_port"]:
-                    senders.append({"tx_idx": i, "essence": "video", "sdp": _tx_sdp(i, t),
+                    tx_fps = _read_tx_fps(i)
+                    senders.append({"tx_idx": i, "idx": i, "essence": "video",
+                                    "fps": tx_fps, "sdp": _tx_sdp(i, t),
                                     "inputs_latency_ms": inputs_lat})
                 if t.get("anc_mcast") and t.get("anc_port"):
-                    senders.append({"tx_idx": i, "essence": "anc", "sdp": _anc_sdp(i, t),
+                    senders.append({"tx_idx": i, "idx": i, "essence": "anc",
+                                    "sdp": _anc_sdp(i, t),
                                     "inputs_latency_ms": inputs_lat})
         rx_gbps, tx_gbps, port_cap = _nic_bps(IFACE)
         model_label, aggregate_gbps = _nic_model(IFACE)
+        hw_q = _nic_hw_queues(IFACE)
         payload = {"fps": top_fps, "receivers": recs, "senders": senders,
                    "nic": {"rx_gbps": rx_gbps, "tx_gbps": tx_gbps,
                             "port_capacity_gbps": port_cap,
                             "aggregate_gbps": aggregate_gbps,
-                            "model": model_label}}
+                            "model": model_label},
+                   "xdp": {"allocated":           ACTIVE_RX * 3 + ACTIVE_TX_C * 3,
+                            "active":              _xdp_sessions_active,
+                            "hw_max_combined":     hw_q["max"]          if hw_q else None,
+                            "hw_current_combined": hw_q["current"]       if hw_q else None,
+                            "hw_xdp_available":    hw_q["xdp_available"] if hw_q else None}}
         self.wfile.write(json.dumps(payload).encode())
     def log_message(self, *a): pass
 
@@ -967,7 +1026,7 @@ def _write_config(sessions):
     désirées. Le daemon détecte le changement de mtime et RÉCONCILIE à chaud — aucune relance."""
     with open(_CONFIG_PATH, "w") as f:
         json.dump({"pmd": "af_xdp", "iface": IFACE, "lcores": LCORES, "sip": SIP,
-                   "rx_queues": max(1, N_VIDEO + N_AUDIO + N_ANC), "tx_queues": max(1, N_TX * 3 + 1),
+                   "rx_queues": max(1, ACTIVE_RX * 3), "tx_queues": max(1, ACTIVE_TX_C * 3),
                    "sessions": sessions}, f)
 
 
@@ -1076,7 +1135,7 @@ def _manager_loop():
     config. Le daemon mtl_rx — lancé UNE fois et MAINTENU en vie (mtl_init à vie) — réconcilie les
     sessions à chaud : plus de kill/relance, ptp4l ne faute qu'au 1er lancement. On ne relance QUE
     si le daemon meurt (crash), avec backoff + purge XDP."""
-    global _mtl_proc, _cur_sig, _fail_streak
+    global _mtl_proc, _cur_sig, _fail_streak, _xdp_sessions_active
     while True:
         groups = {}        # (mcast, port) → {"info": sdp, "idxs": [..]} — fan-out même-source
         for idx in range(N_VIDEO):
@@ -1139,6 +1198,7 @@ def _manager_loop():
             with _mtl_lock:
                 _write_config(sessions)
             _cur_sig = sig
+            _xdp_sessions_active = len(sessions)
             print("mtl_rx config: {} session(s)".format(len(sessions)), flush=True)
 
         # 2) cycle de vie : lancé 1× au 1er besoin, maintenu en vie ; relancé seulement s'il a crashé
