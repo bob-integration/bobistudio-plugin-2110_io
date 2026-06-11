@@ -1303,16 +1303,29 @@ def _txgen_loop(idx):
 
 
 def _txgen_audio_loop(idx, ai):
-    """Génère du silence (s24be 8ch, 1ms par chunk) dans un shm audio txgen d'un slot TX.
-    Utilisé par les sessions audio TX quand gen est actif sans câblage vidéo réel."""
-    A_CHUNK = (48000 // 1000) * A_CHANNELS * 3   # 1152 bytes (1ms, s24be 8ch)
+    """Génère l'audio de repli/gen d'un slot TX (s24be 8ch, 1ms par chunk) : une tonalité de ligne
+    1 kHz à -18 dBFS sur TOUS les canaux quand la mire est active (pattern 'bars'), sinon du silence
+    (repli 'black' ou gen sans mire). Utilisé par les sessions audio TX quand gen est actif."""
+    import math
+    SR = 48000
+    N = SR // 1000                                # 48 échantillons = 1 ms = 1 période pile de 1 kHz
+    A_CHUNK = N * A_CHANNELS * 3                   # 1152 bytes (1ms, s24be 8ch interleaved)
     shm_path = "/dev/shm/{}_audio_txgen_{}_{}".format(HOSTNAME, idx, ai)
     size = HDR + A_RING * A_CHUNK
     silence = bytes(A_CHUNK)
+    # Tonalité 1 kHz @ -18 dBFS (niveau d'alignement EBU). 1 ms = 1 période entière → le chunk boucle
+    # sans discontinuité (l'échantillon 47 enchaîne sur l'échantillon 0 du chunk suivant = sin(2π)).
+    _amp = int(round(10 ** (-18.0 / 20.0) * (2 ** 23 - 1)))   # pleine échelle 24 bits signés
+    _tone = bytearray()
+    for n in range(N):
+        v = int(round(_amp * math.sin(2 * math.pi * n / N)))  # 1 kHz : période = N échantillons
+        _tone += v.to_bytes(3, "big", signed=True) * A_CHANNELS   # même tonalité sur les 8 canaux
+    tone = bytes(_tone)
     mm = None; fi = 0
     while True:
         with _tx_gen_lock:
-            gen_on = _tx_gen[idx]["enabled"]
+            gen_on  = _tx_gen[idx]["enabled"]
+            pattern = _tx_gen[idx].get("pattern") or "black"
         if not gen_on:
             if mm is not None:
                 mm.close(); mm = None
@@ -1320,8 +1333,9 @@ def _txgen_audio_loop(idx, ai):
             continue
         if mm is None:
             mm = _open_shm(shm_path, size)
+        chunk = tone if pattern == "bars" else silence
         off = HDR + (fi % A_RING) * A_CHUNK
-        mm[off:off + A_CHUNK] = silence
+        mm[off:off + A_CHUNK] = chunk
         mm[0:24] = struct.pack("QQQ", fi, time.time_ns(), 0)
         fi += 1
         time.sleep(0.001)   # 1ms
