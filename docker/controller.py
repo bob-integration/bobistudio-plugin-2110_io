@@ -1046,6 +1046,17 @@ def _launch_mtl():
 def _tx_gen_apply(idx):
     """Recalcule shm_in/enabled d'un slot TX selon la priorité : câblage réel > gen > fallback > rien.
     Appelé après tout changement de cable_shm, user_enabled ou fallback_mode."""
+    # Budget de queues AF_XDP partagé RX+TX : seuls les ACTIVE_TX_C premiers slots peuvent émettre.
+    # Sans ce garde-fou, un repli (fallback != none) activerait TOUS les slots provisionnés (jusqu'à
+    # TX_COUNT) → ils émettraient du noir en continu et satureraient les queues de la NIC (ENOMEM /
+    # registre plein). Les slots au-delà du budget restent silencieux tant qu'ils ne sont pas activés.
+    if idx >= ACTIVE_TX_C:
+        with _tx_lock:
+            _tx[idx]["shm_in"] = None
+            _tx[idx]["enabled"] = False
+        with _tx_gen_lock:
+            _tx_gen[idx]["enabled"] = False
+        return
     with _tx_lock:
         cable    = _tx[idx].get("cable_shm") or ""
         fallback = _tx[idx].get("fallback_mode") or "none"
@@ -1168,8 +1179,10 @@ def _manager_loop():
                 sessions.append(_anc_session(idx, dinfo))
 
         # Sessions TX : un slot émet s'il est activé, a une destination et un shm d'entrée câblé.
+        # Plafonné à ACTIVE_TX_C (budget de queues partagé RX+TX) — les slots provisionnés au-delà
+        # ne créent aucune session (cf. _tx_gen_apply qui les force déjà à enabled=False).
         with _tx_lock:
-            for i in range(N_TX):
+            for i in range(min(N_TX, ACTIVE_TX_C)):
                 t = _tx[i]
                 if t["enabled"] and t["mcast"] and t["udp_port"] and t["shm_in"]:
                     sessions.append(_tx_session(i, t))
