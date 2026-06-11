@@ -1,7 +1,10 @@
 {
-  "version": "0.22.2",
+  "version": "0.22.3",
   "date": "2026-06-11",
   "changes": {
+    "Corrections (0.22.3)": [
+      "Format vidéo à la création = défaut des Réglages (et non plus 1920×1080p25 codé en dur). Le manifeste deploy_defaults portait width/height/fps en dur → à la création d'un moteur sur un nœud (chemin Docker, qui n'envoie pas de format), ce hardcode écrasait systématiquement le défaut des Réglages (Réglages → MXL → Format vidéo par défaut / video_format_default). Désormais : deploy_defaults ne déclare plus de format → docker_driver applique get_default_video_format() (les Réglages) quand aucun format n'est choisi. Un sélecteur de format (« — Défaut Réglages — » + presets) est ajouté au formulaire de création sur nœud pour permettre un override explicite par moteur. NB : les moteurs DÉJÀ créés gardent leur format figé en DB (recréer ou éditer le deploy_config pour réaligner)."
+    ],
     "Nouveautés (0.22.2)": [
       "Repli « Mire + 1000 Hz » : quand le repli TX est réglé sur la mire, le générateur audio émet désormais une tonalité de ligne 1 kHz à -18 dBFS (niveau d'alignement EBU) sur les 8 canaux, au lieu du silence. 1 ms = 1 période entière (48 éch. @48 kHz) → chunk s24be qui boucle sans discontinuité. Le repli « Noir » reste en silence. Option renommée « Mire + silence » → « Mire + 1000 Hz » (UI Destinations + config_schema)."
     ],
