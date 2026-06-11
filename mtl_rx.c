@@ -122,6 +122,7 @@ struct sess {
   size_t   shm_slotsize;   /* taille d'un slot shm = TRAME PLEINE (≠ slotsize = taille CHAMP en
                               entrelacé, côté libmtl). 0 ⇒ open_shm retombe sur slotsize (audio/data). */
   enum st_frame_fmt out_fmt; int plane_h;   /* plane_h = hauteur de CHAMP (H/2) en entrelacé */
+  uint8_t* tx_scratch;     /* TX entrelacé + IDENT : trame pleine de travail (overlay avant weave) */
   /* ── audio ── */
   st30p_rx_handle ah;      /* RX */
   st30p_tx_handle a_tx;    /* TX */
@@ -177,13 +178,15 @@ static void load_ident_patch(struct target* t) {
   t->ident_patch = p; t->id_bw = bw; t->id_bh = bh; t->id_mtime = (long)st.st_mtime;
 }
 
-static void overlay_ident(struct sess* s, struct target* t, uint8_t* dst) {
+/* dst_bd = profondeur du BUFFER destination `dst` (≠ s->bit_depth quand TX : le buffer libmtl
+ * est toujours 10-bit, cf. input_fmt PLANAR10LE). Le patch reste un plan Y 8-bit. */
+static void overlay_ident(struct sess* s, struct target* t, uint8_t* dst, int dst_bd) {
   if (!t->ident_patch || t->id_bw <= 0) return;
   int W = s->width, H = s->height, bw = t->id_bw, bh = t->id_bh;
   if (bw > W || bh > H) return;
   int x0 = W - bw - 8, y0 = 8;
   x0 -= x0 & 1; y0 -= y0 & 1; if (x0 < 0) x0 = 0;
-  int deep = (s->bit_depth >= 10), shift = s->bit_depth - 8;
+  int deep = (dst_bd >= 10), shift = dst_bd - 8;
   size_t ysz = (size_t)W * H, uvsz = (size_t)(W / 2) * H;
   int bps = deep ? 2 : 1;
   for (int r = 0; r < bh; r++) {
@@ -193,7 +196,7 @@ static void overlay_ident(struct sess* s, struct target* t, uint8_t* dst) {
     else      { uint8_t*  y = dst + (size_t)(y0 + r) * W + x0;
                 for (int x = 0; x < bw; x++) y[x] = p[x]; }
   }
-  int neutral = 1 << (s->bit_depth - 1);
+  int neutral = 1 << (dst_bd - 1);
   int ux0 = x0 / 2, ubw = bw / 2;
   uint8_t* uplane = dst + ysz * bps;
   uint8_t* vplane = uplane + uvsz * bps;
@@ -274,7 +277,7 @@ static void* video_rx_thread(void* arg) {
         uint8_t* dst = t->frames_base + (size_t)(fi % s->ring) * s->shm_slotsize;
         field_weave(s->width, s->height, s->conv8, frame, dst, parity, 0);
         if (sf) {                                  /* 2e champ : trame complète */
-          if (t->has_ident) { load_ident_patch(t); overlay_ident(s, t, dst); }
+          if (t->has_ident) { load_ident_patch(t); overlay_ident(s, t, dst, s->bit_depth); }
           write_shm_header(t, fi);
           write_shm_media_ts(t, mts_latch);
           t->index = fi + 1; t->recv++;
@@ -292,7 +295,7 @@ static void* video_rx_thread(void* arg) {
         } else {
           memcpy(dst, frame->addr[0], s->slotsize);
         }
-        if (t->has_ident) { load_ident_patch(t); overlay_ident(s, t, dst); }
+        if (t->has_ident) { load_ident_patch(t); overlay_ident(s, t, dst, s->bit_depth); }
         write_shm_header(t, fi);
         write_shm_media_ts(t, mts);
         t->index = fi + 1; t->recv++;
@@ -463,6 +466,19 @@ static void* video_tx_thread(void* arg) {
       uint64_t fi = sf ? latched_fi : (latched_fi = ((volatile uint64_t*)t->shm_base)[0]);
       long slot = (long)(fi % s->ring);
       uint8_t* src = t->frames_base + (size_t)slot * s->slotsize;   /* slot = TRAME PLEINE */
+      /* IDENT : le buffer libmtl est un CHAMP → on incruste sur une trame pleine de travail
+       * (au bit_depth du shm) puis on dé-weave depuis ce scratch. Coût nul si IDENT off. */
+      if (t->has_ident) {
+        load_ident_patch(t);
+        if (t->ident_patch) {
+          if (!s->tx_scratch) s->tx_scratch = malloc(s->slotsize);
+          if (s->tx_scratch) {
+            memcpy(s->tx_scratch, src, s->slotsize);
+            overlay_ident(s, t, s->tx_scratch, s->bit_depth);
+            src = s->tx_scratch;
+          }
+        }
+      }
       field_weave(s->width, s->height, (s->bit_depth == 8), frame, src, parity, 1);
       st20p_tx_put_frame(s->vth, frame);
       t->index = fi; t->recv++;
@@ -478,6 +494,8 @@ static void* video_tx_thread(void* arg) {
       } else {
         memcpy(dst, src, out_size < s->slotsize ? out_size : s->slotsize);
       }
+      /* IDENT : dst est une trame pleine planaire TOUJOURS 10-bit (input_fmt PLANAR10LE). */
+      if (t->has_ident) { load_ident_patch(t); overlay_ident(s, t, dst, 10); }
       st20p_tx_put_frame(s->vth, frame);
       t->index = fi; t->recv++;
     }
@@ -836,6 +854,7 @@ static void free_session(struct sess* s) {
     if (t->shm_base && t->shm_base != MAP_FAILED) munmap(t->shm_base, t->shm_size);
     if (t->ident_patch) free(t->ident_patch);
   }
+  if (s->tx_scratch) free(s->tx_scratch);
   memset(s, 0, sizeof(*s));
 }
 
