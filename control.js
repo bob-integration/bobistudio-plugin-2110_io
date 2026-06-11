@@ -300,9 +300,10 @@ window.MXLPlugins["2110_io"] = {
               ${rows.join('')}
             </div>`;
           }).join('');
-      const remaining = _cachedActiveRx - ens.length;
+      const activeEnsCount = ens.filter(g => g.video && g.video.active).length;
+      const remaining = _cachedActiveRx - activeEnsCount;
       const moreBtn = remaining > 0
-        ? `<button class="io2110-more-btn">+ Ajouter une source · ${remaining} disponible${remaining > 1 ? 's' : ''}</button>`
+        ? `<button class="io2110-more-btn">+ Ajouter une source</button>`
         : '';
       body.innerHTML = _cachedMeta + inner + moreBtn + _cachedTxHtml;
       if (remaining > 0) {
@@ -360,7 +361,10 @@ window.MXLPlugins["2110_io"] = {
         <span class="nic-bar-val" style="color:${_xdpColH}">${_xdpHwAvail ?? '?'} / ${_xdpHwMax ?? '?'} <span class="nic-bar-est">(kernel: ${_xdpHwCur ?? '?'})</span></span>
         <div class="nic-bar-track"><div class="nic-bar-fill" style="width:${_xdpHwPct}%;background:${_xdpColH}"></div></div>
       </div>` : '';
-      _cachedMeta = `<div class="meta rx-meta">IP : ${esc((c && c.ip) || '—')} — ${recvs.length} / ${_cachedVideoCount} sources · ${activeCount} abonné${activeCount > 1 ? 's' : ''}</div>${_nicH}${_nicRxBar}${_nicXdpBar}`;
+      const _xdpHdr = _xdpAlloc != null
+        ? `<span style="margin-left:var(--space-3);color:${_xdpColU}">⬡ ${_xdpAct} / ${_xdpAlloc} queues XDP</span>`
+        : '';
+      _cachedMeta = `<div class="meta rx-meta">IP : ${esc((c && c.ip) || '—')} — ${recvs.length} / ${_cachedVideoCount} sources · ${activeCount} abonné${activeCount > 1 ? 's' : ''}${_xdpHdr}</div>${_nicH}${_nicRxBar}${_nicXdpBar}`;
       _cachedTxHtml    = renderTXSection(cs && cs.senders);
       _renderBody();
     }
