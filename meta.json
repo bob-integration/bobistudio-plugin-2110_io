@@ -1,7 +1,10 @@
 {
-  "version": "0.22.3",
+  "version": "0.22.4",
   "date": "2026-06-11",
   "changes": {
+    "Nouveautés (0.22.4)": [
+      "Résolution par sortie pour le générateur (mire). Chaque slot TX peut désormais émettre sa mire GÉN à une résolution propre, indépendante des autres sorties et du format du moteur. Sélecteur de format par carte de sortie sur la page Destinations (presets des Réglages). Un slot CÂBLÉ continue de suivre le format de sa source (adapts_input) → le sélecteur passe « suit la source » (verrouillé) ; le format par-slot ne gouverne que les sorties GÉN/non câblées. Le contrôleur rendait déjà la mire à _tx[idx].w/h (aucun changement conteneur) : hook before_deploy initialise le format par-slot au format moteur, push_tx_slots ne pousse l'override que sur les slots non câblés (sinon 0 → la source gouverne), nouvel endpoint POST /api/mtl/<vmid>/tx/<slot>/format, sélecteur io2110.js."
+    ],
     "Corrections (0.22.3)": [
       "Format vidéo à la création = défaut des Réglages (et non plus 1920×1080p25 codé en dur). Le manifeste deploy_defaults portait width/height/fps en dur → à la création d'un moteur sur un nœud (chemin Docker, qui n'envoie pas de format), ce hardcode écrasait systématiquement le défaut des Réglages (Réglages → MXL → Format vidéo par défaut / video_format_default). Désormais : deploy_defaults ne déclare plus de format → docker_driver applique get_default_video_format() (les Réglages) quand aucun format n'est choisi. Un sélecteur de format (« — Défaut Réglages — » + presets) est ajouté au formulaire de création sur nœud pour permettre un override explicite par moteur. NB : les moteurs DÉJÀ créés gardent leur format figé en DB (recréer ou éditer le deploy_config pour réaligner)."
     ],

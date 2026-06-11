@@ -30,6 +30,13 @@ def before_deploy(params, context):
         t.setdefault("multicast_ip", f"239.10.30.{(vmid + i) % 254 + 1}")
         t.setdefault("dest_port", 5000)
         t.setdefault("payload_type", 96)
+        # Format GÉN par slot : défaut = format du moteur ; un override (page Destinations) est
+        # préservé (setdefault). Ne sert qu'au générateur/mire : un slot CÂBLÉ suit sa source
+        # (adapts_input via :8082/input), ce format est alors ignoré (cf. push_tx_slots).
+        t.setdefault("width",  int(params.get("width") or 1920))
+        t.setdefault("height", int(params.get("height") or 1080))
+        t.setdefault("fps",    float(params.get("fps") or 25))
+        t.setdefault("scan",   str(params.get("scan") or "p"))
         # Audio TX : n_aud_per_tx flux — plages 239.10.40.x, 239.10.41.x, …
         base_a = (vmid * 2 + i) % 254 + 1
         audios_alloc = [
