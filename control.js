@@ -343,28 +343,14 @@ window.MXLPlugins["2110_io"] = {
         _nicPortCap, 'RX');
       const _xdpAlloc   = c && c.xdp_allocated;
       const _xdpAct     = (c && c.xdp_active) ?? 0;
-      const _xdpHwMax   = c && c.xdp_hw_max_combined;
-      const _xdpHwCur   = c && c.xdp_hw_current_combined;
-      const _xdpHwAvail = c && c.xdp_hw_xdp_available;
       const _xdpUsedPct = _xdpAlloc ? Math.min(100, Math.round(_xdpAct / _xdpAlloc * 100)) : 0;
-      const _xdpHwPct   = _xdpHwMax  ? Math.min(100, Math.round(_xdpHwAvail / _xdpHwMax * 100)) : 0;
       const _xdpColU = _xdpUsedPct > 80 ? 'var(--status-stopped-fg,#f87171)' : _xdpUsedPct > 60 ? '#e8a33d' : 'var(--status-running-fg,#22c55e)';
-      const _xdpColH = (_xdpHwAvail != null && _xdpHwAvail < (_xdpAlloc || 0))
-          ? 'var(--status-stopped-fg,#f87171)' : 'var(--status-running-fg,#22c55e)';
       const _nicXdpBar = _xdpAlloc != null ? `<div class="nic-bar-wrap">
-        <span class="nic-bar-lbl">XDP sessions</span>
+        <span class="nic-bar-lbl">Queues XDP</span>
         <span class="nic-bar-val" style="color:${_xdpColU}">${_xdpAct} / ${_xdpAlloc} allouées (${_xdpUsedPct}%)</span>
         <div class="nic-bar-track"><div class="nic-bar-fill" style="width:${_xdpUsedPct}%;background:${_xdpColU}"></div></div>
-      </div>
-      <div class="nic-bar-wrap">
-        <span class="nic-bar-lbl">Queues XDP dispo</span>
-        <span class="nic-bar-val" style="color:${_xdpColH}">${_xdpHwAvail ?? '?'} / ${_xdpHwMax ?? '?'} <span class="nic-bar-est">(kernel: ${_xdpHwCur ?? '?'})</span></span>
-        <div class="nic-bar-track"><div class="nic-bar-fill" style="width:${_xdpHwPct}%;background:${_xdpColH}"></div></div>
       </div>` : '';
-      const _xdpHdr = _xdpAlloc != null
-        ? `<span style="margin-left:var(--space-3);color:${_xdpColU}">⬡ ${_xdpAct} / ${_xdpAlloc} queues XDP</span>`
-        : '';
-      _cachedMeta = `<div class="meta rx-meta">IP : ${esc((c && c.ip) || '—')} — ${recvs.length} / ${_cachedVideoCount} sources · ${activeCount} abonné${activeCount > 1 ? 's' : ''}${_xdpHdr}</div>${_nicH}${_nicRxBar}${_nicXdpBar}`;
+      _cachedMeta = `<div class="meta rx-meta">IP : ${esc((c && c.ip) || '—')} — ${recvs.length} / ${_cachedVideoCount} sources · ${activeCount} abonné${activeCount > 1 ? 's' : ''}</div>${_nicH}${_nicRxBar}${_nicXdpBar}`;
       _cachedTxHtml    = renderTXSection(cs && cs.senders);
       _renderBody();
     }
