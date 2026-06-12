@@ -156,6 +156,9 @@ def _get_n_cpus():
 
 IFACE      = os.environ.get("IFACE") or "ens1f0np0"
 LCORES     = os.environ.get("LCORES") or "1,2,3"
+# Quota Mb/s par scheduler (lcore) libmtl : au-delà, les nouvelles sessions vont sur un autre
+# lcore (≈ 2×1080p50 à 5000). Sans quota, tout s'empile sur sch_0 → epoch drops à la charge.
+QUOTA_MBS  = int(os.environ.get("MTL_SCH_QUOTA_MBS") or 5000)
 V_RING     = max(2, int(os.environ.get("RING") or 8))   # ring du pipeline (réglage) ; mtl_rx borne ≤8
 WIDTH      = int(os.environ.get("WIDTH") or 1280)     # défaut/simu (réel = lu du SDP)
 HEIGHT     = int(os.environ.get("HEIGHT") or 720)
@@ -337,13 +340,14 @@ def _overlay_simu(mm, off, idx, lay):
         c[uy0:uy0 + ubh, ux0:ux0 + ubw] = _NEUTRAL
 
 
-def _read_tx_fps(idx):
+def _read_tx_stats(idx):
+    """Stats du sender TX idx écrites par mtl_rx (fps réel + late = trames ayant raté leur epoch)."""
     try:
         with open("/tmp/mtl_tx{}.json".format(idx)) as f:
             d = json.load(f)
-        return float(d.get("fps", 0.0))
+        return float(d.get("fps", 0.0)), int(d.get("late", 0))
     except Exception:
-        return None
+        return None, None
 
 
 # ─── :8080 métriques (format get_metrics) ────────────────────────────
@@ -378,11 +382,12 @@ class MetricsHandler(BaseHTTPRequestHandler):
                 if t["enabled"] and t["shm_in"] and t.get("lat_ms") is not None:
                     inputs_lat = {t["shm_in"]: t["lat_ms"]}
                 if t["mcast"] and t["udp_port"]:
-                    tx_fps = _read_tx_fps(i)
+                    tx_fps, tx_late = _read_tx_stats(i)
                     with _tx_gen_lock:
                         _id_on, _id_sz = _tx_gen[i]["ident"], _tx_gen[i]["ident_size"]
                     senders.append({"tx_idx": i, "idx": i, "essence": "video",
-                                    "fps": tx_fps, "sdp": _tx_sdp(i, t),
+                                    "fps": tx_fps, "fps_nominal": float(t.get("fps") or 0),
+                                    "late": tx_late, "sdp": _tx_sdp(i, t),
                                     "ident": _id_on, "ident_size": _id_sz,
                                     "inputs_latency_ms": inputs_lat})
                 # Senders AUDIO (2110-30) : un SDP par flux audio configuré (dest mcast+port).
@@ -1206,6 +1211,7 @@ def _write_config(sessions):
     désirées. Le daemon détecte le changement de mtime et RÉCONCILIE à chaud — aucune relance."""
     with open(_CONFIG_PATH, "w") as f:
         json.dump({"pmd": "af_xdp", "iface": IFACE, "lcores": LCORES, "sip": SIP,
+                   "quota_mbs": QUOTA_MBS,
                    "rx_queues": max(1, ACTIVE_RX * 3), "tx_queues": max(1, ACTIVE_TX_C * 3),
                    "sessions": sessions}, f)
 

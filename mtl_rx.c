@@ -59,6 +59,13 @@ static uint64_t now_ns(void) {
   return (uint64_t)ts.tv_sec * 1000000000ULL + ts.tv_nsec;
 }
 
+/* Horloge monotone (mesure d'écarts insensible aux sauts NTP/PTP de l'horloge système). */
+static uint64_t mono_ns(void) {
+  struct timespec ts;
+  clock_gettime(CLOCK_MONOTONIC, &ts);
+  return (uint64_t)ts.tv_sec * 1000000000ULL + ts.tv_nsec;
+}
+
 /* Timestamp média de la frame → TAI ns ABSOLU (instant de capture, horloge PTP commune A/V).
  * Le RX libmtl fournit en pratique tfmt=MEDIA_CLK : un compteur 32 bits qui WRAPPE (~47721 s à
  * 90 kHz, ~89478 s à 48 kHz). st10_media_clk_to_ns ne donne que la position DANS la fenêtre →
@@ -86,6 +93,8 @@ struct target {
   uint8_t* shm_base; size_t shm_size; uint8_t* frames_base;
   uint64_t index;          /* frame_index (vidéo) / chunk_index (audio) */
   uint64_t recv;           /* compteur reçu (pour le débit) */
+  uint64_t late;           /* TX vidéo : trames en retard (get_frame > 1,5 période = epoch raté) */
+  uint64_t last_feed_ns;   /* TX vidéo : instant (monotone) du dernier get_frame réussi */
   char     ident_file[300]; int has_ident;
   uint8_t* ident_patch; int id_bw, id_bh; long id_mtime;
   /* timecode ATC (data/ANC) — dernier TC décodé, publié dans les stats */
@@ -451,12 +460,27 @@ static void* video_tx_thread(void* arg) {
   struct target* t = &s->tg[0];                 /* la cible TX = l'unique shm d'entrée */
   size_t out_size = st20p_tx_frame_size(s->vth);   /* = taille CHAMP si entrelacé */
   uint64_t latched_fi = 0;                      /* entrelacé : index latché sur le 1er champ */
+  /* Période nominale entre deux get_frame (BLOCK_GET pace à la cadence de la session ; en
+   * entrelacé un get_frame = un CHAMP). Sert au compteur `late` : un get_frame qui revient
+   * > 1,5 période après le précédent = la session a raté au moins un epoch (trame perdue). */
+  uint64_t period_ns = s->fps > 0 ? (uint64_t)(1e9 / s->fps) : 0;
+  if (s->interlaced) period_ns /= 2;
   while (!s->stop) {
     if (!t->shm_base) {
+      t->last_feed_ns = 0;   /* shm pas encore là : ne pas compter l'attente comme du retard */
       if (open_shm_in(s, t, (size_t)s->hdr + s->slotsize) != 0) { usleep(20000); continue; }
     }
     struct st_frame* frame = st20p_tx_get_frame(s->vth);   /* bloque → pacing à fps */
     if (!frame) { usleep(1000); continue; }
+    uint64_t tnow = mono_ns();
+    if (period_ns && t->last_feed_ns) {
+      uint64_t gap = tnow - t->last_feed_ns;
+      if (gap > period_ns + period_ns / 2) {
+        uint64_t missed = (gap + period_ns / 2) / period_ns;   /* périodes écoulées (arrondi) */
+        t->late += missed > 1 ? missed - 1 : 1;
+      }
+    }
+    t->last_feed_ns = tnow;
     if (s->interlaced) {
       /* Un CHAMP par appel (libmtl pose/alterne second_field). Les 2 champs d'une trame viennent du
        * MÊME slot shm → on latche l'index sur le 1er champ, réutilisé pour le 2e (évite le combing si
@@ -930,7 +954,8 @@ static void write_stats(struct sess* reg, uint64_t last[][MAX_TG], double dt) {
           fprintf(sf, "{\"fps\": %.1f, \"frame_index\": %llu, \"timecode\": \"%s\", \"df\": %s}\n",
                   rate, (unsigned long long)t->index, t->tc, t->tc_df ? "true" : "false");
         else
-          fprintf(sf, "{\"fps\": %.1f, \"frame_index\": %llu}\n", rate, (unsigned long long)t->index);
+          fprintf(sf, "{\"fps\": %.1f, \"frame_index\": %llu, \"late\": %llu}\n",
+                  rate, (unsigned long long)t->index, (unsigned long long)t->late);
         fclose(sf);
       }
     }
@@ -989,6 +1014,7 @@ int main(int argc, char** argv) {
     snprintf(lcores,sizeof(lcores),"%s",jstr(root,"lcores",""));
     int rx_q = jint(root,"rx_queues", 8);   /* plafond de sessions RX (= rx_count du moteur) */
     int tx_q = jint(root,"tx_queues", 1);   /* TX : Phase 2 (1 = file de contrôle IGMP/ARP) */
+    int quota_mbs = jint(root,"quota_mbs", 5000);   /* Mb/s max par scheduler (lcore), cf. mtl_init */
     json_object_put(root);
     if (!iface[0]) { fprintf(stderr,"mtl_rx: config sans iface\n"); return 1; }
 
@@ -1006,6 +1032,12 @@ int main(int argc, char** argv) {
      * se start/stop au gré du nombre de sessions, mais le XDP reste attaché tant que mtl_init vit
      * (le détache n'a lieu qu'à mtl_uninit) → ptp4l ne faute qu'au boot, pas sur les changements. */
     p.flags |= MTL_FLAG_DEV_AUTO_START_STOP;
+    /* Répartition des sessions sur les lcores : sans quota, libmtl empile TOUTES les sessions
+     * vidéo sur sch_0 → saturation (epoch drop / build timeout → « RTP alignment failure » au
+     * récepteur). quota_mbs (Mb/s) borne chaque scheduler (~2×1080p50 à 5000) → éclatement initial
+     * sur les lcores fournis ; les flags MIGRATE rééquilibrent à chaud un sch détecté trop busy. */
+    p.flags |= MTL_FLAG_TX_VIDEO_MIGRATE | MTL_FLAG_RX_VIDEO_MIGRATE;
+    p.data_quota_mbs_per_sch = quota_mbs > 0 ? (uint32_t)quota_mbs : 0;
     p.log_level = MTL_LOG_LEVEL_INFO;
     p.lcores = lcores[0] ? lcores : NULL;
     p.rx_queues_cnt[MTL_PORT_P] = rx_q > 0 ? rx_q : 1;
@@ -1048,6 +1080,8 @@ int main(int argc, char** argv) {
   if (sip[0]) inet_pton(AF_INET, sip, p.sip_addr[MTL_PORT_P]);
   p.pmd[MTL_PORT_P] = mtl_pmd_by_port_name(portname);
   p.flags |= MTL_FLAG_DEV_AUTO_START_STOP;
+  p.flags |= MTL_FLAG_TX_VIDEO_MIGRATE | MTL_FLAG_RX_VIDEO_MIGRATE;
+  p.data_quota_mbs_per_sch = 5000;
   p.log_level = MTL_LOG_LEVEL_INFO;
   p.lcores = lcores[0] ? lcores : NULL;
   p.rx_queues_cnt[MTL_PORT_P] = 1;
