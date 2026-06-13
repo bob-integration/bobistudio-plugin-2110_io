@@ -95,6 +95,9 @@ struct target {
   uint64_t recv;           /* compteur reçu (pour le débit) */
   uint64_t late;           /* TX vidéo : trames en retard (get_frame > 1,5 période = epoch raté) */
   uint64_t last_feed_ns;   /* TX vidéo : instant (monotone) du dernier get_frame réussi */
+  /* RX vidéo : latence de réception (segment A = capture média → écriture shm), moyenne glissante
+   * sur la fenêtre de stats. lat_sum en ns, lat_cnt = nb d'échantillons ; reset à chaque write_stats. */
+  uint64_t lat_sum; uint32_t lat_cnt;
   char     ident_file[300]; int has_ident;
   uint8_t* ident_patch; int id_bw, id_bh; long id_mtime;
   /* timecode ATC (data/ANC) — dernier TC décodé, publié dans les stats */
@@ -153,6 +156,20 @@ static void write_shm_header(struct target* t, uint64_t i) {
  * d'écriture (now_ns). Additif au contrat [index, write_ts] → rétro-compatible. */
 static void write_shm_media_ts(struct target* t, uint64_t media_ts) {
   ((uint64_t*)t->shm_base)[2] = media_ts;
+}
+
+/* Latence de réception (segment A) : Δ entre l'instant de CAPTURE média (media_ts, TAI) et
+ * l'instant d'écriture shm (now_ns, REALTIME). Les deux horloges peuvent différer d'un nombre
+ * ENTIER de secondes (offset TAI↔UTC, p.ex. 37 s ; ou 0 si le système est calé sur TAI). La vraie
+ * latence étant << 1 s, on retire l'écart entier de secondes par arrondi → reste la part sub-seconde.
+ * Accumule la moyenne glissante (fenêtre = write_stats). media_ts=0 (inconnu) → ignoré. */
+static void accum_rx_latency(struct target* t, uint64_t media_ts) {
+  if (!media_ts) return;
+  int64_t d   = (int64_t)now_ns() - (int64_t)media_ts;
+  int64_t off = (int64_t)llround((double)d / 1e9) * 1000000000LL;
+  d -= off;
+  if (d < 0) d = 0;                 /* garde-fou : jamais négatif après calibration */
+  t->lat_sum += (uint64_t)d; t->lat_cnt++;
 }
 /* sampling de l'horloge média ST 2110-10 : 90 kHz vidéo, 48 kHz audio (pour st10_get_tai). */
 #define MEDIA_CLK_VIDEO 90000u
@@ -289,6 +306,7 @@ static void* video_rx_thread(void* arg) {
           if (t->has_ident) { load_ident_patch(t); overlay_ident(s, t, dst, s->bit_depth); }
           write_shm_header(t, fi);
           write_shm_media_ts(t, mts_latch);
+          accum_rx_latency(t, mts_latch);
           t->index = fi + 1; t->recv++;
         }
       }
@@ -307,6 +325,7 @@ static void* video_rx_thread(void* arg) {
         if (t->has_ident) { load_ident_patch(t); overlay_ident(s, t, dst, s->bit_depth); }
         write_shm_header(t, fi);
         write_shm_media_ts(t, mts);
+        accum_rx_latency(t, mts);
         t->index = fi + 1; t->recv++;
       }
     }
@@ -948,14 +967,21 @@ static void write_stats(struct sess* reg, uint64_t last[][MAX_TG], double dt) {
       if (!t->stats_path[0]) continue;
       double rate = dt > 0 ? (double)(t->recv - last[i][ti]) / dt : 0.0;
       last[i][ti] = t->recv;
+      /* Latence de réception (segment A) : moyenne de la fenêtre, en ms. -1 = pas d'échantillon
+       * (TX, ou flux média sans timestamp) → sérialisé `null`. Reset du cumul à chaque fenêtre. */
+      double rx_lat = t->lat_cnt ? (double)t->lat_sum / (double)t->lat_cnt / 1e6 : -1.0;
+      t->lat_sum = 0; t->lat_cnt = 0;
       FILE* sf = fopen(t->stats_path, "w");
       if (sf) {
+        char latbuf[32];
+        if (rx_lat >= 0.0) snprintf(latbuf, sizeof(latbuf), "%.1f", rx_lat);
+        else               snprintf(latbuf, sizeof(latbuf), "null");
         if (s->kind == K_DATA && t->tc_valid)
-          fprintf(sf, "{\"fps\": %.1f, \"frame_index\": %llu, \"timecode\": \"%s\", \"df\": %s}\n",
-                  rate, (unsigned long long)t->index, t->tc, t->tc_df ? "true" : "false");
+          fprintf(sf, "{\"fps\": %.1f, \"frame_index\": %llu, \"timecode\": \"%s\", \"df\": %s, \"rx_latency_ms\": %s}\n",
+                  rate, (unsigned long long)t->index, t->tc, t->tc_df ? "true" : "false", latbuf);
         else
-          fprintf(sf, "{\"fps\": %.1f, \"frame_index\": %llu, \"late\": %llu}\n",
-                  rate, (unsigned long long)t->index, (unsigned long long)t->late);
+          fprintf(sf, "{\"fps\": %.1f, \"frame_index\": %llu, \"late\": %llu, \"rx_latency_ms\": %s}\n",
+                  rate, (unsigned long long)t->index, (unsigned long long)t->late, latbuf);
         fclose(sf);
       }
     }

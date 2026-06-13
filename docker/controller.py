@@ -1485,11 +1485,14 @@ def _simu_loop(idx):
         if _live[idx]:
             if sim_mm is not None:
                 sim_mm.close(); sim_mm = None; sim_res = None
-            st = _read_stats("/tmp/mtl_v{}.json".format(idx))
+            d = _read_stats_raw("/tmp/mtl_v{}.json".format(idx))
             with metrics_lock:
                 metrics[idx]["mode"] = "mtl"
-                if st:
-                    metrics[idx]["fps"] = st[0]; metrics[idx]["frame_index"] = st[1]
+                if d:
+                    metrics[idx]["fps"] = float(d.get("fps", 0.0))
+                    metrics[idx]["frame_index"] = int(d.get("frame_index", 0))
+                    # Latence de réception (segment A = capture média → écriture shm), en ms.
+                    metrics[idx]["rx_latency_ms"] = d.get("rx_latency_ms")
             time.sleep(0.5)
             continue
         w, h = _slot_res[idx]
@@ -1503,6 +1506,7 @@ def _simu_loop(idx):
         if fi % 25 == 0:
             with metrics_lock:
                 metrics[idx]["mode"] = "simu"; metrics[idx]["fps"] = 25.0; metrics[idx]["frame_index"] = fi
+                metrics[idx]["rx_latency_ms"] = None   # pas de latence réception en simu (généré localement)
         time.sleep(1.0 / 25)
 
 
