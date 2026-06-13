@@ -45,7 +45,10 @@ window.MXLPlugins["2110_io"] = {
       }
       return fps;
     }
-    function stateBadge(active){
+    function stateBadge(active, stalled){
+      if (active && stalled)
+        // Abonné (IS-05) mais aucun flux ne remonte : création RX ratée (budget lcores) ou pas de trafic.
+        return `<span class="badge" style="background:rgba(251,146,60,0.7); color:#3d1500" title="Abonné (IS-05) mais aucun flux ne remonte : création RX échouée (budget lcores du nœud) ou pas de trafic réseau (source/switch).">⚠ sans flux</span>`;
       return active
         ? `<span class="badge" style="background:var(--status-running-bg); color:var(--status-running-fg)">subscribed</span>`
         : `<span class="badge" style="background:var(--border-soft); color:var(--text-muted)">idle</span>`;
@@ -189,7 +192,7 @@ window.MXLPlugins["2110_io"] = {
         ${genIcon}
         ${identCtl}
         ${sdpCtl}
-        <span>${stateBadge(r.active)}</span>
+        <span>${stateBadge(r.active, r.rx_stalled)}</span>
         ${rateCell}
         <span class="net-addr" title="entrée 2110"><span class="net-arrow">↘</span>${net}</span>
         <span class="mxl-path" title="sortie MXL (shared memory)">→ ${mxl}</span>

@@ -901,6 +901,15 @@ static void free_session(struct sess* s) {
   memset(s, 0, sizeof(*s));
 }
 
+/* Écrit un statut d'ERREUR dans le stats json d'une cible (création de session ratée). Le contrôleur
+ * le relaie en `rx_error` sur :8080 → l'orchestrateur affiche « abonné mais ne reçoit pas » avec la
+ * cause précise (typiquement budget lcores du nœud dépassé : st20p_rx_create → no available lcore). */
+static void write_stats_error(struct target* t, const char* err) {
+  if (!t->stats_path[0]) return;
+  FILE* sf = fopen(t->stats_path, "w");
+  if (sf) { fprintf(sf, "{\"fps\": 0.0, \"frame_index\": 0, \"error\": \"%s\"}\n", err); fclose(sf); }
+}
+
 /* Réconcilie le registre des sessions vivantes avec le config (sessions désirées), À CHAUD sur le
  * mtl_handle vivant : libère les disparues, crée les nouvelles. JAMAIS de mtl_uninit. */
 static void reconcile(struct sess* reg, const char* path, mtl_handle st, const char* portname) {
@@ -952,7 +961,13 @@ static void reconcile(struct sess* reg, const char* path, mtl_handle st, const c
             ? ((s->kind == K_AUDIO) ? setup_audio_tx(s) : (s->kind == K_DATA) ? setup_data_tx(s) : setup_video_tx(s))
             : ((s->kind == K_AUDIO) ? setup_audio(s)    : (s->kind == K_DATA) ? setup_data(s)    : setup_video(s));
     if (r == 0) { s->used = 1; s->seen = 1; }
-    else { fprintf(stderr,"mtl_rx: création session %s:%d échouée\n", s->mcast, s->udp_port); memset(s,0,sizeof(*s)); }
+    else {
+      fprintf(stderr,"mtl_rx: création session %s:%d échouée\n", s->mcast, s->udp_port);
+      /* RX : remonter l'échec dans le stats json du slot (sinon le contrôleur le croit « mtl »). */
+      if (s->role != ROLE_TX)
+        for (int ti = 0; ti < s->ntg; ti++) write_stats_error(&s->tg[ti], "rx_create_failed");
+      memset(s,0,sizeof(*s));
+    }
   }
   json_object_put(root);
 }

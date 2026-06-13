@@ -1487,12 +1487,21 @@ def _simu_loop(idx):
                 sim_mm.close(); sim_mm = None; sim_res = None
             d = _read_stats_raw("/tmp/mtl_v{}.json".format(idx))
             with metrics_lock:
-                metrics[idx]["mode"] = "mtl"
-                if d:
-                    metrics[idx]["fps"] = float(d.get("fps", 0.0))
-                    metrics[idx]["frame_index"] = int(d.get("frame_index", 0))
-                    # Latence de réception (segment A = capture média → écriture shm), en ms.
-                    metrics[idx]["rx_latency_ms"] = d.get("rx_latency_ms")
+                # Échec de création de session RX (budget lcores…) : mtl_rx écrit {error} dans le stats.
+                # On le remonte (mode="error" + rx_error) au lieu de prétendre « mtl » à tort.
+                if d and d.get("error"):
+                    metrics[idx]["mode"] = "error"
+                    metrics[idx]["rx_error"] = d.get("error")
+                    metrics[idx]["fps"] = 0.0
+                    metrics[idx]["rx_latency_ms"] = None
+                else:
+                    metrics[idx]["mode"] = "mtl"
+                    metrics[idx].pop("rx_error", None)
+                    if d:
+                        metrics[idx]["fps"] = float(d.get("fps", 0.0))
+                        metrics[idx]["frame_index"] = int(d.get("frame_index", 0))
+                        # Latence de réception (segment A = capture média → écriture shm), en ms.
+                        metrics[idx]["rx_latency_ms"] = d.get("rx_latency_ms")
             time.sleep(0.5)
             continue
         w, h = _slot_res[idx]
