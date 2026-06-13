@@ -26,7 +26,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
       libcap-ng-dev m4 sudo unzip cmake systemtap-sdt-dev libgtest-dev libgmock-dev \
       libxdp-dev libbpf-dev libelf-dev clang llvm gcc-multilib \
       ca-certificates iproute2 ethtool wget curl \
-      linuxptp \
       python3 python3-numpy python3-pil fonts-dejavu-core \
  && rm -rf /var/lib/apt/lists/*
 
@@ -61,6 +60,13 @@ RUN cc -O2 -o /usr/local/bin/mtl_rx /src/mtl_rx.c $(pkg-config --cflags --libs m
 
 # 6) Nettoyage de l'arbre source (les artefacts sont dans /usr/local).
 RUN rm -rf /src/MTL
+
+# 6bis) linuxptp (pmc) — RUN dédié TARDIF (≠ grosse ligne apt) pour que ce petit paquet n'invalide
+# PAS le cache du toolchain ni du build DPDK/libmtl : un rebuild ne re-télécharge que linuxptp.
+# Le contrôleur s'en sert pour lire le grandmaster PTP réel (socket RO host monté par `docker run`)
+# et émettre a=ts-refclk:ptp dans le SDP TX.
+RUN apt-get update && apt-get install -y --no-install-recommends linuxptp \
+ && rm -rf /var/lib/apt/lists/*
 
 # 7) Contrôleur Python (rôle agent+contrôleur : :8080 métriques + :8081 nmos/subscribe + simu).
 COPY controller.py /usr/local/bin/controller.py
