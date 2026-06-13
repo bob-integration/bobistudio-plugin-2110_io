@@ -1,7 +1,10 @@
 {
-  "version": "0.22.10",
+  "version": "0.22.11",
   "date": "2026-06-13",
   "changes": {
+    "Nouveautés (0.22.11)": [
+      "Échec de création de session RX remonté (fin du « faux mtl » silencieux). Quand st20p_rx_create échoue (typiquement budget lcores du nœud dépassé : « mt_sch_get_lcore: no available lcore »), mtl_rx.c écrit désormais {error} dans le stats json du slot (write_stats_error, appelé avant le memset de la session dans reconcile). Le contrôleur le relaie en mode=\"error\" + rx_error sur :8080 (au lieu de prétendre mode=\"mtl\" alors que rien n'est reçu). L'orchestrateur (metrics.py) surface le slot en « abonné mais ne reçoit pas » (badge page Câbles + I/O Sources) avec une alerte précisant la cause (échec création = lcores ; ou frame_index figé = pas de trafic source/réseau). Complète l'auto-dimensionnement des lcores du nœud (docker_driver._auto_lcores). REBUILD IMAGE REQUIS (mtl_rx.c)."
+    ],
     "Nouveautés (0.22.10)": [
       "Observabilité de la LATENCE DE RÉCEPTION (segment A) par slot vidéo RX. mtl_rx.c mesure désormais l'écart entre l'instant de CAPTURE média (media_ts PTP/TAI, déjà écrit à l'offset 16 du header shm) et l'instant d'ÉCRITURE shm (now_ns) → c'est la latence réseau + framebuffers MTL + de-jitter, jusque-là invisible (le badge ⧖ de la page Câbles ne mesure que le transit shm→lecteur, segment B). Auto-calibration de l'écart d'horloge TAI↔UTC (37 s, ou 0 si système TAI) par arrondi à la seconde entière (vraie latence << 1 s) → aucune constante de leap-second en dur. Moyenne glissante par fenêtre de stats, écrite dans /tmp/mtl_vN.json (rx_latency_ms) et exposée dans metrics.receivers[] (:8080). Orchestrateur : app/metrics.py la mappe sur le nom de shm producteur ({hostname}_{idx}) → rx_latency_cache ; app/routes.py l'attache aux ports source (api_home_summary) ; page Câbles (cables.html + base.css) affiche un badge ambre « ⇣ N ms » sur chaque source 2110, DISTINCT du badge ⧖ des câbles. Diagnostic-first : localise où vivent les ~4 trames de latence observées sur le RX. REBUILD IMAGE REQUIS (mtl_rx.c)."
     ],
