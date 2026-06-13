@@ -1,7 +1,11 @@
 {
-  "version": "0.22.11",
+  "version": "0.22.12",
   "date": "2026-06-13",
   "changes": {
+    "Corrections (0.22.12)": [
+      "Page Sources 2110, affichage corrigé (UI seule — PAS de rebuild image) : (1) le scan vidéo (i/p) vient désormais du SDP réel (a=fmtp interlace) au lieu de retomber sur le scan CONFIGURÉ — un flux 1080p ne s'affiche plus « 1080i » ; (2) le format AUDIO 2110-30 est lu du SDP (a=rtpmap L24/48000/8 → « 48kHz / L24 / 8ch ») et affiché dès l'abonnement au lieu d'un « 48K / L24 » figé / « — / — » ; (3) ANC 2110-40 : on n'affiche plus de timecode brut mais « reçu » (+ « · timecode » si ATC décodé) avec le type de métadata en tooltip (SMPTE ST 12M / ST 291). Côté orchestrateur : _fmt_from_sdp pose scan p/i explicite + nouveau _audio_fmt_from_sdp ; _compute_receivers_detail expose sample_rate/bit_depth/channels.",
+      "Format vidéo COMPLET depuis le SDP : « 1920×1080p25 » (résolution + scan p/i TOUJOURS affiché + fps fusionné) + chroma (sampling), profondeur (depth), colorimétrie (colorimetry), et si présents transfert HDR (TCS) + range FULL — ex. « 1920×1080p50 · 4:2:2 · 10b · BT709 ». _fmt_from_sdp extrait sampling/depth/colorimetry/TCS/RANGE ; _compute_receivers_detail expose chroma/colorimetry/tcs/range (+ bit_depth vidéo), SDP prioritaire, repli deploy_config quand pas de flux."
+    ],
     "Nouveautés (0.22.11)": [
       "Échec de création de session RX remonté (fin du « faux mtl » silencieux). Quand st20p_rx_create échoue (typiquement budget lcores du nœud dépassé : « mt_sch_get_lcore: no available lcore »), mtl_rx.c écrit désormais {error} dans le stats json du slot (write_stats_error, appelé avant le memset de la session dans reconcile). Le contrôleur le relaie en mode=\"error\" + rx_error sur :8080 (au lieu de prétendre mode=\"mtl\" alors que rien n'est reçu). L'orchestrateur (metrics.py) surface le slot en « abonné mais ne reçoit pas » (badge page Câbles + I/O Sources) avec une alerte précisant la cause (échec création = lcores ; ou frame_index figé = pas de trafic source/réseau). Complète l'auto-dimensionnement des lcores du nœud (docker_driver._auto_lcores). REBUILD IMAGE REQUIS (mtl_rx.c)."
     ],

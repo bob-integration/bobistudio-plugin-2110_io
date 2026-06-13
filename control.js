@@ -38,12 +38,24 @@ window.MXLPlugins["2110_io"] = {
     // Taille IDENT (10..120 px) → angle du rotatif (course 270°, de -135° à +135°).
     function _identAngle(v){ v = Math.max(10, Math.min(120, Number(v) || 12)); return -135 + (v - 10) / 110 * 270; }
     function fmtVideoFormat(o){
-      const fps = `${fmtFps(o.fps)} fps`;
       if (o.width && o.height) {
-        const sc = (o.scan === 'i') ? 'i' : '';
-        return `<span style="color:var(--text-muted)">${o.width}×${o.height}${sc}</span> · ${fps}`;
+        const sc = (o.scan === 'i') ? 'i' : 'p';      // p ou i TOUJOURS affiché (notation broadcast)
+        const fpsTxt = (o.fps != null) ? String(Number(o.fps)).replace(/\.0$/, '') : '';
+        // Résolution + scan + fps fusionnés : « 1920×1080p25 ». fps coloré selon l'état.
+        const res = `${o.width}×${o.height}${sc}<span style="color:${Number(o.fps) >= 24 ? 'var(--status-running-fg)' : Number(o.fps) > 0 ? '#e8a33d' : 'var(--status-stopped-fg)'}">${fpsTxt}</span>`;
+        // Tout ce que le SDP donne en plus : chroma, profondeur, colorimétrie, transfert(HDR), range.
+        const chroma = o.chroma ? String(o.chroma).replace(/^(\d)(\d)(\d)$/, '$1:$2:$3') : '';
+        const extra = [
+          chroma,
+          o.bit_depth ? o.bit_depth + 'b' : '',
+          o.colorimetry || '',
+          (o.tcs && String(o.tcs).toUpperCase() !== 'SDR') ? 'HDR(' + o.tcs + ')' : '',
+          (o.range && String(o.range).toUpperCase() === 'FULL') ? 'full' : '',
+        ].filter(Boolean).join(' · ');
+        const tip = `Format vidéo (SDP) : ${o.width}×${o.height}${sc}${fpsTxt}${extra ? ' · ' + extra.replace(/<[^>]+>/g,'') : ''}`;
+        return `<span style="color:var(--text-muted)" title="${esc(tip)}">${res}${extra ? ' · ' + extra : ''}</span>`;
       }
-      return fps;
+      return `${fmtFps(o.fps)} fps`;
     }
     function stateBadge(active, stalled){
       if (active && stalled)
@@ -168,22 +180,32 @@ window.MXLPlugins["2110_io"] = {
         </span>`;
       const rateCell = isAnc
         ? (() => {
+            // ANC 2110-40 : on ne cherche pas à afficher un timecode. On confirme la réception
+            // et on précise le type de métadata SI on le connaît (timecode ATC décodé, sinon SMPTE 291).
             const flowing = Number(r.fps) > 0;
-            const tc = r.timecode || '--:--:--:--';
-            const col = flowing ? 'var(--status-running-fg)' : 'var(--status-stopped-fg)';
-            const tip = flowing
-              ? (r.timecode ? 'ANC 2110-40 actif · timecode ATC (SMPTE 12-1)' + (r.df ? ' · drop-frame' : '')
-                            : 'ANC 2110-40 actif · pas de timecode ATC dans le flux')
-              : 'Aucun paquet ANC reçu sur ce slot';
-            return `<span style="color:${col};font-family:var(--font-mono,ui-monospace,monospace);letter-spacing:.5px" title="${tip}">${esc(tc)}${r.df ? ' DF' : ''}</span>`;
+            const col = flowing ? 'var(--status-running-fg)' : (r.sdp ? 'var(--text-muted)' : 'var(--status-stopped-fg)');
+            let txt = '—', tip = 'Aucun abonnement ANC sur ce slot';
+            if (r.sdp) {
+              const type = r.timecode ? 'timecode (SMPTE ST 12M)' : 'SMPTE ST 291 (type non décodé)';
+              txt = flowing ? ('reçu' + (r.timecode ? ' · timecode' : '')) : 'abonné';
+              tip = flowing ? `ANC 2110-40 reçu · ${type}` : 'ANC 2110-40 abonné · aucun paquet reçu';
+            }
+            return `<span style="color:${col}" title="${tip}">${esc(txt)}</span>`;
           })()
         : isAudio
         ? (() => {
+            // Format AUDIO 2110-30 lu du SDP : « 48kHz / L24 / 8ch ». Affiché dès l'abonnement
+            // (r.sdp), même sans flux ; couleur = état de réception.
             const flowing = Number(r.fps) > 0;
-            const col = flowing ? 'var(--status-running-fg)' : 'var(--status-stopped-fg)';
-            const txt = flowing ? '48K / L24' : '— / —';
-            const tip = flowing ? '48 kHz / L24 / 8 canaux — flux actif' : 'Aucun chunk audio reçu sur ce slot';
-            return `<span style="color:${col}" title="${tip}">${txt}</span>`;
+            const col = flowing ? 'var(--status-running-fg)' : (r.sdp ? 'var(--text-muted)' : 'var(--status-stopped-fg)');
+            let txt = '— / —', tip = 'Aucun abonnement audio sur ce slot';
+            if (r.sdp && r.sample_rate) {
+              const khz = (r.sample_rate / 1000).toString().replace(/\.0$/, '');
+              const ch  = r.channels || 1;
+              txt = `${khz}kHz / L${r.bit_depth || 24} / ${ch}ch`;
+              tip = flowing ? `${esc(txt)} — flux actif` : `${esc(txt)} — abonné, aucun chunk reçu`;
+            }
+            return `<span style="color:${col}" title="${tip}">${esc(txt)}</span>`;
           })()
         : `<span title="format vidéo">${fmtVideoFormat(r)}</span>`;
       const rowCls = isAnc ? 'flow-anc' : isAudio ? 'flow-audio' : 'flow-video';
