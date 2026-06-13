@@ -26,6 +26,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
       libcap-ng-dev m4 sudo unzip cmake systemtap-sdt-dev libgtest-dev libgmock-dev \
       libxdp-dev libbpf-dev libelf-dev clang llvm gcc-multilib \
       ca-certificates iproute2 ethtool wget curl \
+      linuxptp \
       python3 python3-numpy python3-pil fonts-dejavu-core \
  && rm -rf /var/lib/apt/lists/*
 
