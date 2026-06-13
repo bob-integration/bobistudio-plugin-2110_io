@@ -196,53 +196,10 @@ def _detect_iface_mac(iface):
 
 IFACE_MAC = _detect_iface_mac(IFACE)
 
-# Ligne a=ts-refclk localmac (par section média) — vide si MAC illisible.
+# Ligne a=ts-refclk localmac (par section média) — vide si MAC illisible. C'est un REPLI : le
+# conteneur ne gère pas le PTP (ptp4l tourne sur l'hôte). L'orchestrateur REMPLACE cette ligne par
+# le ts-refclk:ptp traçable du grandmaster du nœud, lu via SSH pmc (services/nmos + app/ptp).
 _LOCALMAC_REFCLK = "a=ts-refclk:localmac={}\r\n".format(IFACE_MAC) if IFACE_MAC else ""
-
-# ─── ts-refclk PTP (grandmaster réel, lecture LIVE via le socket RO de ptp4l host) ──────────
-# Le ptp4l qui discipline l'horloge tourne sur l'HÔTE (le conteneur n'a ni ptp4l ni accès UDS).
-# L'orchestrateur monte le socket read-only /var/run/ptp4lro (mode 0666, conçu pour les lecteurs
-# non privilégiés) en RO dans le conteneur → on interroge le grandmaster réel auquel le nœud est
-# verrouillé et on émet un a=ts-refclk:ptp TRAÇABLE (ST 2110-10), exigé par les récepteurs
-# PTP-stricts. Repli sur localmac si non verrouillé / pmc absent / socket injoignable (jamais
-# de mensonge ni de crash). Caché (TTL court) : la génération SDP est appelée à chaque poll :8080.
-PTP_DOMAIN      = int(os.environ.get("PTP_DOMAIN") or 127)
-_PTP_RO_SOCK    = "/var/run/ptp4lro"
-_PTP_REFCLK_TTL = 5.0
-_ptp_refclk_cache = {"line": None, "ts": 0.0}
-
-def _pmc_ro(query):
-    """Interroge le ptp4l host via le socket UDS read-only. Texte pmc ou '' si échec."""
-    try:
-        out = subprocess.run(
-            ["pmc", "-u", "-s", _PTP_RO_SOCK, "-b", "0", "-d", str(PTP_DOMAIN), query],
-            capture_output=True, text=True, timeout=3)
-        return out.stdout or ""
-    except Exception:
-        return ""
-
-def _ptp_refclk():
-    """Ligne a=ts-refclk à injecter dans chaque section média. Lit le grandmaster réel du ptp4l
-    host (caché TTL ~5 s) → a=ts-refclk:ptp=IEEE1588-2008:<GM>:<domain> ; repli localmac si le
-    nœud n'est pas verrouillé ou si la lecture échoue. Mirroir des parseurs de app/ptp.py."""
-    now = time.time()
-    c = _ptp_refclk_cache
-    if c["line"] is not None and now - c["ts"] < _PTP_REFCLK_TTL:
-        return c["line"]
-    line = _LOCALMAC_REFCLK   # repli par défaut
-    try:
-        m = re.search(r"portState\s+(\w+)", _pmc_ro("GET PORT_DATA_SET"))
-        if m and m.group(1) in ("SLAVE", "MASTER", "GRAND_MASTER", "PASSIVE"):
-            mg = re.search(r"grandmasterIdentity\s+([0-9a-fA-F.]+)", _pmc_ro("GET PARENT_DATA_SET"))
-            if mg:
-                raw = mg.group(1).replace(".", "")
-                if len(raw) == 16:
-                    gm = ":".join(raw[i:i+2].upper() for i in range(0, 16, 2))
-                    line = "a=ts-refclk:ptp=IEEE1588-2008:{}:{}\r\n".format(gm, PTP_DOMAIN)
-    except Exception:
-        line = _LOCALMAC_REFCLK
-    c["line"], c["ts"] = line, now
-    return line
 
 # ─── Layout shm (simu) — RÉSOLUTION DYNAMIQUE ───────────────────────
 # La simu (GÉN ou fallback sans SDP) doit suivre la résolution du flux LIVE (lue du SDP) pour
@@ -1078,7 +1035,7 @@ def _tx_sdp(i, t):
         "{refclk}"
         "a=mediaclk:direct=0\r\n"
     ).format(port=int(t.get("udp_port") or 0), pt=pt, mcast=t.get("mcast") or "0.0.0.0",
-             sip=sip, fmtp=fmtp, refclk=_ptp_refclk(),
+             sip=sip, fmtp=fmtp, refclk=_LOCALMAC_REFCLK,
              mid="a=mid:DUP-1\r\n" if dual else "")
     grp = "a=group:DUP DUP-1 DUP-2\r\n" if dual else ""
     sdp = "v=0\r\no=- 0 0 IN IP4 {sip}\r\ns={hn} TX{i}\r\nt=0 0\r\n{grp}".format(
@@ -1094,7 +1051,7 @@ def _tx_sdp(i, t):
             "{refclk}"
             "a=mediaclk:direct=0\r\n"
         ).format(port=int(t["udp_port2"]), pt=pt, mcast=t["mcast2"], sip=sip, fmtp=fmtp,
-                 refclk=_ptp_refclk())
+                 refclk=_LOCALMAC_REFCLK)
         sdp += leg1
     return sdp
 
@@ -1113,7 +1070,7 @@ def _anc_sdp(i, t):
         "{refclk}"
         "a=mediaclk:direct=0\r\n"
     ).format(port=int(t.get("anc_port") or 0), pt=pt,
-             mcast=t.get("anc_mcast") or "0.0.0.0", sip=sip, refclk=_ptp_refclk(),
+             mcast=t.get("anc_mcast") or "0.0.0.0", sip=sip, refclk=_LOCALMAC_REFCLK,
              mid="a=mid:DUP-1\r\n" if dual else "")
     grp = "a=group:DUP DUP-1 DUP-2\r\n" if dual else ""
     sdp = "v=0\r\no=- 0 0 IN IP4 {sip}\r\ns={hn} TX{i} ANC\r\nt=0 0\r\n{grp}".format(
@@ -1129,13 +1086,13 @@ def _anc_sdp(i, t):
             "{refclk}"
             "a=mediaclk:direct=0\r\n"
         ).format(port=int(t["anc_port2"]), pt=pt, mcast=t["anc_mcast2"], sip=sip,
-                 refclk=_ptp_refclk())
+                 refclk=_LOCALMAC_REFCLK)
         sdp += leg1
     return sdp
 
 def _aud_sdp(i, ai, acfg):
     """SDP ST 2110-30 d'un flux audio TX (L24 / 48 kHz / 8 ch). Dual-section si mcast2/port2
-    présents (SMPTE 2022-7 : group:DUP + a=mid:). ts-refclk = grandmaster réel via _ptp_refclk()."""
+    présents (SMPTE 2022-7 : group:DUP + a=mid:). ts-refclk:localmac (upgrade PTP côté orchestrateur)."""
     sip = SIP or "0.0.0.0"
     pt  = int(acfg.get("pt") or 97)
     ptime = A_PTIME_DEF if A_PTIME_DEF in (0.125, 0.25, 1.0, 4.0) else 1.0
@@ -1153,7 +1110,7 @@ def _aud_sdp(i, ai, acfg):
             "{refclk}"
             "a=mediaclk:direct=0\r\n"
         ).format(port=int(port or 0), pt=pt, mcast=mcast or "0.0.0.0", sip=sip,
-                 ch=A_CHANNELS, ptime=ptime_s, refclk=_ptp_refclk(), mid=mid)
+                 ch=A_CHANNELS, ptime=ptime_s, refclk=_LOCALMAC_REFCLK, mid=mid)
     grp = "a=group:DUP DUP-1 DUP-2\r\n" if dual else ""
     sdp = "v=0\r\no=- 0 0 IN IP4 {sip}\r\ns={hn} TX{i} AUDIO{ai}\r\nt=0 0\r\n{grp}".format(
           sip=sip, hn=HOSTNAME, i=i, ai=ai, grp=grp)
