@@ -1,7 +1,10 @@
 {
-  "version": "0.22.14",
-  "date": "2026-06-13",
+  "version": "0.22.15",
+  "date": "2026-06-14",
   "changes": {
+    "Nouveautés (0.22.15)": [
+      "Page Câbles (UI seule — PAS de rebuild image) : le badge fps de carte est masqué pour ce moteur (manifeste aggregate_fps:false) — un fps unique agrégé n'a aucun sens sur un moteur RX multi-session. À la place, le fps RÉEL de chaque flux RX (receivers[].fps, déjà exposé sur :8080) s'affiche désormais sur le port de sortie correspondant (rx_fps_cache → ports produces[].fps)."
+    ],
     "Corrections (0.22.14)": [
       "SDP TX a=ts-refclk:ptp : l'upgrade du grandmaster est ramené CÔTÉ ORCHESTRATEUR (le conteneur ne gère pas le PTP). La tentative 0.22.13 de lire le PTP DEPUIS le conteneur (socket RO /var/run/ptp4lro monté + pmc) ne fonctionne pas : pmc envoie la requête mais son socket de réponse (/var/run/pmc.$pid) vit dans le mount-namespace du conteneur, donc le ptp4l de l'hôte ne peut pas y répondre (aucune réponse). Annulé : le conteneur réémet a=ts-refclk:localmac (repli), linuxptp retiré de l'image, montage socket + env PTP_DOMAIN retirés du run cmd. C'est désormais l'orchestrateur qui REMPLACE localmac par le ts-refclk:ptp traçable, lu via SSH pmc sur l'HÔTE DU NŒUD du sender (app/ptp.refclk_for_host, caché TTL ~10 s ; services/nmos.is05_send_transportfile), découplé de ptp_enabled pour un moteur MTL. REBUILD IMAGE REQUIS (revient à l'image sans linuxptp ; le conteneur n'a plus aucun rôle PTP)."
     ],
