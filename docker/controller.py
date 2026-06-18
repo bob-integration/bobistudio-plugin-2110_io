@@ -410,7 +410,7 @@ class MetricsHandler(BaseHTTPRequestHandler):
                             "port_capacity_gbps": port_cap,
                             "aggregate_gbps": aggregate_gbps,
                             "model": model_label},
-                   "xdp": {"allocated":           ACTIVE_RX * 3 + ACTIVE_TX_C * 3,
+                   "xdp": {"allocated":           _rx_queues_alloc + _tx_queues_alloc,
                             "active":              _xdp_sessions_active,
                             "hw_max_combined":     hw_q["max"]          if hw_q else None,
                             "hw_current_combined": hw_q["current"]       if hw_q else None,
@@ -1208,13 +1208,33 @@ def _read_stats_raw(stats_path):
         return None
 
 
+_rx_queues_alloc = 0   # dernières files RX/TX demandées au daemon (exposé via :8080 xdp.allocated)
+_tx_queues_alloc = 0
+
+
 def _write_config(sessions):
-    """Écrit le config lu par le DAEMON mtl_rx : device params (cap des files = N_VIDEO) + sessions
-    désirées. Le daemon détecte le changement de mtime et RÉCONCILIE à chaud — aucune relance."""
+    """Écrit le config lu par le DAEMON mtl_rx : device params + sessions désirées. Le daemon détecte
+    le changement de mtime et RÉCONCILIE à chaud — aucune relance.
+
+    `rx_queues`/`tx_queues` (= `mtl_init` rx/tx_queues_cnt, 1 file AF-XDP par session libmtl) sont
+    dimensionnés au NOMBRE RÉEL de sessions de ce config. AVANT : forfait `ACTIVE_RX*3` (réserve
+    1 vidéo+1 audio+1 ANC par slot) → sur-réservation qui plafonnait à ~16 sessions (48 files HW / 3)
+    même en vidéo-seule. Maintenant : exact → une RX vidéo-seule peut monter jusqu'aux ~48 files HW.
+    `MTL_RX_QUEUE_HEADROOM`/`MTL_TX_QUEUE_HEADROOM` (env, défaut 0) pré-réservent des files pour
+    ajouter audio/ANC à chaud SANS réinit mtl (compromis capacité ↔ souplesse dynamique)."""
+    global _rx_queues_alloc, _tx_queues_alloc
+    # RX = toute session non explicitement TX (la session vidéo RX n'a pas de clé 'role' ;
+    # audio/ANC RX portent role='rx' ; TX portent role='tx').
+    n_rx = sum(1 for s in sessions if s.get("role") != "tx")
+    n_tx = sum(1 for s in sessions if s.get("role") == "tx")
+    hr_rx = max(0, int(os.environ.get("MTL_RX_QUEUE_HEADROOM") or 0))
+    hr_tx = max(0, int(os.environ.get("MTL_TX_QUEUE_HEADROOM") or 0))
+    _rx_queues_alloc = max(1, n_rx + hr_rx)
+    _tx_queues_alloc = max(1, n_tx + hr_tx)
     with open(_CONFIG_PATH, "w") as f:
         json.dump({"pmd": "af_xdp", "iface": IFACE, "lcores": LCORES, "sip": SIP,
                    "quota_mbs": QUOTA_MBS,
-                   "rx_queues": max(1, ACTIVE_RX * 3), "tx_queues": max(1, ACTIVE_TX_C * 3),
+                   "rx_queues": _rx_queues_alloc, "tx_queues": _tx_queues_alloc,
                    "sessions": sessions}, f)
 
 

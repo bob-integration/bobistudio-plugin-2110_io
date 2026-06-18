@@ -1,7 +1,10 @@
 {
-  "version": "0.22.15",
-  "date": "2026-06-14",
+  "version": "0.22.16",
+  "date": "2026-06-18",
   "changes": {
+    "Capacité (0.22.16)": [
+      "Files AF-XDP dimensionnées au NOMBRE RÉEL de sessions RX/TX (controller.py _write_config) au lieu du forfait `active_rx×3`. L'ancien ×3 (réserve 1 vidéo + 1 audio + 1 ANC par slot source) plafonnait l'ingestion à ~16 sessions (48 files matérielles E810 ÷ 3) MÊME pour des sources vidéo-seules. libmtl alloue 1 file par session (mtl_rx.c : rx_queues_cnt = rx_queues) → on demande exactement le nb de sessions du config. Mesuré sur E810 (banc node-1) : plafond RX vidéo-seule 16 → 44 sessions sur 1 contrôleur. Sources full vidéo+audio+ANC = toujours 3 sessions/source (~16 sources/contrôleur). Headroom optionnel `MTL_RX_QUEUE_HEADROOM`/`MTL_TX_QUEUE_HEADROOM` (env, défaut 0) pour pré-réserver des files et ajouter audio/ANC à chaud sans réinit mtl. `:8080 xdp.allocated` reflète l'alloc réelle. REBUILD IMAGE REQUIS. ⚠ COORDINATION ORCHESTRATEUR : `_mtl_active_caps` (routes.py, `sessions = total_queues // 3`) plafonne encore `active_rx`+`active_tx` à 16 — à ajuster (diviser par le nb réel de sessions/source, p.ex. 1 en vidéo-seule) pour exploiter la nouvelle capacité bout-en-bout."
+    ],
     "Nouveautés (0.22.15)": [
       "Page Câbles (UI seule — PAS de rebuild image) : le badge fps de carte est masqué pour ce moteur (manifeste aggregate_fps:false) — un fps unique agrégé n'a aucun sens sur un moteur RX multi-session. À la place, le fps RÉEL de chaque flux RX (receivers[].fps, déjà exposé sur :8080) s'affiche désormais sur le port de sortie correspondant (rx_fps_cache → ports produces[].fps)."
     ],
