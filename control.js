@@ -330,7 +330,10 @@ window.MXLPlugins["2110_io"] = {
       const moreBtn = remaining > 0
         ? `<button class="io2110-more-btn">+ Ajouter une source</button>`
         : '';
-      body.innerHTML = _cachedMeta + inner + moreBtn + _cachedTxHtml;
+      const delBtn = _cachedActiveRx > 0
+        ? `<button class="io2110-more-btn io2110-del-rx">− Retirer la dernière source</button>`
+        : '';
+      body.innerHTML = _cachedMeta + inner + moreBtn + delBtn + _cachedTxHtml;
       if (remaining > 0) {
         body.querySelector('.io2110-more-btn').onclick = async (btn) => {
           const el = body.querySelector('.io2110-more-btn');
@@ -341,6 +344,20 @@ window.MXLPlugins["2110_io"] = {
               body: JSON.stringify({kind: 'rx'}),
             });
             if (!r.ok) { const j = await r.json().catch(()=>({})); toast(j.error || 'Erreur activation RX', 'error'); }
+          } catch(e) { toast('Erreur réseau', 'error'); }
+          await refresh();
+        };
+      }
+      const delEl = body.querySelector('.io2110-del-rx');
+      if (delEl) {
+        delEl.onclick = async () => {
+          delEl.disabled = true;
+          try {
+            const r = await fetch(`/api/mtl/${vmid}/deactivate`, {
+              method: 'POST', headers: {'Content-Type': 'application/json'},
+              body: JSON.stringify({kind: 'rx'}),
+            });
+            if (!r.ok) { const j = await r.json().catch(()=>({})); toast(j.error || 'Erreur retrait RX', 'error'); }
           } catch(e) { toast('Erreur réseau', 'error'); }
           await refresh();
         };
