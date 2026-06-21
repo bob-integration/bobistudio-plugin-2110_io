@@ -385,11 +385,22 @@ window.MXLPlugins["2110_io"] = {
         _nicPortCap, 'RX');
       const _xdpAlloc   = c && c.xdp_allocated;
       const _xdpAct     = (c && c.xdp_active) ?? 0;
-      const _xdpUsedPct = _xdpAlloc ? Math.min(100, Math.round(_xdpAct / _xdpAlloc * 100)) : 0;
-      const _xdpColU = _xdpUsedPct > 80 ? 'var(--status-stopped-fg,#f87171)' : _xdpUsedPct > 60 ? '#e8a33d' : 'var(--status-running-fg,#22c55e)';
+      const _xdpHwMax   = c && c.xdp_hw_max_combined;
+      // Saturation RÉELLE = queues DEMANDÉES (allocated = 1 file AF-XDP par session libmtl) vs files
+      // PHYSIQUES de la carte (hw_max_combined). L'ancien « actives / allouées » comparait deux
+      // mauvais nombres → « 31 % vert » alors qu'on demande PLUS de files que la carte n'en a
+      // (sur-souscription : des sessions ne démarrent pas → active < allocated).
+      const _xdpDen     = _xdpHwMax || _xdpAlloc;
+      const _xdpUsedPct = _xdpDen ? Math.min(100, Math.round(_xdpAlloc / _xdpDen * 100)) : 0;
+      const _xdpOver    = (_xdpHwMax != null) && (_xdpAlloc > _xdpHwMax);
+      const _xdpColU = (_xdpOver || _xdpUsedPct >= 100) ? 'var(--status-stopped-fg,#f87171)' : _xdpUsedPct > 85 ? '#e8a33d' : 'var(--status-running-fg,#22c55e)';
+      const _xdpTxt  = (_xdpHwMax != null)
+        ? (_xdpOver ? `${_xdpAlloc} / ${_xdpHwMax} files — SUR-CAPACITÉ (${_xdpAct} actives)`
+                    : `${_xdpAlloc} / ${_xdpHwMax} files (${_xdpUsedPct}%)`)
+        : `${_xdpAct} / ${_xdpAlloc} sessions`;
       const _nicXdpBar = _xdpAlloc != null ? `<div class="nic-bar-wrap">
         <span class="nic-bar-lbl">Queues XDP</span>
-        <span class="nic-bar-val" style="color:${_xdpColU}">${_xdpAct} / ${_xdpAlloc} allouées (${_xdpUsedPct}%)</span>
+        <span class="nic-bar-val" style="color:${_xdpColU}">${_xdpTxt}</span>
         <div class="nic-bar-track"><div class="nic-bar-fill" style="width:${_xdpUsedPct}%;background:${_xdpColU}"></div></div>
       </div>` : '';
       _cachedMeta = `<div class="meta rx-meta">IP : ${esc((c && c.ip) || '—')} — ${recvs.length} / ${_cachedVideoCount} sources · ${activeCount} abonné${activeCount > 1 ? 's' : ''}</div>${_nicH}${_nicRxBar}${_nicXdpBar}`;
