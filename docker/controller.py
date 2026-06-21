@@ -942,6 +942,35 @@ def _flush_ntuple():
         print("ntuple purge échouée:", e, flush=True)
 
 
+# Multicast PTP (SMPTE 2059-2 / IEEE 1588) : Announce/Sync/Delay sur 224.0.1.129, P2P delay sur
+# 224.0.0.107. Faute de règle dédiée, ce trafic est réparti par RSS sur toutes les queues — dont
+# celles possédées par les sockets AF-XDP de libmtl, qui l'avalent → ptp4l noyau ne reçoit plus les
+# Announce → bascules SLAVE↔MASTER permanentes (sans compteur rx_dropped). On l'épingle donc sur la
+# queue 0 (queue noyau : libmtl démarre ses queues de session à ≥1, aucune XSK sur la 0 → XDP_PASS).
+PTP_MCAST = ("224.0.1.129", "224.0.0.107")
+PTP_KERNEL_QUEUE = 0
+
+def _steer_ptp_to_kernel_queue():
+    """(Ré)installe les règles ntuple dirigeant le multicast PTP vers la queue noyau, APRÈS le flush
+    de _launch_mtl (sinon elles seraient purgées). Best-effort : un échec ne bloque pas le moteur."""
+    try:
+        n = 0
+        for grp in PTP_MCAST:
+            rc = subprocess.run(["ethtool", "-N", IFACE, "flow-type", "udp4",
+                                 "dst-ip", grp, "action", str(PTP_KERNEL_QUEUE)],
+                                stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, timeout=5)
+            if rc.returncode == 0:
+                n += 1
+            else:
+                print("steering PTP {} échoué: {}".format(grp, (rc.stderr or b'').decode()[:120]),
+                      flush=True)
+        if n:
+            print("PTP steering: {} groupe(s) multicast épinglé(s) sur la queue {} (noyau/ptp4l)"
+                  .format(n, PTP_KERNEL_QUEUE), flush=True)
+    except Exception as e:
+        print("steering PTP échoué:", e, flush=True)
+
+
 def _kill_mtl():
     """Arrêt GRACIEUX de l'unique mtl_rx : SIGTERM + longue attente pour laisser mtl_uninit
     détacher proprement le XDP et se désinscrire de MtlManager. SIGKILL en TOUT dernier recours.
@@ -1249,6 +1278,9 @@ def _launch_mtl():
     _mtl_proc = subprocess.Popen([MTL_RX, "--config", _CONFIG_PATH])
     _last_launch = time.time()
     print("mtl_rx daemon (re)lancé", flush=True)
+    # APRÈS le launch (donc après le flush ntuple en tête) : épingle le PTP sur la queue noyau,
+    # sinon ses Announce sont avalés par les queues AF-XDP de libmtl (bascules SLAVE↔MASTER).
+    _steer_ptp_to_kernel_queue()
 
 
 def _tx_gen_apply(idx):
