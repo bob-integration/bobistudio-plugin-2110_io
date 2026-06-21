@@ -1,7 +1,10 @@
 {
-  "version": "0.22.17",
-  "date": "2026-06-18",
+  "version": "0.22.18",
+  "date": "2026-06-21",
   "changes": {
+    "Nouveautés (0.22.18)": [
+      "PTP fiable en coexistence AF-XDP (corrige les bascules SLAVE↔MASTER permanentes du ptp4l noyau, ~275/h sur un nœud chargé). Le multicast PTP (224.0.1.129 Announce/Sync/Delay + 224.0.0.107 P2P) n'avait aucune règle de steering : réparti par RSS sur les 48 queues de l'E810, il tombait sur les queues possédées par les sockets AF-XDP de libmtl qui l'avalaient → ptp4l ne recevait plus les Announce (sans compteur rx_dropped, XDP « traite » le paquet) → BMCA basculait le port en grandmaster toutes les ~3 s (announceReceiptTimeout) puis revenait SLAVE quand un Announce passait. controller.py `_steer_ptp_to_kernel_queue()` (ré)installe, dans `_launch_mtl` APRÈS le `_flush_ntuple` (sinon purgé), deux règles ntuple `ethtool -N <iface> flow-type udp4 dst-ip <grp> action 0` épinglant le PTP sur la queue 0 (queue noyau : libmtl démarre ses queues de session à ≥1, aucune XSK sur la 0 → XDP_PASS → ptp4l). Réinstallé à chaque relance du daemon. N'affecte pas les flux média (règles de session inchangées). REBUILD IMAGE REQUIS. NB : le passage des nœuds média en `clientOnly` (ne jamais devenir grandmaster) est complémentaire, côté orchestrateur (ptp4l.conf, sans rebuild)."
+    ],
     "Nouveautés (0.22.17)": [
       "Page Sources 2110 (UI seule — PAS de rebuild image) : bouton « − Retirer la dernière source » à côté de « + Ajouter une source » (décrémente active_rx_count via la nouvelle route POST /api/mtl/<vmid>/deactivate, symétrique de /activate). Libère les files XDP du dernier slot RX."
     ],
