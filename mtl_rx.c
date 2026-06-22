@@ -37,6 +37,15 @@
 #include <mtl/st40_pipeline_api.h>
 #include <json-c/json.h>
 
+/* ── MXL (Media eXchange Layer) ── le moteur produit/consomme des FLOWS MXL (grains vidéo/data,
+ * samples audio) au lieu des rings shm maison. Voir bobimxl.py côté Python (mêmes conventions). */
+#include <mxl/mxl.h>
+#include <mxl/flow.h>
+#include <mxl/time.h>
+#include <mxl/rational.h>
+#define OPENSSL_SUPPRESS_DEPRECATED   /* SHA1_* sont « deprecated » en OpenSSL 3 mais valides */
+#include <openssl/sha.h>
+
 #define MAX_FB    64
 #define MAX_SESS  16
 #define MAX_TG    16   /* cibles (shm de sortie) par session : fan-out même-source → N slots */
@@ -85,13 +94,62 @@ static uint64_t media_ts_to_tai(mtl_handle st, enum st10_timestamp_fmt tfmt,
   return tai;
 }
 
-/* Une cible = un shm de sortie. Une session en porte 1..N (fan-out même-source → N slots).
- * Chaque cible a son propre état d'écriture (index/recv) et son propre IDENT (par slot). */
+/* ═══ MXL ═══ instance globale (un domaine = un sous-rép. tmpfs partagé avec les consommateurs).
+ * Domaine surchargeable par MXL_DOMAIN (isole un banc). Créée dans main(), à vie. */
+static mxlInstance g_mxl = NULL;
+
+/* Namespace UUIDv5 Bobi.Studio = uuid5(NAMESPACE_DNS, "mxl.bobi.studio") — DOIT être identique à
+ * bobimxl._NS_BOBI (sinon les flux écrits ici ne sont pas trouvés par les consommateurs Python). */
+static const uint8_t NS_BOBI[16] = {
+  0xd4, 0xe7, 0x7c, 0xba, 0x0e, 0x52, 0x55, 0xd9, 0x82, 0xed, 0x72, 0x26, 0xb7, 0xbd, 0xa7, 0x57};
+
+/* UUIDv5 (SHA-1) d'un NOM de flux → chaîne canonique (= bobimxl.flow_id). Le flowDef porte cet id ;
+ * le lecteur ouvre le flux par ce même id. */
+static void flow_id_str(const char* name, char out[37]) {
+  SHA_CTX c; unsigned char h[20];
+  SHA1_Init(&c);
+  SHA1_Update(&c, NS_BOBI, 16);
+  SHA1_Update(&c, name, strlen(name));
+  SHA1_Final(h, &c);
+  h[6] = (unsigned char)((h[6] & 0x0f) | 0x50);   /* version 5 */
+  h[8] = (unsigned char)((h[8] & 0x3f) | 0x80);   /* variant RFC 4122 */
+  snprintf(out, 37,
+    "%02x%02x%02x%02x-%02x%02x-%02x%02x-%02x%02x-%02x%02x%02x%02x%02x%02x",
+    h[0],h[1],h[2],h[3],h[4],h[5],h[6],h[7],h[8],h[9],h[10],h[11],h[12],h[13],h[14],h[15]);
+}
+
+/* Nom de flux = basename du shm_path historique (strip /dev/shm/). Le câblage orchestrateur
+ * propage toujours des noms ({hn}_{idx}) → contrat inchangé. */
+static const char* flow_name(const char* shm_path) {
+  if (!strncmp(shm_path, "/dev/shm/", 9)) return shm_path + 9;
+  return shm_path;
+}
+
+/* Cadence (double) → rational standard (grain_rate du flowDef + grille TAL). Miroir de to_st_fps :
+ * les fps « drop » sont rendus en n/1001 pour une grille TAI exacte. */
+static mxlRational fps_to_rational(double f) {
+  mxlRational r = {25, 1};
+  if      (fabs(f - 23.98) < 0.05) { r.numerator = 24000; r.denominator = 1001; }
+  else if (fabs(f - 24.0)  < 0.05) { r.numerator = 24;    r.denominator = 1; }
+  else if (fabs(f - 25.0)  < 0.05) { r.numerator = 25;    r.denominator = 1; }
+  else if (fabs(f - 29.97) < 0.05) { r.numerator = 30000; r.denominator = 1001; }
+  else if (fabs(f - 30.0)  < 0.05) { r.numerator = 30;    r.denominator = 1; }
+  else if (fabs(f - 50.0)  < 0.05) { r.numerator = 50;    r.denominator = 1; }
+  else if (fabs(f - 59.94) < 0.1)  { r.numerator = 60000; r.denominator = 1001; }
+  else if (fabs(f - 60.0)  < 0.05) { r.numerator = 60;    r.denominator = 1; }
+  else if (fabs(f - 100.0) < 0.05) { r.numerator = 100;   r.denominator = 1; }
+  else if (fabs(f - 120.0) < 0.05) { r.numerator = 120;   r.denominator = 1; }
+  return r;
+}
+
+/* Une cible = un FLUX MXL de sortie. Une session en porte 1..N (fan-out même-source → N flux).
+ * Chaque cible a son propre writer (RX/simu) ou reader (TX), son index et son propre IDENT. */
 struct target {
   int      idx;            /* slot d'origine (pour le log) */
-  char     shm_path[300], stats_path[300];
-  uint8_t* shm_base; size_t shm_size; uint8_t* frames_base;
-  uint64_t index;          /* frame_index (vidéo) / chunk_index (audio) */
+  char     shm_path[300], stats_path[300];   /* shm_path = NOM de flux (basename) après strip */
+  mxlFlowWriter writer;    /* RX/simu : producteur du flux MXL (NULL si TX) */
+  mxlFlowReader reader;    /* TX : lecteur du flux d'entrée câblé (NULL si RX ; créé paresseusement) */
+  uint64_t index;          /* dernier index publié/lu (frame_index/chunk_index exposé en stats) */
   uint64_t recv;           /* compteur reçu (pour le débit) */
   uint64_t late;           /* TX vidéo : trames en retard (get_frame > 1,5 période = epoch raté) */
   uint64_t last_feed_ns;   /* TX vidéo : instant (monotone) du dernier get_frame réussi */
@@ -135,6 +193,11 @@ struct sess {
                               entrelacé, côté libmtl). 0 ⇒ open_shm retombe sur slotsize (audio/data). */
   enum st_frame_fmt out_fmt; int plane_h;   /* plane_h = hauteur de CHAMP (H/2) en entrelacé */
   uint8_t* tx_scratch;     /* TX entrelacé + IDENT : trame pleine de travail (overlay avant weave) */
+  uint8_t* rx_scratch;     /* RX entrelacé : trame pleine où l'on weave les 2 champs avant OpenGrain */
+  uint8_t* tx_frame;       /* TX entrelacé : trame pleine source (copie stable du grain) entre champs */
+  /* ── MXL ── grille du flux (grain_rate vidéo/data, sample_rate audio) pour l'index TAI. */
+  mxlRational mrate;       /* vidéo/data : cadence trame (grain_rate) */
+  mxlRational srate;       /* audio : {48000,1} (sample_rate) */
   /* ── audio ── */
   st30p_rx_handle ah;      /* RX */
   st30p_tx_handle a_tx;    /* TX */
@@ -146,16 +209,102 @@ struct sess {
   uint32_t max_udw;        /* taille du buffer UDW (octets) */
 };
 
-static void write_shm_header(struct target* t, uint64_t i) {
-  uint64_t* h = (uint64_t*)t->shm_base;
-  h[0] = i; h[1] = now_ns();
+/* ── flowDef MXL (ressource Flow NMOS IS-04) — mêmes champs/conventions que bobimxl.build_*. ── */
+static void jcomp(struct json_object* arr, const char* nm, int w, int h, int bd) {
+  struct json_object* c = json_object_new_object();
+  json_object_object_add(c, "name", json_object_new_string(nm));
+  json_object_object_add(c, "width", json_object_new_int(w));
+  json_object_object_add(c, "height", json_object_new_int(h));
+  json_object_object_add(c, "bit_depth", json_object_new_int(bd));
+  json_object_array_add(arr, c);
+}
+static struct json_object* jgrouphint(const char* name, const char* role) {
+  struct json_object* tags = json_object_new_object();
+  struct json_object* gh = json_object_new_array();
+  char hint[420]; snprintf(hint, sizeof(hint), "%s:%s", name, role);
+  json_object_array_add(gh, json_object_new_string(hint));
+  json_object_object_add(tags, "urn:x-nmos:tag:grouphint/v1.0", gh);
+  return tags;
+}
+static struct json_object* jrate(mxlRational r) {
+  struct json_object* o = json_object_new_object();
+  json_object_object_add(o, "numerator", json_object_new_int64(r.numerator));
+  json_object_object_add(o, "denominator", json_object_new_int64(r.denominator));
+  return o;
 }
 
-/* off 16 du header shm : timestamp MÉDIA (RTP/PTP), en nanosecondes TAI (0 = inconnu). C'est
- * l'instant de CAPTURE (commun audio/vidéo via le grandmaster PTP, ST 2110-10), pas l'heure
- * d'écriture (now_ns). Additif au contrat [index, write_ts] → rétro-compatible. */
-static void write_shm_media_ts(struct target* t, uint64_t media_ts) {
-  ((uint64_t*)t->shm_base)[2] = media_ts;
+/* Vidéo planar (video/x-mxl-planar) : grain = somme des plans Y+Cb+Cr (octet-identique au shm
+ * maison historique). 422 → Cb/Cr en demi-largeur, pleine hauteur. Renvoie une chaîne heap. */
+static char* build_video_flowdef(struct sess* s, struct target* t) {
+  const char* name = flow_name(t->shm_path);
+  char id[37]; flow_id_str(name, id);
+  struct json_object* o = json_object_new_object();
+  json_object_object_add(o, "id", json_object_new_string(id));
+  json_object_object_add(o, "tags", jgrouphint(name, "Video"));
+  json_object_object_add(o, "format", json_object_new_string("urn:x-nmos:format:video"));
+  json_object_object_add(o, "label", json_object_new_string(name));
+  json_object_object_add(o, "media_type", json_object_new_string("video/x-mxl-planar"));
+  json_object_object_add(o, "grain_rate", jrate(s->mrate));
+  json_object_object_add(o, "frame_width", json_object_new_int(s->width));
+  json_object_object_add(o, "frame_height", json_object_new_int(s->height));
+  json_object_object_add(o, "interlace_mode", json_object_new_string(
+      s->interlaced ? (s->tff ? "interlaced_tff" : "interlaced_bff") : "progressive"));
+  json_object_object_add(o, "colorspace", json_object_new_string("BT709"));
+  struct json_object* comps = json_object_new_array();
+  jcomp(comps, "Y",  s->width,     s->height, s->bit_depth);
+  jcomp(comps, "Cb", s->width / 2, s->height, s->bit_depth);
+  jcomp(comps, "Cr", s->width / 2, s->height, s->bit_depth);
+  json_object_object_add(o, "components", comps);
+  char* out = strdup(json_object_to_json_string(o));
+  json_object_put(o);
+  return out;
+}
+
+/* Audio (audio/float32) : flux CONTINU de samples float32 par canal, 48 kHz. */
+static char* build_audio_flowdef(struct sess* s, struct target* t) {
+  const char* name = flow_name(t->shm_path);
+  char id[37]; flow_id_str(name, id);
+  struct json_object* o = json_object_new_object();
+  json_object_object_add(o, "id", json_object_new_string(id));
+  json_object_object_add(o, "tags", jgrouphint(name, "Audio"));
+  json_object_object_add(o, "format", json_object_new_string("urn:x-nmos:format:audio"));
+  json_object_object_add(o, "label", json_object_new_string(name));
+  json_object_object_add(o, "media_type", json_object_new_string("audio/float32"));
+  mxlRational sr = {48000, 1};
+  json_object_object_add(o, "sample_rate", jrate(sr));
+  json_object_object_add(o, "channel_count", json_object_new_int(s->channels));
+  json_object_object_add(o, "bit_depth", json_object_new_int(32));
+  char* out = strdup(json_object_to_json_string(o));
+  json_object_put(o);
+  return out;
+}
+
+/* Data/ANC (video/smpte291) : grain = payload ANC sérialisée (meta+udw). */
+static char* build_data_flowdef(struct sess* s, struct target* t) {
+  const char* name = flow_name(t->shm_path);
+  char id[37]; flow_id_str(name, id);
+  struct json_object* o = json_object_new_object();
+  json_object_object_add(o, "id", json_object_new_string(id));
+  json_object_object_add(o, "tags", jgrouphint(name, "Data"));
+  json_object_object_add(o, "format", json_object_new_string("urn:x-nmos:format:data"));
+  json_object_object_add(o, "label", json_object_new_string(name));
+  json_object_object_add(o, "media_type", json_object_new_string("video/smpte291"));
+  json_object_object_add(o, "grain_rate", jrate(s->mrate));
+  char* out = strdup(json_object_to_json_string(o));
+  json_object_put(o);
+  return out;
+}
+
+/* Crée le writer MXL d'une cible à partir d'un flowDef (RX/simu). Renvoie 0 si OK. */
+static int open_writer(struct target* t, char* flowdef) {
+  bool created = false;
+  mxlStatus st = mxlCreateFlowWriter(g_mxl, flowdef, NULL, &t->writer, NULL, &created);
+  free(flowdef);
+  if (st != MXL_STATUS_OK) {
+    fprintf(stderr, "mtl_rx: mxlCreateFlowWriter(%s) -> %d\n", flow_name(t->shm_path), (int)st);
+    return -1;
+  }
+  return 0;
 }
 
 /* Latence de réception (segment A) : Δ entre l'instant de CAPTURE média (media_ts, TAI) et
@@ -291,42 +440,48 @@ static void* video_rx_thread(void* arg) {
     /* af_xdp/copy_mode : décodage unique → fan-out vers chaque cible (slot shm).
      * Chaque cible a son propre ring/index + son propre IDENT. */
     if (s->interlaced) {
-      /* On reçoit UN CHAMP par appel ; libmtl pose frame->second_field. On weave les 2 champs dans
-       * le MÊME slot (trame pleine) et on ne PUBLIE (header + index) qu'au 2e champ → les
-       * consommateurs lisent toujours une trame complète, jamais une demi-trame. */
+      /* On reçoit UN CHAMP par appel (libmtl pose second_field). On weave les 2 champs dans une
+       * trame pleine de travail (rx_scratch) ; on n'OUVRE/COMMIT le grain MXL qu'au 2e champ → les
+       * consommateurs lisent toujours une trame complète. Le grain est committé à l'INDEX TAI du
+       * 1er champ (instant de capture de la trame) → phase-lock A/V. */
       int sf = frame->second_field ? 1 : 0;
       int parity = field_parity(sf, s->tff);
       if (!sf) mts_latch = mts;                    /* capture = instant du 1er champ */
-      for (int ti = 0; ti < s->ntg; ti++) {
-        struct target* t = &s->tg[ti];
-        uint64_t fi = t->index;                    /* index NON bumpé tant que la trame est partielle */
-        uint8_t* dst = t->frames_base + (size_t)(fi % s->ring) * s->shm_slotsize;
-        field_weave(s->width, s->height, s->conv8, frame, dst, parity, 0);
-        if (sf) {                                  /* 2e champ : trame complète */
-          if (t->has_ident) { load_ident_patch(t); overlay_ident(s, t, dst, s->bit_depth); }
-          write_shm_header(t, fi);
-          write_shm_media_ts(t, mts_latch);
+      if (!s->rx_scratch) s->rx_scratch = malloc(s->shm_slotsize);
+      if (s->rx_scratch) field_weave(s->width, s->height, s->conv8, frame, s->rx_scratch, parity, 0);
+      if (sf && s->rx_scratch) {                   /* 2e champ : trame complète → publier */
+        uint64_t fi = mts_latch ? mxlTimestampToIndex(&s->mrate, mts_latch)
+                                : mxlGetCurrentIndex(&s->mrate);
+        for (int ti = 0; ti < s->ntg; ti++) {
+          struct target* t = &s->tg[ti];
+          mxlGrainInfo gi; uint8_t* payload;
+          if (mxlFlowWriterOpenGrain(t->writer, fi, &gi, &payload) != MXL_STATUS_OK) continue;
+          memcpy(payload, s->rx_scratch, s->shm_slotsize);
+          if (t->has_ident) { load_ident_patch(t); overlay_ident(s, t, payload, s->bit_depth); }
+          gi.validSlices = gi.totalSlices;
+          mxlFlowWriterCommitGrain(t->writer, &gi);
           accum_rx_latency(t, mts_latch);
-          t->index = fi + 1; t->recv++;
+          t->index = fi; t->recv++;
         }
       }
     } else {
+      uint64_t fi = mts ? mxlTimestampToIndex(&s->mrate, mts) : mxlGetCurrentIndex(&s->mrate);
       for (int ti = 0; ti < s->ntg; ti++) {
         struct target* t = &s->tg[ti];
-        uint64_t fi = t->index;
-        uint8_t* dst = t->frames_base + (size_t)(fi % s->ring) * s->slotsize;
-        if (s->conv8) {
+        mxlGrainInfo gi; uint8_t* payload;
+        if (mxlFlowWriterOpenGrain(t->writer, fi, &gi, &payload) != MXL_STATUS_OK) continue;
+        if (s->conv8) {                            /* 10→8 bits (planar10 libmtl → planar8 grain) */
           const uint16_t* src = (const uint16_t*)frame->addr[0];
           size_t n = s->slotsize;
-          for (size_t k = 0; k < n; k++) dst[k] = (uint8_t)(src[k] >> 2);
+          for (size_t k = 0; k < n; k++) payload[k] = (uint8_t)(src[k] >> 2);
         } else {
-          memcpy(dst, frame->addr[0], s->slotsize);
+          memcpy(payload, frame->addr[0], s->slotsize);
         }
-        if (t->has_ident) { load_ident_patch(t); overlay_ident(s, t, dst, s->bit_depth); }
-        write_shm_header(t, fi);
-        write_shm_media_ts(t, mts);
+        if (t->has_ident) { load_ident_patch(t); overlay_ident(s, t, payload, s->bit_depth); }
+        gi.validSlices = gi.totalSlices;
+        mxlFlowWriterCommitGrain(t->writer, &gi);
         accum_rx_latency(t, mts);
-        t->index = fi + 1; t->recv++;
+        t->index = fi; t->recv++;
       }
     }
     st20p_rx_put_frame(s->vh, frame);
@@ -335,25 +490,45 @@ static void* video_rx_thread(void* arg) {
 }
 
 /* ═══ AUDIO ═══════════════════════════════════════════════════════════════════ */
-/* st30p délivre le payload L24 du fil = BIG-ENDIAN. Le pipeline MXL audio est désormais en BE
- * (wire-native) → on écrit le chunk TEL QUEL dans le ring, ZÉRO conversion (passthrough). */
+/* st30p délivre le payload L24 du fil = BIG-ENDIAN, entrelacé par échantillon (chs canaux × 3 o).
+ * On le CONVERTIT en samples float32 par canal (contrat MXL audio/float32) et on l'écrit dans le
+ * flux continu MXL, à l'INDEX SAMPLE TAI (mxlTimestampToIndex sur la grille 48 kHz) → MÊME grille
+ * PTP que la vidéo (phase-lock A/V structurel). */
 static void* audio_rx_thread(void* arg) {
   struct sess* s = arg;
+  int chs = s->channels;
   while (!s->stop) {
     struct st30_frame* frame = st30p_rx_get_frame(s->ah);
     if (!frame) { usleep(500); continue; }
-    size_t n = frame->data_size < s->slotsize ? frame->data_size : s->slotsize;
-    /* Timestamp MÉDIA (capture) du chunk, TAI ns — MÊME horloge PTP que la vidéo (sampling 48 kHz). */
+    const uint8_t* src = (const uint8_t*)frame->addr;
+    size_t n = frame->data_size / (size_t)(chs * 3);   /* samples par canal dans ce chunk (~48) */
+    if (!n) { st30p_rx_put_frame(s->ah, frame); continue; }
     uint64_t mts = media_ts_to_tai(s->st, frame->tfmt, frame->timestamp, MEDIA_CLK_AUDIO);
-    for (int ti = 0; ti < s->ntg; ti++) {        /* fan-out (même source audio → N slots) */
+    for (int ti = 0; ti < s->ntg; ti++) {        /* fan-out (même source audio → N flux) */
       struct target* t = &s->tg[ti];
-      uint64_t ci = t->index;
-      uint8_t* dst = t->frames_base + (size_t)(ci % s->ring) * s->slotsize;   /* slotsize = 1152 */
-      memcpy(dst, frame->addr, n);
-      if (n < s->slotsize) memset(dst + n, 0, s->slotsize - n);
-      write_shm_header(t, ci);
-      write_shm_media_ts(t, mts);
-      t->index = ci + 1; t->recv++;
+      uint64_t idx = mts ? mxlTimestampToIndex(&s->srate, mts)
+                         : mxlGetCurrentIndex(&s->srate) - n;
+      mxlMutableWrappedMultiBufferSlice slc; memset(&slc, 0, sizeof(slc));
+      if (mxlFlowWriterOpenSamples(t->writer, idx, n, &slc) != MXL_STATUS_OK) continue;
+      size_t stride = slc.stride;
+      for (size_t c = 0; c < slc.count; c++) {
+        size_t pos = 0;
+        for (int f = 0; f < 2; f++) {            /* 2 fragments (wrap d'anneau) */
+          size_t fb = slc.base.fragments[f].size;
+          if (!fb) continue;
+          float* dst = (float*)((uint8_t*)slc.base.fragments[f].pointer + c * stride);
+          size_t cnt = fb / 4;
+          for (size_t k = 0; k < cnt; k++) {
+            const uint8_t* p = src + ((pos + k) * (size_t)chs + c) * 3;   /* L24 BE entrelacé */
+            int32_t v = (int32_t)((uint32_t)p[0] << 16 | (uint32_t)p[1] << 8 | p[2]);
+            if (v & 0x800000) v |= ~0xFFFFFF;    /* sign-extend 24→32 bits */
+            dst[k] = (float)v / 8388608.0f;
+          }
+          pos += cnt;
+        }
+      }
+      mxlFlowWriterCommitSamples(t->writer);
+      t->index = idx; t->recv++;
     }
     st30p_rx_put_frame(s->ah, frame);
   }
@@ -387,29 +562,14 @@ static enum st30_ptime to_st30_ptime(double ms) {
   return ST30_PTIME_1MS;
 }
 
-/* mmap (création + ftruncate) du shm d'une cible, header à l'offset 0. Taille = hdr + ring*slot
- * (dimensions de la session, communes à toutes ses cibles). */
-static int open_shm(struct sess* s, struct target* t) {
-  /* Slot = TRAME PLEINE (shm_slotsize) en vidéo entrelacée ; sinon (progressif/audio/data)
-   * shm_slotsize vaut 0 → on retombe sur slotsize (comportement historique). */
-  size_t slot = s->shm_slotsize ? s->shm_slotsize : s->slotsize;
-  size_t raw = (size_t)s->hdr + (size_t)s->ring * slot;
-  size_t pg = (size_t)sysconf(_SC_PAGESIZE);
-  t->shm_size = (raw + pg - 1) & ~(pg - 1);
-  int fd = open(t->shm_path, O_CREAT | O_RDWR, 0666);
-  if (fd < 0) { perror("open shm"); return -1; }
-  if (ftruncate(fd, t->shm_size) < 0) { perror("ftruncate"); close(fd); return -1; }
-  t->shm_base = mmap(NULL, t->shm_size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
-  close(fd);
-  if (t->shm_base == MAP_FAILED) { perror("mmap"); return -1; }
-  t->frames_base = t->shm_base + s->hdr;
-  return 0;
-}
-
-/* Ouvre toutes les cibles de la session (slotsize/ring/hdr déjà calculés). */
+/* Crée le writer MXL de chaque cible RX/simu (le flowDef dépend du kind ; mrate/srate déjà posés). */
 static int open_targets(struct sess* s) {
-  for (int ti = 0; ti < s->ntg; ti++)
-    if (open_shm(s, &s->tg[ti]) != 0) return -1;
+  for (int ti = 0; ti < s->ntg; ti++) {
+    char* fd = (s->kind == K_AUDIO) ? build_audio_flowdef(s, &s->tg[ti])
+             : (s->kind == K_DATA)  ? build_data_flowdef(s, &s->tg[ti])
+             :                        build_video_flowdef(s, &s->tg[ti]);
+    if (open_writer(&s->tg[ti], fd) != 0) return -1;
+  }
   return 0;
 }
 
@@ -441,8 +601,9 @@ static int setup_video(struct sess* s) {
   if (!s->vh) { fprintf(stderr, "mtl_rx: st20p_rx_create fail (video %s:%d)\n", s->mcast, s->udp_port); return -1; }
   s->src_framesize = st20p_rx_frame_size(s->vh);   /* = taille CHAMP si entrelacé (st_frame_size/2) */
   s->slotsize = s->conv8 ? s->src_framesize / 2 : s->src_framesize;
-  /* Slot shm = TRAME PLEINE : en entrelacé on weave 2 champs (×2) ; en progressif = slotsize. */
+  /* Grain MXL = TRAME PLEINE : en entrelacé on weave 2 champs (×2) ; en progressif = slotsize. */
   s->shm_slotsize = s->interlaced ? s->slotsize * 2 : s->slotsize;
+  s->mrate = fps_to_rational(s->fps);            /* grain_rate du flowDef + grille TAI vidéo */
   if (open_targets(s) != 0) return -1;
   fprintf(stderr, "mtl_rx[video] %dx%d%s fps=%.2f pt=%d mc=%s:%d slot=%zu ring=%d → %d cible(s):",
           s->width, s->height, s->interlaced ? "i" : "p", s->fps, s->payload_type,
@@ -452,31 +613,38 @@ static int setup_video(struct sess* s) {
   return pthread_create(&s->thread, NULL, video_rx_thread, s) == 0 ? (s->started = 1, 0) : -1;
 }
 
-/* ═══ VIDÉO TX (shm→wire, st20p_tx) ═══════════════════════════════════════════ */
-/* Ouvre un shm EXISTANT en lecture (le shm d'entrée du TX, écrit par un producteur). Ne crée ni ne
- * tronque (ne pas resizer le shm du producteur). Renvoie 0 si mappé et assez grand. */
-static int open_shm_in(struct sess* s, struct target* t, size_t want) {
-  char path[320];   /* défensif : un nom relatif (ex. "mtl_0") → /dev/shm/mtl_0 */
-  if (t->shm_path[0] == '/') snprintf(path, sizeof(path), "%s", t->shm_path);
-  else snprintf(path, sizeof(path), "/dev/shm/%s", t->shm_path);
-  int fd = open(path, O_RDWR);
-  if (fd < 0) return -1;
-  struct stat stt;
-  if (fstat(fd, &stt) != 0 || (size_t)stt.st_size < want) { close(fd); return -1; }
-  t->shm_size = (size_t)stt.st_size;
-  t->shm_base = mmap(NULL, t->shm_size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
-  close(fd);
-  if (t->shm_base == MAP_FAILED) { t->shm_base = NULL; return -1; }
-  t->frames_base = t->shm_base + s->hdr;
+/* ═══ TX commun (lecture du flux d'entrée câblé via un reader MXL) ═════════════ */
+/* Crée (paresseusement) le reader MXL du flux d'entrée câblé. -1 si le flux n'existe pas encore
+ * (le producteur peut démarrer après nous) → l'appelant réessaie. */
+static int open_reader(struct target* t) {
+  char id[37]; flow_id_str(flow_name(t->shm_path), id);
+  if (mxlCreateFlowReader(g_mxl, id, NULL, &t->reader) != MXL_STATUS_OK) { t->reader = NULL; return -1; }
   return 0;
 }
 
-/* Feeder TX : lit la frame courante du shm d'entrée (header [index,ts], ring) et l'émet. Up-shift
- * 8→10 si le pipeline est en 8 bits (transport 2110-20 = 422-10). Le shm d'entrée est mappé
- * PARESSEUSEMENT (le producteur peut démarrer après nous). Pacing assuré par ST20P_TX_FLAG_BLOCK_GET. */
+/* Dernier grain dispo (NON bloquant) → 0 + (gi,payload), ou -1. Flux recréé (producteur redéployé)
+ * → libère le reader pour forcer une recréation au tour suivant. */
+static int reader_latest(struct target* t, mxlGrainInfo* gi, uint8_t** payload) {
+  mxlFlowRuntimeInfo rt;
+  mxlStatus st = mxlFlowReaderGetRuntimeInfo(t->reader, &rt);
+  if (st == MXL_STATUS_OK && rt.headIndex != MXL_UNDEFINED_INDEX) {
+    st = mxlFlowReaderGetGrainNonBlocking(t->reader, rt.headIndex, gi, payload);
+    if (st == MXL_STATUS_OK) return 0;
+  }
+  if (st == MXL_ERR_FLOW_NOT_FOUND || st == MXL_ERR_FLOW_INVALID) {
+    mxlReleaseFlowReader(g_mxl, t->reader); t->reader = NULL;
+  }
+  return -1;
+}
+
+/* ═══ VIDÉO TX (flux MXL → wire, st20p_tx) ═════════════════════════════════════ */
+
+/* Feeder TX : lit le DERNIER grain du flux MXL d'entrée câblé et l'émet. Up-shift 8→10 si le
+ * pipeline est en 8 bits (transport 2110-20 = 422-10). Le reader est créé PARESSEUSEMENT (le
+ * producteur peut démarrer après nous). Pacing assuré par ST20P_TX_FLAG_BLOCK_GET. */
 static void* video_tx_thread(void* arg) {
   struct sess* s = arg;
-  struct target* t = &s->tg[0];                 /* la cible TX = l'unique shm d'entrée */
+  struct target* t = &s->tg[0];                 /* la cible TX = l'unique flux d'entrée câblé */
   size_t out_size = st20p_tx_frame_size(s->vth);   /* = taille CHAMP si entrelacé */
   uint64_t latched_fi = 0;                      /* entrelacé : index latché sur le 1er champ */
   /* Période nominale entre deux get_frame (BLOCK_GET pace à la cadence de la session ; en
@@ -485,9 +653,9 @@ static void* video_tx_thread(void* arg) {
   uint64_t period_ns = s->fps > 0 ? (uint64_t)(1e9 / s->fps) : 0;
   if (s->interlaced) period_ns /= 2;
   while (!s->stop) {
-    if (!t->shm_base) {
-      t->last_feed_ns = 0;   /* shm pas encore là : ne pas compter l'attente comme du retard */
-      if (open_shm_in(s, t, (size_t)s->hdr + s->slotsize) != 0) { usleep(20000); continue; }
+    if (!t->reader) {
+      t->last_feed_ns = 0;   /* flux pas encore là : ne pas compter l'attente comme du retard */
+      if (open_reader(t) != 0) { usleep(20000); continue; }
     }
     struct st_frame* frame = st20p_tx_get_frame(s->vth);   /* bloque → pacing à fps */
     if (!frame) { usleep(1000); continue; }
@@ -502,54 +670,55 @@ static void* video_tx_thread(void* arg) {
     t->last_feed_ns = tnow;
     if (s->interlaced) {
       /* Un CHAMP par appel (libmtl pose/alterne second_field). Les 2 champs d'une trame viennent du
-       * MÊME slot shm → on latche l'index sur le 1er champ, réutilisé pour le 2e (évite le combing si
-       * le producteur avance entre les deux get_frame). On dé-weave la trame pleine en lignes. */
+       * MÊME grain → on copie le grain (trame pleine) dans tx_frame au 1er champ, réutilisé pour le
+       * 2e (évite le combing si le producteur avance entre les deux get_frame). Dé-weave en lignes. */
       int sf = frame->second_field ? 1 : 0;
       int parity = field_parity(sf, s->tff);
-      uint64_t fi = sf ? latched_fi : (latched_fi = ((volatile uint64_t*)t->shm_base)[0]);
-      long slot = (long)(fi % s->ring);
-      uint8_t* src = t->frames_base + (size_t)slot * s->slotsize;   /* slot = TRAME PLEINE */
-      /* IDENT : le buffer libmtl est un CHAMP → on incruste sur une trame pleine de travail
-       * (au bit_depth du shm) puis on dé-weave depuis ce scratch. Coût nul si IDENT off. */
-      if (t->has_ident) {
-        load_ident_patch(t);
-        if (t->ident_patch) {
-          if (!s->tx_scratch) s->tx_scratch = malloc(s->slotsize);
-          if (s->tx_scratch) {
-            memcpy(s->tx_scratch, src, s->slotsize);
-            overlay_ident(s, t, s->tx_scratch, s->bit_depth);
-            src = s->tx_scratch;
-          }
+      if (!s->tx_frame) s->tx_frame = malloc(s->shm_slotsize);
+      if (!sf) {                                 /* 1er champ : (re)charger la trame source */
+        mxlGrainInfo gi; uint8_t* payload;
+        if (s->tx_frame && reader_latest(t, &gi, &payload) == 0) {
+          memcpy(s->tx_frame, payload, s->shm_slotsize);   /* grain = trame pleine */
+          latched_fi = gi.index;
+          if (t->has_ident) { load_ident_patch(t);
+            if (t->ident_patch) overlay_ident(s, t, s->tx_frame, s->bit_depth); }
+        } else if (s->tx_frame) {
+          memset(s->tx_frame, 0, s->shm_slotsize);          /* pas de grain → trame neutre */
         }
       }
-      field_weave(s->width, s->height, (s->bit_depth == 8), frame, src, parity, 1);
+      if (s->tx_frame) field_weave(s->width, s->height, (s->bit_depth == 8), frame, s->tx_frame, parity, 1);
+      else memset(frame->addr[0], 0, out_size);
       st20p_tx_put_frame(s->vth, frame);
-      t->index = fi; t->recv++;
+      t->index = latched_fi; t->recv++;
     } else {
-      uint64_t fi = ((volatile uint64_t*)t->shm_base)[0];
-      long slot = (long)(fi % s->ring);
-      const uint8_t* src = t->frames_base + (size_t)slot * s->slotsize;
+      mxlGrainInfo gi; uint8_t* payload;
       uint8_t* dst = (uint8_t*)frame->addr[0];
-      if (s->bit_depth == 8) {
-        uint16_t* d16 = (uint16_t*)dst;
-        size_t n = s->slotsize;                 /* 8 bits : slotsize octets = n échantillons */
-        for (size_t k = 0; k < n; k++) d16[k] = (uint16_t)src[k] << 2;   /* 8→10 */
+      if (reader_latest(t, &gi, &payload) == 0) {
+        if (s->bit_depth == 8) {
+          uint16_t* d16 = (uint16_t*)dst;
+          size_t n = s->slotsize;               /* 8 bits : slotsize octets = n échantillons */
+          for (size_t k = 0; k < n; k++) d16[k] = (uint16_t)payload[k] << 2;   /* 8→10 */
+        } else {
+          memcpy(dst, payload, out_size < s->slotsize ? out_size : s->slotsize);
+        }
+        /* IDENT : dst est une trame pleine planaire TOUJOURS 10-bit (input_fmt PLANAR10LE). */
+        if (t->has_ident) { load_ident_patch(t); overlay_ident(s, t, dst, 10); }
+        t->index = gi.index;
       } else {
-        memcpy(dst, src, out_size < s->slotsize ? out_size : s->slotsize);
+        memset(dst, 0, out_size);               /* pas de grain → trame neutre */
       }
-      /* IDENT : dst est une trame pleine planaire TOUJOURS 10-bit (input_fmt PLANAR10LE). */
-      if (t->has_ident) { load_ident_patch(t); overlay_ident(s, t, dst, 10); }
       st20p_tx_put_frame(s->vth, frame);
-      t->index = fi; t->recv++;
+      t->recv++;
     }
   }
   return NULL;
 }
 
 static int setup_video_tx(struct sess* s) {
-  if (s->ring < 2) s->ring = 2;                 /* ring du shm d'ENTRÉE (réglage du producteur) */
-  /* taille d'un slot du shm d'entrée (422 planar : 8b = 2·w·h octets, 10b = 4·w·h octets) */
+  if (s->ring < 2) s->ring = 2;                 /* (vestige) — MXL gère le ring du flux d'entrée */
+  /* taille d'une TRAME PLEINE du flux d'entrée (422 planar : 8b = 2·w·h, 10b = 4·w·h) = grainSize */
   s->slotsize = (size_t)(s->bit_depth == 8 ? 2 : 4) * (size_t)s->width * (size_t)s->height;
+  s->shm_slotsize = s->slotsize;                /* entrelacé : grain = trame pleine (tx_frame) */
 
   struct st20p_tx_ops ops; memset(&ops, 0, sizeof(ops));
   ops.name = "bobi_mtl_vtx";
@@ -598,6 +767,7 @@ static int setup_audio(struct sess* s) {
 
   s->ah = st30p_rx_create(s->st, &ops);
   if (!s->ah) { fprintf(stderr, "mtl_rx: st30p_rx_create fail (audio %s:%d)\n", s->mcast, s->udp_port); return -1; }
+  s->srate.numerator = 48000; s->srate.denominator = 1;   /* grille sample TAI */
   if (open_targets(s) != 0) return -1;
   fprintf(stderr, "mtl_rx[audio] %dch L24/48k pt=%d mc=%s:%d slot=%zu ring=%d → %d cible(s):",
           s->channels, s->payload_type, s->mcast, s->udp_port, s->slotsize, s->ring, s->ntg);
@@ -606,25 +776,63 @@ static int setup_audio(struct sess* s) {
   return pthread_create(&s->thread, NULL, audio_rx_thread, s) == 0 ? (s->started = 1, 0) : -1;
 }
 
-/* ═══ AUDIO TX (shm→wire, st30p_tx) ═══════════════════════════════════════════ */
-/* Feeder audio TX : lit le chunk courant du shm d'entrée (L24 BE = wire-native) et l'émet TEL QUEL
- * (passthrough, zéro conversion — le shm MXL audio est déjà en BE). shm mappé paresseusement. */
+/* ═══ AUDIO TX (flux MXL → wire, st30p_tx) ═════════════════════════════════════ */
+/* Derniers `n` samples dispo (NON bloquant) du flux audio → slc, ou -1. Recrée le reader si le
+ * flux a été invalidé (producteur redéployé). */
+static int reader_samples(struct target* t, size_t n, mxlWrappedMultiBufferSlice* slc) {
+  mxlFlowRuntimeInfo rt;
+  mxlStatus st = mxlFlowReaderGetRuntimeInfo(t->reader, &rt);
+  if (st == MXL_STATUS_OK && rt.headIndex != MXL_UNDEFINED_INDEX) {
+    st = mxlFlowReaderGetSamplesNonBlocking(t->reader, rt.headIndex, n, slc);
+    if (st == MXL_STATUS_OK) return 0;
+  }
+  if (st == MXL_ERR_FLOW_NOT_FOUND || st == MXL_ERR_FLOW_INVALID) {
+    mxlReleaseFlowReader(g_mxl, t->reader); t->reader = NULL;
+  }
+  return -1;
+}
+
+/* Feeder audio TX : lit les derniers samples float32 du flux MXL d'entrée câblé, les CONVERTIT en
+ * L24 BG (wire-native ST 2110-30) et les émet. reader créé paresseusement, pacing par BLOCK_GET. */
 static void* audio_tx_thread(void* arg) {
   struct sess* s = arg;
   struct target* t = &s->tg[0];
+  int chs = s->channels;
   while (!s->stop) {
-    if (!t->shm_base) {
-      if (open_shm_in(s, t, (size_t)s->hdr + s->slotsize) != 0) { usleep(20000); continue; }
+    if (!t->reader) {
+      if (open_reader(t) != 0) { usleep(20000); continue; }
     }
     struct st30_frame* frame = st30p_tx_get_frame(s->a_tx);   /* bloque (BLOCK_GET) → pacing 1ms */
     if (!frame) { usleep(500); continue; }
-    uint64_t ci = ((volatile uint64_t*)t->shm_base)[0];
-    long slot = (long)(ci % s->ring);
-    const uint8_t* src = t->frames_base + (size_t)slot * s->slotsize;
-    size_t n = frame->data_size < s->slotsize ? frame->data_size : s->slotsize;
-    memcpy(frame->addr, src, n);                              /* BE shm → BE fil = passthrough */
+    uint8_t* dst = (uint8_t*)frame->addr;
+    size_t n = frame->data_size / (size_t)(chs * 3);          /* samples par canal à émettre */
+    mxlWrappedMultiBufferSlice slc; memset(&slc, 0, sizeof(slc));
+    if (n && reader_samples(t, n, &slc) == 0) {
+      size_t stride = slc.stride;
+      for (size_t c = 0; c < slc.count; c++) {
+        size_t pos = 0;
+        for (int f = 0; f < 2; f++) {
+          size_t fb = slc.base.fragments[f].size;
+          if (!fb) continue;
+          const float* sp = (const float*)((const uint8_t*)slc.base.fragments[f].pointer + c * stride);
+          size_t cnt = fb / 4;
+          for (size_t k = 0; k < cnt; k++) {
+            float v = sp[k];
+            if (v > 1.0f) v = 1.0f; else if (v < -1.0f) v = -1.0f;
+            int32_t iv = (int32_t)lrintf(v * 8388607.0f);      /* float → 24 bits signés */
+            uint8_t* p = dst + ((pos + k) * (size_t)chs + c) * 3;
+            p[0] = (uint8_t)((iv >> 16) & 0xff);               /* big-endian (wire) */
+            p[1] = (uint8_t)((iv >> 8) & 0xff);
+            p[2] = (uint8_t)(iv & 0xff);
+          }
+          pos += cnt;
+        }
+      }
+    } else {
+      memset(dst, 0, frame->data_size);                        /* pas de samples → silence */
+    }
     st30p_tx_put_frame(s->a_tx, frame);
-    t->index = ci; t->recv++;
+    t->recv++;
   }
   return NULL;
 }
@@ -695,11 +903,12 @@ static void* data_rx_thread(void* arg) {
     uint32_t fill = frame->udw_buffer_fill; if (fill > s->max_udw) fill = s->max_udw;
     size_t need = 8 + (size_t)mn * sizeof(struct anc_meta_rec) + fill;
     char tc[16]; int df = 0; int got_tc = decode_atc(frame, tc, &df);
+    uint64_t idx = mxlGetCurrentIndex(&s->mrate);   /* grille trame TAI (ANC ~1 grain/trame) */
     for (int ti = 0; ti < s->ntg; ti++) {
       struct target* t = &s->tg[ti];
-      uint64_t ci = t->index;
-      uint8_t* dst = t->frames_base + (size_t)(ci % s->ring) * s->slotsize;
-      if (need <= s->slotsize) {
+      mxlGrainInfo gi; uint8_t* dst;
+      if (mxlFlowWriterOpenGrain(t->writer, idx, &gi, &dst) != MXL_STATUS_OK) continue;
+      if (need <= gi.grainSize) {
         ((uint32_t*)dst)[0] = mn; ((uint32_t*)dst)[1] = fill;
         struct anc_meta_rec* mr = (struct anc_meta_rec*)(dst + 8);
         for (uint32_t m = 0; m < mn; m++) {
@@ -710,12 +919,13 @@ static void* data_rx_thread(void* arg) {
           mr[m].c = md->c; mr[m].s = md->s;
         }
         if (fill) memcpy(dst + 8 + (size_t)mn * sizeof(struct anc_meta_rec), frame->udw_buff_addr, fill);
-      } else {   /* frame anormalement gros → slot vide (on ne déborde jamais) */
+      } else {   /* frame anormalement gros → grain vide (on ne déborde jamais) */
         ((uint32_t*)dst)[0] = 0; ((uint32_t*)dst)[1] = 0;
       }
       if (got_tc) { memcpy(t->tc, tc, sizeof(t->tc)); t->tc_df = df; t->tc_valid = 1; }
-      write_shm_header(t, ci);
-      t->index = ci + 1; t->recv++;
+      gi.validSlices = gi.totalSlices;
+      mxlFlowWriterCommitGrain(t->writer, &gi);
+      t->index = idx; t->recv++;
     }
     st40p_rx_put_frame(s->d_rx, frame);
   }
@@ -728,29 +938,31 @@ static void* data_tx_thread(void* arg) {
   struct sess* s = arg;
   struct target* t = &s->tg[0];
   while (!s->stop) {
-    if (!t->shm_base) {
-      if (open_shm_in(s, t, (size_t)s->hdr + s->slotsize) != 0) { usleep(20000); continue; }
-    }
+    if (!t->reader) { if (open_reader(t) != 0) { usleep(20000); continue; } }
     struct st40_frame_info* frame = st40p_tx_get_frame(s->d_tx);   /* bloque (BLOCK_GET) → pacing fps */
     if (!frame) { usleep(1000); continue; }
-    uint64_t ci = ((volatile uint64_t*)t->shm_base)[0];
-    const uint8_t* src = t->frames_base + (size_t)(ci % s->ring) * s->slotsize;
-    uint32_t mn = ((const uint32_t*)src)[0]; if (mn > ST40_MAX_META) mn = 0;
-    uint32_t fill = ((const uint32_t*)src)[1]; if (fill > s->max_udw) fill = s->max_udw;
-    const struct anc_meta_rec* mr = (const struct anc_meta_rec*)(src + 8);
-    frame->meta_num = mn;
-    for (uint32_t m = 0; m < mn; m++) {
-      struct st40_meta* md = &frame->meta[m];
-      md->did = mr[m].did; md->sdid = mr[m].sdid;
-      md->line_number = mr[m].line; md->hori_offset = mr[m].hori;
-      md->udw_size = mr[m].udw_size; md->udw_offset = mr[m].udw_offset;
-      md->c = mr[m].c; md->s = mr[m].s; md->stream_num = 0;
+    mxlGrainInfo gi; uint8_t* src;
+    if (reader_latest(t, &gi, &src) == 0) {
+      uint32_t mn = ((const uint32_t*)src)[0]; if (mn > ST40_MAX_META) mn = 0;
+      uint32_t fill = ((const uint32_t*)src)[1]; if (fill > s->max_udw) fill = s->max_udw;
+      const struct anc_meta_rec* mr = (const struct anc_meta_rec*)(src + 8);
+      frame->meta_num = mn;
+      for (uint32_t m = 0; m < mn; m++) {
+        struct st40_meta* md = &frame->meta[m];
+        md->did = mr[m].did; md->sdid = mr[m].sdid;
+        md->line_number = mr[m].line; md->hori_offset = mr[m].hori;
+        md->udw_size = mr[m].udw_size; md->udw_offset = mr[m].udw_offset;
+        md->c = mr[m].c; md->s = mr[m].s; md->stream_num = 0;
+      }
+      if (fill && frame->udw_buff_addr)
+        memcpy(frame->udw_buff_addr, src + 8 + (size_t)mn * sizeof(struct anc_meta_rec), fill);
+      frame->udw_buffer_fill = fill;
+      t->index = gi.index;
+    } else {
+      frame->meta_num = 0; frame->udw_buffer_fill = 0;   /* pas de grain → ANC vide */
     }
-    if (fill && frame->udw_buff_addr)
-      memcpy(frame->udw_buff_addr, src + 8 + (size_t)mn * sizeof(struct anc_meta_rec), fill);
-    frame->udw_buffer_fill = fill;
     st40p_tx_put_frame(s->d_tx, frame);
-    t->index = ci; t->recv++;
+    t->recv++;
   }
   return NULL;
 }
@@ -774,6 +986,7 @@ static int setup_data(struct sess* s) {
 
   s->d_rx = st40p_rx_create(s->st, &ops);
   if (!s->d_rx) { fprintf(stderr, "mtl_rx: st40p_rx_create fail (data %s:%d)\n", s->mcast, s->udp_port); return -1; }
+  s->mrate = fps_to_rational(s->fps);            /* grille TAI ANC (cadence trame) */
   if (open_targets(s) != 0) return -1;
   fprintf(stderr, "mtl_rx[data] ANC pt=%d mc=%s:%d slot=%zu ring=%d → %d cible(s):",
           s->payload_type, s->mcast, s->udp_port, s->slotsize, s->ring, s->ntg);
@@ -894,10 +1107,13 @@ static void free_session(struct sess* s) {
   else                           { if (s->vh)  st20p_rx_free(s->vh); }
   for (int ti = 0; ti < s->ntg; ti++) {
     struct target* t = &s->tg[ti];
-    if (t->shm_base && t->shm_base != MAP_FAILED) munmap(t->shm_base, t->shm_size);
+    if (t->writer) mxlReleaseFlowWriter(g_mxl, t->writer);   /* RX/simu */
+    if (t->reader) mxlReleaseFlowReader(g_mxl, t->reader);   /* TX */
     if (t->ident_patch) free(t->ident_patch);
   }
   if (s->tx_scratch) free(s->tx_scratch);
+  if (s->rx_scratch) free(s->rx_scratch);
+  if (s->tx_frame)   free(s->tx_frame);
   memset(s, 0, sizeof(*s));
 }
 
@@ -1044,6 +1260,14 @@ int main(int argc, char** argv) {
   static struct sess reg[MAX_SESS]; memset(reg, 0, sizeof(reg));
   static uint64_t last[MAX_SESS][MAX_TG]; memset(last, 0, sizeof(last));
 
+  /* Instance MXL (domaine tmpfs partagé avec les consommateurs). À vie, comme mtl_init. */
+  const char* mxl_domain = getenv("MXL_DOMAIN");
+  if (!mxl_domain || !*mxl_domain) mxl_domain = "/dev/shm/mxl";
+  mkdir(mxl_domain, 0777);   /* idempotent ; /dev/shm existe déjà */
+  g_mxl = mxlCreateInstance(mxl_domain, NULL);
+  if (!g_mxl) { fprintf(stderr, "mtl_rx: mxlCreateInstance(%s) fail (tmpfs ?)\n", mxl_domain); return 1; }
+  fprintf(stderr, "mtl_rx: domaine MXL = %s\n", mxl_domain);
+
   if (config) {
     /* ═══ DAEMON ═══ mtl_init UNE fois (à vie), puis réconciliation des sessions à chaud.
      * Le device reste démarré (XDP attaché) tant que le process vit → ptp4l ne faute qu'au boot. */
@@ -1102,10 +1326,12 @@ int main(int argc, char** argv) {
         reconcile(reg, config, st, portname);             /* config changé → converge à chaud */
       }
       time_t now = time(NULL); double dt = difftime(now, last_t);
-      if (dt >= 2.0) { write_stats(reg, last, dt); last_t = now; }
+      if (dt >= 2.0) { write_stats(reg, last, dt); last_t = now;
+        mxlGarbageCollectFlows(g_mxl); }   /* récupère les flux orphelins (producteurs morts) */
     }
     for (int i = 0; i < MAX_SESS; i++) if (reg[i].used) free_session(&reg[i]);
     mtl_uninit(st);
+    mxlDestroyInstance(g_mxl);
     return 0;
   }
 
@@ -1140,7 +1366,7 @@ int main(int argc, char** argv) {
   if (l_stats) snprintf(s->tg[0].stats_path,sizeof(s->tg[0].stats_path),"%s",l_stats);
   if (l_ident) { snprintf(s->tg[0].ident_file,sizeof(s->tg[0].ident_file),"%s",l_ident); s->tg[0].has_ident=1; }
   s->st = st; snprintf(s->portname, sizeof(s->portname), "%s", portname); s->stop = 0;
-  if (setup_video(s) != 0) { fprintf(stderr,"mtl_rx: setup échoué\n"); mtl_uninit(st); return 1; }
+  if (setup_video(s) != 0) { fprintf(stderr,"mtl_rx: setup échoué\n"); mtl_uninit(st); mxlDestroyInstance(g_mxl); return 1; }
   s->used = 1;
 
   time_t last_t = time(NULL);
@@ -1152,5 +1378,6 @@ int main(int argc, char** argv) {
   }
   free_session(s);
   mtl_uninit(st);
+  mxlDestroyInstance(g_mxl);
   return 0;
 }
