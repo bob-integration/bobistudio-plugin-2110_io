@@ -49,6 +49,12 @@ _cpu_last_usec = None
 _cpu_last_time = None
 _bw_last = {}
 _xdp_sessions_active = 0
+# Files RÉSERVÉES au dernier mtl_init (rx_queues/tx_queues passés au lancement). Distinct de
+# `_rx/_tx_queues_alloc` qui suit la DEMANDE courante (recalculée à chaque _write_config) : le daemon
+# ne relit PAS rx_queues après mtl_init → la réservation est FIGÉE jusqu'au prochain (re)lancement.
+# C'est le « plafond à chaud » : au-delà, créer une session échoue tant qu'on n'a pas relancé.
+_rx_queues_reserved = 0
+_tx_queues_reserved = 0
 # subsystem_device → (label, aggregate_gbps)  — source: Intel product brief + sysfs
 _E810_MODELS = {
     "0x0002": ("E810-CQDA2", 100),   # E810-C for QSFP 2-port, 1 controller (pvemxl confirmé)
@@ -464,6 +470,7 @@ class MetricsHandler(BaseHTTPRequestHandler):
                             "aggregate_gbps": aggregate_gbps,
                             "model": model_label},
                    "xdp": {"allocated":           _rx_queues_alloc + _tx_queues_alloc,
+                            "reserved":            _rx_queues_reserved + _tx_queues_reserved,
                             "active":              _xdp_sessions_active,
                             "hw_max_combined":     hw_q["max"]          if hw_q else None,
                             "hw_current_combined": hw_q["current"]       if hw_q else None,
@@ -1330,11 +1337,15 @@ def _launch_mtl():
     lancement (ou après un crash / `docker rm -f`) une instance précédente a pu laisser un programme
     XDP accroché (`native xdp dev init fail -5`) ET/OU des règles fdir sur le matériel (« socket add
     flow fail » → session muette). On repart d'une interface propre."""
-    global _mtl_proc, _last_launch
+    global _mtl_proc, _last_launch, _rx_queues_reserved, _tx_queues_reserved
     _xdp_off()
     _flush_ntuple()
     _mtl_proc = subprocess.Popen([MTL_RX, "--config", _CONFIG_PATH])
     _last_launch = time.time()
+    # Fige la réservation effective = ce que le config porte À CET INSTANT (lu par mtl_init au boot du
+    # daemon). _write_config a déjà posé _rx/_tx_queues_alloc juste avant dans la boucle du manager.
+    _rx_queues_reserved = _rx_queues_alloc
+    _tx_queues_reserved = _tx_queues_alloc
     print("mtl_rx daemon (re)lancé", flush=True)
     # APRÈS le flush ntuple : PTP vers la queue noyau via RESTRICTION RSS (ethtool -N est incompatible
     # avec le flow-steering AF-XDP de libmtl) — sinon les Announce PTP sont avalés par les queues XSK.
