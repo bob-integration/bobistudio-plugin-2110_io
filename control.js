@@ -324,23 +324,25 @@ window.MXLPlugins["2110_io"] = {
       const pend  = Math.max(0, planned - active);          // planifié pas encore live
       const hot   = Math.max(0, reserved - active);         // ajoutables à chaud (planifié inclus)
       const freeQ = Math.max(0, reserved - planned);        // réservé NON réclamé (zone pâle)
-      const over  = planned > reserved;                     // provisionné au-delà du plafond
+      const overQ = Math.max(0, planned - reserved);        // planifié AU-DELÀ du plafond (ambre)
       const pct   = v => Math.min(100, Math.max(0, v / hw * 100));
       const col   = (active >= reserved) ? 'var(--status-stopped-fg,#f87171)'
                   : (hot <= 1 ? '#e8a33d' : 'var(--status-running-fg,#22c55e)');
-      const aPct = pct(active), rPct = pct(reserved);
-      const pPct = Math.max(0, pct(planned) - aPct);        // largeur hachuré
+      const aPct = pct(active), rPct = pct(reserved), planPct = pct(planned);
+      const hotL = aPct, hotW = Math.max(0, Math.min(planPct, rPct) - aPct);   // planifié À CHAUD (≤ réservé)
+      const ovrL = Math.max(aPct, rPct), ovrW = Math.max(0, planPct - ovrL);   // planifié au-delà (ambre)
       const freeL = pct(Math.min(Math.max(active, planned), reserved));
       const freeW = Math.max(0, rPct - freeL);
-      const txt = over
-        ? `${active} live · +${pend} planifié (> ${reserved} réservé) → redéploiement`
+      const txt = overQ
+        ? `${active} live · +${pend} planifié dont ${overQ} > réservé (${reserved}) → redéploiement`
         : `${active} live · +${pend} planifié · ${freeQ} libre / ${hw} files`;
       return `<div class="nic-bar-wrap">
         <span class="nic-bar-lbl">Queues XDP</span>
-        <span class="nic-bar-val" style="color:${col}">${txt}</span>
+        <span class="nic-bar-val" style="color:${overQ ? '#e8a33d' : col}">${txt}</span>
         <div class="nic-xdp-track">
           <div class="nic-xdp-free"    style="left:${freeL}%;width:${freeW}%"></div>
-          <div class="nic-xdp-pending" style="left:${aPct}%;width:${pPct}%;background-color:${col}"></div>
+          <div class="nic-xdp-pending" style="left:${hotL}%;width:${hotW}%;background-color:${col}"></div>
+          <div class="nic-xdp-over"    style="left:${ovrL}%;width:${ovrW}%"></div>
           <div class="nic-xdp-active"  style="width:${aPct}%;background:${col}"></div>
           <div class="nic-xdp-mark"    style="left:${rPct}%" title="Plafond à chaud : ${reserved} files réservées à mtl_init — au-delà, redéploiement requis"></div>
         </div>
