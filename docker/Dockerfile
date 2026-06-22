@@ -75,8 +75,12 @@ RUN ln -sf /usr/include/x86_64-linux-gnu/asm /usr/include/asm
 
 # 2) Build DPDK patché MTL + libmtl. tests DPDK désactivés (inline, sinon fuit dans build.sh).
 #    Le composant ld_preload/udp casse (signature ioctl) → ignoré ; gate = pkg-config mtl.
+#    Patch bobi.studio st40/AF-XDP (RX ANC : mbuf port=UINT16_MAX en AF-XDP natif → fallback mono-port)
+#    appliqué APRÈS le clone, AVANT build.sh (qui compile libmtl depuis lib/src).
+COPY patch_st40_afxdp_port.py /tmp/patch_st40_afxdp_port.py
 RUN git clone --depth 1 -b ${MTL_REF} https://github.com/OpenVisualCloud/Media-Transport-Library /src/MTL \
  && cd /src/MTL \
+ && python3 /tmp/patch_st40_afxdp_port.py \
  && MTL_PREFIX_ARGS="-Dtests=false" ./script/build_dpdk.sh -f \
  && ./build.sh || true \
  && ldconfig \
