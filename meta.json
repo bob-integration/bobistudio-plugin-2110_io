@@ -1,7 +1,12 @@
 {
-  "version": "0.24.0",
+  "version": "0.25.0",
   "date": "2026-06-22",
   "changes": {
+    "Suivi capacité Queues XDP — barre à 3 repères (« B2 », 0.25.0)": [
+      "Métrique `:8080 xdp.reserved` AJOUTÉE = files réservées au dernier `mtl_init` (rx_queues+tx_queues du lancement), FIGÉES jusqu'au prochain (re)lancement — distinct de `allocated` (qui suit la demande courante, recalculée à chaque `_write_config`) et de `active` (sessions LIVE). C'est le « plafond à chaud » : au-delà, créer une session libmtl échoue tant qu'on n'a pas redéployé (cf. sur-souscription → 0 trame). Capturée dans `_launch_mtl` (`_rx/_tx_queues_reserved`).",
+      "UI carte Source/Destination : la barre « Queues XDP » devient une barre à 3 repères — remplissage = sessions LIVE (`active`), marqueur = réservation `mtl_init` (`reserved`, plafond à chaud), fin de piste = files HW (`hw_max_combined`). Libellé « N / HW files · +X à chaud, +Y après redéploiement » → vrai suivi des possibilités, distingue ajout à chaud vs redéploiement. Repli automatique sur l'ancien rendu `allocated/HW` si `reserved` absent (image pré-0.25). REBUILD IMAGE REQUIS pour que `reserved` remonte (sinon repli).",
+      "NB : l'ancien rendu comparait `allocated` (demande) à HW → trompeur, et ne suivait pas les ajouts/retraits à chaud (compteur figé au plafond du dernier déploiement)."
+    ],
     "Flux composables — Sources/Destinations 2110 (« Option A », 0.24.0)": [
       "AJOUT/RETRAIT GRANULAIRE des flux par essence (vidéo / audio / ANC), À CHAUD dans la limite du pool pré-provisionné. On crée une Source (RX) ou Destination (TX) VIDÉO, puis on y adjoint N audios + un ANC (boutons « + Audio » / « + ANC » / ✕ par carte) ; on peut aussi créer des flux INDÉPENDANTS (audio/ANC non rattachés à une vidéo). Remplace le ratio audio/vidéo HOMOGÈNE (audio_per_video, cap TX à 2 audios) : chaque vidéo a désormais son propre nombre d'audios/ANC.",
       "Modèle : deux listes ordonnées rx_flows / tx_flows dans deploy_config.params — chaque flux {id, essence, idx, attached_to, label}. idx = slot du pool moteur (pilote le shm + le tag NMOS receiver_index → keying vmid+idx STABLE) ; attached_to = id de la vidéo (flux qui se câble/déplace avec elle) ou null (indépendant). Les compteurs *_count restent la CAPACITÉ (pool) ; les listes font foi pour le GROUPEMENT et le nombre réel de flux. Helpers app/io2110_flows.py.",
