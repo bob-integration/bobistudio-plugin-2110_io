@@ -314,6 +314,39 @@ window.MXLPlugins["2110_io"] = {
            + `</div>`;
     }
 
+    // Barre « Queues XDP » multi-segments (B2+). active=sessions LIVE, planned=flux provisionnés (≥active),
+    // reserved=plafond mtl_init, hw=files NIC. PLEIN=live · HACHURÉ=planifié (réagit aux ajouts) · PÂLE
+    // ancré au marqueur (mangé de droite→gauche)=réservé libre · TRAIT=plafond à chaud. Tout en % des HW.
+    function _xdpBar(active, planned, reserved, hw){
+      active   = Math.max(0, active || 0);
+      planned  = Math.max(active, planned || active);
+      reserved = Math.max(0, reserved || 0);
+      const pend  = Math.max(0, planned - active);          // planifié pas encore live
+      const hot   = Math.max(0, reserved - active);         // ajoutables à chaud (planifié inclus)
+      const freeQ = Math.max(0, reserved - planned);        // réservé NON réclamé (zone pâle)
+      const over  = planned > reserved;                     // provisionné au-delà du plafond
+      const pct   = v => Math.min(100, Math.max(0, v / hw * 100));
+      const col   = (active >= reserved) ? 'var(--status-stopped-fg,#f87171)'
+                  : (hot <= 1 ? '#e8a33d' : 'var(--status-running-fg,#22c55e)');
+      const aPct = pct(active), rPct = pct(reserved);
+      const pPct = Math.max(0, pct(planned) - aPct);        // largeur hachuré
+      const freeL = pct(Math.min(Math.max(active, planned), reserved));
+      const freeW = Math.max(0, rPct - freeL);
+      const txt = over
+        ? `${active} live · +${pend} planifié (> ${reserved} réservé) → redéploiement`
+        : `${active} live · +${pend} planifié · ${freeQ} libre / ${hw} files`;
+      return `<div class="nic-bar-wrap">
+        <span class="nic-bar-lbl">Queues XDP</span>
+        <span class="nic-bar-val" style="color:${col}">${txt}</span>
+        <div class="nic-xdp-track">
+          <div class="nic-xdp-free"    style="left:${freeL}%;width:${freeW}%"></div>
+          <div class="nic-xdp-pending" style="left:${aPct}%;width:${pPct}%;background-color:${col}"></div>
+          <div class="nic-xdp-active"  style="width:${aPct}%;background:${col}"></div>
+          <div class="nic-xdp-mark"    style="left:${rPct}%" title="Plafond à chaud : ${reserved} files réservées à mtl_init — au-delà, redéploiement requis"></div>
+        </div>
+      </div>`;
+    }
+
     function _renderBody() {
       const ens = _cachedEnsembles;
       const inner = ens.length === 0
@@ -439,32 +472,12 @@ window.MXLPlugins["2110_io"] = {
       const _xdpAlloc    = c && c.xdp_allocated;
       const _xdpAct      = (c && c.xdp_active) ?? 0;
       const _xdpReserved = c && c.xdp_reserved;
+      const _xdpPlanned  = (c && c.xdp_planned) ?? _xdpAct;
       const _xdpHwMax    = c && c.xdp_hw_max_combined;
-      // B2 — barre à 3 repères : remplissage = sessions LIVE (`active`, 1 file AF-XDP/session) ; repère =
-      // RÉSERVATION mtl_init (`reserved`, plafond À CHAUD : au-delà, créer une session échoue tant qu'on
-      // n'a pas redéployé) ; fin de piste = files PHYSIQUES (`hw_max_combined`). `reserved` distingue
-      // « ajoutable à chaud » de « ajoutable après redéploiement » — le vrai suivi des possibilités.
       const _hasB2 = (_xdpReserved != null) && (_xdpHwMax != null) && _xdpHwMax > 0;
       let _nicXdpBar = '';
       if (_hasB2) {
-        const _actPct = Math.min(100, Math.round(_xdpAct / _xdpHwMax * 100));
-        const _resPct = Math.min(100, Math.round(_xdpReserved / _xdpHwMax * 100));
-        const _hot    = Math.max(0, _xdpReserved - _xdpAct);   // sessions ajoutables SANS redéploiement
-        const _extra  = Math.max(0, _xdpHwMax - _xdpReserved); // de plus, APRÈS redéploiement
-        const _over   = _xdpAct > _xdpReserved;                // sur-souscrit : des créations échouent
-        const _col    = _over ? 'var(--status-stopped-fg,#f87171)'
-                      : (_hot <= 1 ? '#e8a33d' : 'var(--status-running-fg,#22c55e)');
-        const _txt    = _over
-          ? `${_xdpAct} / ${_xdpHwMax} files — au-delà du réservé (${_xdpReserved}) : redéploiement requis`
-          : `${_xdpAct} / ${_xdpHwMax} files · +${_hot} à chaud, +${_extra} après redéploiement`;
-        _nicXdpBar = `<div class="nic-bar-wrap">
-          <span class="nic-bar-lbl">Queues XDP</span>
-          <span class="nic-bar-val" style="color:${_col}">${_txt}</span>
-          <div class="nic-xdp-track">
-            <div class="nic-xdp-fill" style="width:${_actPct}%;background:${_col}"></div>
-            <div class="nic-xdp-mark" style="left:${_resPct}%" title="Plafond à chaud : ${_xdpReserved} files réservées à mtl_init — au-delà, redéploiement requis"></div>
-          </div>
-        </div>`;
+        _nicXdpBar = _xdpBar(_xdpAct, _xdpPlanned, _xdpReserved, _xdpHwMax);
       } else if (_xdpAlloc != null) {
         // Repli image pré-A2 (pas de `reserved`) : ancien rendu allocated/HW.
         const _xdpDen     = _xdpHwMax || _xdpAlloc;
