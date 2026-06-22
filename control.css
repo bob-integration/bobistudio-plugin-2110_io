@@ -123,6 +123,10 @@
 .nic-xdp-active { position:absolute; top:0; bottom:0; left:0; border-radius:4px 0 0 4px; transition:width .5s; }
 .nic-xdp-pending{ position:absolute; top:0; bottom:0; opacity:.5; transition:left .5s, width .5s;
                   background-image:repeating-linear-gradient(45deg, rgba(255,255,255,.6) 0 3px, transparent 3px 7px); }
+/* Planifié AU-DELÀ du plafond mtl_init (ne tient pas à chaud → redéploiement) : hachuré AMBRE. */
+.nic-xdp-over   { position:absolute; top:0; bottom:0; opacity:.7; transition:left .5s, width .5s;
+                  background-color:#e8a33d;
+                  background-image:repeating-linear-gradient(45deg, rgba(255,255,255,.6) 0 3px, transparent 3px 7px); }
 .nic-xdp-free   { position:absolute; top:0; bottom:0; background:var(--text-muted); opacity:.15; transition:left .5s, width .5s; }
 .nic-xdp-mark   { position:absolute; top:0; bottom:0; width:2px; margin-left:-1px;
                   background:#fff; box-shadow:0 0 0 1px rgba(0,0,0,.5); }

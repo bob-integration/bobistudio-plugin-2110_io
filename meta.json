@@ -1,7 +1,10 @@
 {
-  "version": "0.25.1",
+  "version": "0.25.2",
   "date": "2026-06-22",
   "changes": {
+    "Barre Queues XDP — coloration ambre du planifié au-delà du plafond (UI, 0.25.2)": [
+      "La portion HACHURÉE « planifié » qui DÉPASSE le marqueur `reserved` (flux provisionnés qui ne tiennent pas dans le plafond à chaud → redéploiement requis pour les faire passer live) est désormais en AMBRE hachuré (.nic-xdp-over), distincte du planifié-à-chaud (couleur de l'actif). Le libellé passe aussi en ambre et précise « dont N > réservé ». Sources + Destinations."
+    ],
     "Barre Queues XDP — zone « planifié » + segments (UI, 0.25.1)": [
       "La barre « Queues XDP » (pages Sources ET Destinations, désormais identiques) devient multi-segments : PLEIN = sessions LIVE (active, files en usage) ; HACHURÉ = PLANIFIÉ (flux RX+TX provisionnés mais pas encore live — réagit immédiatement aux ajouts/retraits de sources/destinations, même en simu) ; zone PÂLE ancrée au marqueur et mangée de DROITE→GAUCHE = files réservées LIBRES (réutilisables à chaud) ; TRAIT = réservation mtl_init (plafond à chaud) ; fin de piste = files HW. Libellé « N live · +P planifié · L libre / HW files ».",
       "Nouveau champ orchestrateur `xdp_planned` (endpoints /api/nmos/receivers/<vmid>/detail ET /api/io/mtl) = nb de flux provisionnés (RX+TX) = files qui seront prises quand ils passeront live. Répond au « rien ne bouge quand j'ajoute/enlève » : un flux en simu ne consomme pas encore de file (active inchangé) mais la zone planifié bouge tout de suite.",
