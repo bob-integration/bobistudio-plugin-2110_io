@@ -23,6 +23,16 @@ import json, mmap, os, re, signal, struct, subprocess, threading, time
 import numpy as np
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
+# bobimxl : binding du SDK MXL (sur le PYTHONPATH de l'image). La simu/txgen produit des FLOWS MXL
+# (mêmes que mtl_rx) au lieu des rings shm maison. Tolérant : si la lib manque (image legacy),
+# _HAS_MXL=False → les boucles simu/txgen restent inertes (le live RX C reste prioritaire).
+try:
+    import bobimxl
+    _HAS_MXL = True
+except Exception as _mxl_err:
+    _HAS_MXL = False
+    print("controller: bobimxl indisponible:", _mxl_err, flush=True)
+
 HOSTNAME   = os.environ.get("HOSTNAME_RX") or os.environ.get("HOSTNAME") or "mtlrx"
 N_VIDEO    = int(os.environ.get("RX_COUNT") or os.environ.get("VIDEO_COUNT") or 1)   # slots RX vidéo
 N_TX       = int(os.environ.get("TX_COUNT") or 0)                                     # slots TX (senders)
@@ -220,6 +230,49 @@ def _layout(w, h):
     y = w * h * _BPS; uv = uv_w * uv_h * _BPS; vf = y + 2 * uv
     return {"w": w, "h": h, "uv_w": uv_w, "uv_h": uv_h,
             "y": y, "uv": uv, "vf": vf, "total": HDR + V_RING * vf}
+
+
+# ─── MXL (bus partagé) — la simu/txgen écrit des flows MXL (mêmes que mtl_rx) ──────
+_DTNP = np.uint16 if _DEEP else np.uint8
+_MXL_DOMAIN = os.environ.get("MXL_DOMAIN") or "/dev/shm/mxl"
+_mxl_inst = None
+_mxl_inst_lock = threading.Lock()
+
+
+def _mxl():
+    """Instance MXL du process controller (domaine partagé avec mtl_rx). Paresseuse, à vie."""
+    global _mxl_inst
+    if _mxl_inst is None:
+        with _mxl_inst_lock:
+            if _mxl_inst is None:
+                _mxl_inst = bobimxl.Instance(_MXL_DOMAIN)
+    return _mxl_inst
+
+
+def _fps_rational(f):
+    """Cadence (double) → rational standard (grain_rate du flowDef). Miroir de mtl_rx.fps_to_rational."""
+    f = float(f or 25.0)
+    for std, n, d in ((23.98, 24000, 1001), (24, 24, 1), (25, 25, 1), (29.97, 30000, 1001),
+                      (30, 30, 1), (50, 50, 1), (59.94, 60000, 1001), (60, 60, 1),
+                      (100, 100, 1), (120, 120, 1)):
+        if abs(f - std) < (0.1 if std in (23.98, 59.94) else 0.05):
+            return n, d
+    return int(round(f)), 1
+
+
+def _mk_video_writer(name, w, h, fps):
+    """Writer MXL vidéo planar (index_mode tai → grille continue avec le live RX)."""
+    n, d = _fps_rational(fps)
+    return bobimxl.Writer(_mxl(), name, w, h, chroma=CHROMA, bit_depth=BIT_DEPTH,
+                          fps_num=n, fps_den=d, index_mode="tai")
+
+
+def _fill_grain_planes(view, lay, y, cb, cr):
+    """Écrit Y|Cb|Cr (numpy _DT) dans la vue uint8 d'un grain MXL (zéro-copie, planar contigu)."""
+    yb, uvb = lay["y"], lay["uv"]
+    view[0:yb].view(_DTNP).reshape(lay["h"], lay["w"])[:] = y
+    view[yb:yb + uvb].view(_DTNP).reshape(lay["uv_h"], lay["uv_w"])[:] = cb
+    view[yb + uvb:yb + 2 * uvb].view(_DTNP).reshape(lay["uv_h"], lay["uv_w"])[:] = cr
 
 
 # Résolution courante par slot (pour la simu + la taille IDENT), suit le SDP live.
@@ -881,29 +934,42 @@ _tx_tone = [[_default_tone() for _ in range(2)] for _ in range(N_TX)]
 
 
 def _tx_lat_monitor():
-    """Thread passif : lit ts_ns (offset 8, uint64) dans le header SHM de chaque slot Tx actif
-    et calcule l'âge du signal depuis sa capture originale. Ne lit que 16 octets par slot (très
-    léger). Expose le résultat dans _tx[i]["lat_ms"] pour les métriques :8080."""
+    """Thread passif : latence transit de chaque slot Tx actif = (now_tai − lastWriteTime) du FLUX
+    MXL d'entrée câblé (runtime info MXL, en TAI ns). Expose _tx[i]["lat_ms"] pour les métriques
+    :8080. Readers MXL mis en cache par nom de flux (recréés si le flux est absent/remplacé)."""
+    if not _HAS_MXL:
+        return
+    readers = {}   # nom de flux → bobimxl.Reader
+    def _drop(nm):
+        r = readers.pop(nm, None)
+        if r is not None:
+            try: r.close()
+            except Exception: pass
     while True:
         with _tx_lock:
             slots = [(i, t["shm_in"]) for i, t in enumerate(_tx) if t["enabled"] and t["shm_in"]]
-        now_ns = time.time_ns()
+        wanted = set()
         for idx, shm_name in slots:
-            path = shm_name if shm_name.startswith("/") else "/dev/shm/" + shm_name
+            nm = shm_name[9:] if shm_name.startswith("/dev/shm/") else shm_name
+            wanted.add(nm)
+            lat = None
             try:
-                with open(path, "rb") as f:
-                    f.seek(8)
-                    raw = f.read(8)
-                if len(raw) == 8:
-                    ts_ns = struct.unpack("<Q", raw)[0]
-                    if ts_ns > 0:
-                        lat_ms = round((now_ns - ts_ns) / 1_000_000, 1)
-                        with _tx_lock:
-                            _tx[idx]["lat_ms"] = lat_ms if 0 < lat_ms < 30_000 else None
+                r = readers.get(nm)
+                if r is None:
+                    r = bobimxl.Reader(_mxl(), nm); readers[nm] = r
+                lw = r.last_write_time()
+                if lw:
+                    v = round((bobimxl.now_tai() - lw) / 1e6, 1)
+                    lat = v if 0 < v < 30_000 else None
+                else:
+                    _drop(nm)   # flux absent/remplacé → recréer le reader au tour suivant
             except Exception:
-                with _tx_lock:
-                    _tx[idx]["lat_ms"] = None
-        time.sleep(0.1)   # 10 Hz — header uniquement, coût négligeable
+                _drop(nm)
+            with _tx_lock:
+                _tx[idx]["lat_ms"] = lat
+        for nm in [k for k in readers if k not in wanted]:
+            _drop(nm)
+        time.sleep(0.1)   # 10 Hz — runtime info uniquement, coût négligeable
 
 
 threading.Thread(target=_tx_lat_monitor, daemon=True).start()
@@ -1197,27 +1263,8 @@ def _get_pattern(name, fi, lay):
     return _pattern_cache[key]
 
 
-# ─── Simulation (mire numpy, mêmes en-têtes shm) — fallback sans SDP ou GÉN forcé ──
-def _simu_frame(mm, fi, idx, lay):
-    with _ctl_lock:
-        pat = _ctl[idx]["pattern"]
-    y, cb, cr = _get_pattern(pat, fi, lay)
-    off = HDR + (fi % V_RING) * lay["vf"]
-    mm[off:off + lay["y"]]                          = y.tobytes()
-    mm[off + lay["y"]:off + lay["y"] + lay["uv"]]  = cb.tobytes()
-    mm[off + lay["y"] + lay["uv"]:off + lay["vf"]] = cr.tobytes()
-    _overlay_simu(mm, off, idx, lay)     # incrustation IDENT (coût nul si off)
-    # [index, write_ts, media_ts] — la simu (mire) n'a pas d'horloge média → media_ts=0 (off16),
-    # sinon une valeur RX périmée resterait au basculement RX→simu (les consos retombent au nominal).
-    mm[0:24] = struct.pack("QQQ", fi, time.time_ns(), 0)
-
-
-def _open_shm(path, size):
-    fd = os.open(path, os.O_CREAT | os.O_RDWR, 0o666)
-    os.ftruncate(fd, size)
-    mm = mmap.mmap(fd, size)
-    os.close(fd)
-    return mm
+# ─── Simulation : le rendu de mire écrit désormais des GRAINS MXL (cf. _simu_loop / _txgen_loop)
+#     via bobimxl.Writer (open_grain → _fill_grain_planes → commit). Plus de ring shm maison. ──
 
 
 def _read_stats(stats_path):
@@ -1531,14 +1578,22 @@ def _manager_loop():
 
 
 def _simu_loop(idx):
-    """Écrit la mire de simu dans le shm du slot TANT QU'IL N'EST PAS servi par mtl_rx (_live).
-    Quand le slot est live, mtl_rx possède le shm ; on ne fait que relayer ses stats sur :8080."""
-    shm_path = "/dev/shm/{}_{}".format(HOSTNAME, idx)
-    sim_mm = None; sim_res = None; fi = 0
+    """Écrit la mire de simu dans le FLUX MXL du slot TANT QU'IL N'EST PAS servi par mtl_rx (_live).
+    Quand le slot est live, mtl_rx possède le flux ; on ne fait que relayer ses stats sur :8080."""
+    name = "{}_{}".format(HOSTNAME, idx)
+    writer = None; sim_res = None; fi = 0
+    def _close():
+        nonlocal writer, sim_res
+        if writer is not None:
+            try: writer.close()
+            except Exception: pass
+        writer = None; sim_res = None
     while True:
-        if _live[idx]:
-            if sim_mm is not None:
-                sim_mm.close(); sim_mm = None; sim_res = None
+        if _live[idx] or not _HAS_MXL:
+            if writer is not None:
+                _close()
+            if not _HAS_MXL and not _live[idx]:
+                time.sleep(0.5); continue
             d = _read_stats_raw("/tmp/mtl_v{}.json".format(idx))
             with metrics_lock:
                 # Échec de création de session RX (budget lcores…) : mtl_rx écrit {error} dans le stats.
@@ -1560,11 +1615,24 @@ def _simu_loop(idx):
             continue
         w, h = _slot_res[idx]
         lay = _layout(w, h)
-        # même taille de shm que mtl_rx (résolution live) → pas de resize visible au basculement.
-        if sim_mm is None or sim_res != (w, h):
-            if sim_mm is not None: sim_mm.close()
-            sim_mm = _open_shm(shm_path, lay["total"]); sim_res = (w, h)
-        _simu_frame(sim_mm, fi, idx, lay)
+        try:
+            # même format que mtl_rx (résolution live) → pas de glitch au basculement RX↔simu.
+            # Changement de résolution → recréer le writer (le flowDef change) ; GC l'ancien flux.
+            if writer is None or sim_res != (w, h):
+                _close()
+                try: _mxl().garbage_collect()
+                except Exception: pass
+                writer = _mk_video_writer(name, w, h, FPS); sim_res = (w, h)
+            with _ctl_lock:
+                pat = _ctl[idx]["pattern"]
+            y, cb, cr = _get_pattern(pat, fi, lay)
+            _, gi, view = writer.open_grain()
+            _fill_grain_planes(view, lay, y, cb, cr)
+            _overlay_simu(view, 0, idx, lay)     # incrustation IDENT (coût nul si off)
+            writer.commit(gi)
+        except Exception as e:
+            print("simu err idx={}: {}".format(idx, e), flush=True)
+            _close(); time.sleep(0.5); continue
         fi += 1
         if fi % 25 == 0:
             with metrics_lock:
@@ -1574,17 +1642,21 @@ def _simu_loop(idx):
 
 
 def _txgen_loop(idx):
-    """Écrit une mire SMPTE dans le shm txgen d'un slot TX quand gen est actif.
-    Le shm a le même format que les shm RX (header 64 bytes + ring V_RING × vf) → mtl_rx
-    le lit sans modification. Overlay ident (nom + GEN + destination) via PIL si disponible."""
-    shm_path = "/dev/shm/{}_txgen_{}".format(HOSTNAME, idx)
-    mm = None; res = None; fi = 0; patch = None; patch_age = 0
+    """Écrit une mire SMPTE dans le FLUX MXL txgen d'un slot TX quand gen est actif → mtl_rx (TX)
+    le lit comme n'importe quel flux d'entrée câblé. Overlay ident (nom + GEN + dest) via PIL."""
+    name = "{}_txgen_{}".format(HOSTNAME, idx)
+    writer = None; res = None; fi = 0; patch = None; patch_age = 0
+    def _close():
+        nonlocal writer, res
+        if writer is not None:
+            try: writer.close()
+            except Exception: pass
+        writer = None; res = None
     while True:
         with _tx_gen_lock:
             gen_on = _tx_gen[idx]["enabled"]
-        if not gen_on:
-            if mm is not None:
-                mm.close(); mm = None; res = None
+        if not gen_on or not _HAS_MXL:
+            if writer is not None: _close()
             time.sleep(0.1)
             continue
         with _tx_lock:
@@ -1593,27 +1665,31 @@ def _txgen_loop(idx):
             pat = _tx_gen[idx]["pattern"]
         fps = max(1.0, float(fps or FPS))
         lay = _layout(w, h)
-        if mm is None or res != (w, h):
-            if mm is not None: mm.close()
-            mm = _open_shm(shm_path, lay["total"]); res = (w, h)
-            patch = None; patch_age = 0   # forcer recalcul ident après resize
-        y_arr, cb_arr, cr_arr = _get_pattern(pat, fi, lay)
-        off = HDR + (fi % V_RING) * lay["vf"]
-        mm[off:off + lay["y"]]                           = y_arr.tobytes()
-        mm[off + lay["y"]:off + lay["y"] + lay["uv"]]   = cb_arr.tobytes()
-        mm[off + lay["y"] + lay["uv"]:off + lay["vf"]]  = cr_arr.tobytes()
-        # IDENT user actif → mtl_rx incrustera l'IDENT sur cette mire au passage du feeder TX ;
-        # on n'ajoute PAS le libellé auto de la mire (évite le doublon à l'écran).
-        with _tx_gen_lock:
-            user_ident = _tx_gen[idx]["ident"]
-        if user_ident:
-            patch = None
-        elif patch_age <= 0 or patch is None:
-            patch = _txgen_ident_patch(idx); patch_age = int(fps)  # recalcul 1× par seconde
-        else:
-            patch_age -= 1
-        _overlay_patch(mm, off, patch, lay)
-        mm[0:24] = struct.pack("QQQ", fi, time.time_ns(), 0)
+        try:
+            if writer is None or res != (w, h):
+                _close()
+                try: _mxl().garbage_collect()
+                except Exception: pass
+                writer = _mk_video_writer(name, w, h, fps); res = (w, h)
+                patch = None; patch_age = 0   # forcer recalcul ident après resize
+            y_arr, cb_arr, cr_arr = _get_pattern(pat, fi, lay)
+            # IDENT user actif → mtl_rx incrustera l'IDENT sur la mire au passage du feeder TX ;
+            # on n'ajoute PAS le libellé auto de la mire (évite le doublon à l'écran).
+            with _tx_gen_lock:
+                user_ident = _tx_gen[idx]["ident"]
+            if user_ident:
+                patch = None
+            elif patch_age <= 0 or patch is None:
+                patch = _txgen_ident_patch(idx); patch_age = int(fps)  # recalcul 1× par seconde
+            else:
+                patch_age -= 1
+            _, gi, view = writer.open_grain()
+            _fill_grain_planes(view, lay, y_arr, cb_arr, cr_arr)
+            _overlay_patch(view, 0, patch, lay)
+            writer.commit(gi)
+        except Exception as e:
+            print("txgen err idx={}: {}".format(idx, e), flush=True)
+            _close(); time.sleep(0.2); continue
         fi += 1
         time.sleep(1.0 / fps)
 
@@ -1623,31 +1699,33 @@ def _build_tone_second(freq, level_db, chan_on):
     canaux où chan_on[ch], silence ailleurs. 1 s = nb entier de périodes pour toute fréquence
     entière → boucle sans discontinuité. Renvoie des bytes (SR·8·3 = 1 152 000 octets)."""
     SR = 48000
-    amp = (10.0 ** (float(level_db) / 20.0)) * (2 ** 23 - 1)
+    amp = 10.0 ** (float(level_db) / 20.0)        # niveau normalisé [-1,1] (float32 MXL)
     t = np.arange(SR, dtype=np.float64)
-    wave = np.round(amp * np.sin(2.0 * np.pi * float(freq) * t / SR)).astype(np.int32)
-    buf = np.zeros((SR, A_CHANNELS), dtype=np.int32)
+    wave = (amp * np.sin(2.0 * np.pi * float(freq) * t / SR)).astype(np.float32)
+    buf = np.zeros((SR, A_CHANNELS), dtype=np.float32)
     for ch in range(A_CHANNELS):
         if ch < len(chan_on) and chan_on[ch]:
             buf[:, ch] = wave
-    # int32 LE → on garde les 3 octets bas et on inverse l'ordre → s24 big-endian (wire-native).
-    le4 = np.frombuffer(buf.reshape(-1).astype("<i4").tobytes(), dtype=np.uint8).reshape(-1, 4)
-    return le4[:, :3][:, ::-1].tobytes()
+    return buf                                     # (48000, 8) float32, 1 s entière (boucle propre)
 
 
 def _txgen_audio_loop(idx, ai):
-    """Audio généré d'une sortie TX (s24be 8ch, 1 ms/chunk). Source par priorité :
+    """Audio généré d'une sortie TX → FLUX MXL audio (float32 8ch, 1 ms/bloc). Source par priorité :
     (1) TONALITÉ configurée (_tx_tone[idx][ai]) si activée — choix des canaux + ruptage ;
     (2) sinon audio de mire (1 kHz tous canaux) quand le GEN vidéo+mire est actif ;
     (3) sinon silence. Ruptage = 0,9 s ON / 0,1 s OFF (mod sur la seconde), comme aux entrées."""
     SR = 48000
     N = SR // 1000                                # 48 éch. = 1 ms
-    A_CHUNK = N * A_CHANNELS * 3                   # 1152 octets (1 ms, s24be 8ch interleaved)
-    shm_path = "/dev/shm/{}_audio_txgen_{}_{}".format(HOSTNAME, idx, ai)
-    size = HDR + A_RING * A_CHUNK
-    silence = bytes(A_CHUNK)
-    mm = None; fi = 0
+    name = "{}_audio_txgen_{}_{}".format(HOSTNAME, idx, ai)
+    silence = np.zeros((N, A_CHANNELS), dtype=np.float32)
+    writer = None; fi = 0
     sig = None; buf_on = None; buf_off = None        # buffers 1 s (ON-phase / OFF-phase ruptage)
+    def _close():
+        nonlocal writer
+        if writer is not None:
+            try: writer.close()
+            except Exception: pass
+        writer = None
     while True:
         with _tx_gen_lock:
             tone = dict(_tx_tone[idx][ai])
@@ -1655,40 +1733,42 @@ def _txgen_audio_loop(idx, ai):
             pattern = _tx_gen[idx].get("pattern") or "black"
         tone_on = bool(tone.get("enabled"))
         want_mire = gen_on and pattern == "bars"
-        if not tone_on and not gen_on:               # rien à émettre → veille (shm fermé)
-            if mm is not None:
-                mm.close(); mm = None
+        if (not tone_on and not gen_on) or not _HAS_MXL:   # rien à émettre → veille (flux fermé)
+            if writer is not None: _close()
             sig = None
             time.sleep(0.1)
             continue
-        if mm is None:
-            mm = _open_shm(shm_path, size)
-        if tone_on:
-            active = (tone.get("active") or [])
-            rupted = (tone.get("rupted") or [])
-            freq = int(tone.get("freq") or 1000)
-            level = float(tone.get("level_db") if tone.get("level_db") is not None else -18.0)
-            on_mask  = [bool(active[c]) if c < len(active) else False for c in range(A_CHANNELS)]
-            off_mask = [on_mask[c] and not (c < len(rupted) and bool(rupted[c])) for c in range(A_CHANNELS)]
-            nsig = ("tone", freq, level, tuple(on_mask), tuple(off_mask))
-            if nsig != sig:
-                buf_on  = _build_tone_second(freq, level, on_mask)
-                buf_off = _build_tone_second(freq, level, off_mask)
-                sig = nsig
-            c = fi % 1000                            # position dans la seconde (ruptage)
-            src = buf_on if c < 900 else buf_off
-            chunk = src[c * A_CHUNK:(c + 1) * A_CHUNK]
-        elif want_mire:                              # legacy : 1 kHz tous canaux, sans ruptage
-            if sig != ("mire",):
-                buf_on = _build_tone_second(1000, -18.0, [True] * A_CHANNELS)
-                buf_off = buf_on; sig = ("mire",)
-            c = fi % 1000
-            chunk = buf_on[c * A_CHUNK:(c + 1) * A_CHUNK]
-        else:                                        # GEN vidéo sans mire → silence
-            chunk = silence; sig = None
-        off = HDR + (fi % A_RING) * A_CHUNK
-        mm[off:off + A_CHUNK] = chunk
-        mm[0:24] = struct.pack("QQQ", fi, time.time_ns(), 0)
+        try:
+            if writer is None:
+                writer = bobimxl.AudioWriter(_mxl(), name, channels=A_CHANNELS,
+                                             sample_rate=SR, index_mode="tai")
+            if tone_on:
+                active = (tone.get("active") or [])
+                rupted = (tone.get("rupted") or [])
+                freq = int(tone.get("freq") or 1000)
+                level = float(tone.get("level_db") if tone.get("level_db") is not None else -18.0)
+                on_mask  = [bool(active[c]) if c < len(active) else False for c in range(A_CHANNELS)]
+                off_mask = [on_mask[c] and not (c < len(rupted) and bool(rupted[c])) for c in range(A_CHANNELS)]
+                nsig = ("tone", freq, level, tuple(on_mask), tuple(off_mask))
+                if nsig != sig:
+                    buf_on  = _build_tone_second(freq, level, on_mask)
+                    buf_off = _build_tone_second(freq, level, off_mask)
+                    sig = nsig
+                c = fi % 1000                            # position dans la seconde (ruptage)
+                src = buf_on if c < 900 else buf_off
+                chunk = src[c * N:(c + 1) * N]
+            elif want_mire:                              # legacy : 1 kHz tous canaux, sans ruptage
+                if sig != ("mire",):
+                    buf_on = _build_tone_second(1000, -18.0, [True] * A_CHANNELS)
+                    buf_off = buf_on; sig = ("mire",)
+                c = fi % 1000
+                chunk = buf_on[c * N:(c + 1) * N]
+            else:                                        # GEN vidéo sans mire → silence
+                chunk = silence; sig = None
+            writer.write(chunk)                          # (48,8) float32 → index TAI interne
+        except Exception as e:
+            print("txgen audio err idx={} ai={}: {}".format(idx, ai, e), flush=True)
+            _close(); sig = None; time.sleep(0.2); continue
         fi += 1
         time.sleep(0.001)   # 1ms
 
