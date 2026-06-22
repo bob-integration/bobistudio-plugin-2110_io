@@ -115,11 +115,16 @@
 .nic-bar-track { flex:1; height:4px; background:var(--border); border-radius:2px; overflow:hidden; }
 .nic-bar-fill  { height:100%; border-radius:2px; transition:width .6s; }
 .nic-bar-est  { font-style:italic; color:var(--text-muted); }
-/* B2 — barre Queues XDP à 3 repères : remplissage (sessions live) + marqueur (réservation mtl_init,
-   = plafond à chaud) sur une piste allant jusqu'aux files HW. Track NON clippé (le marqueur déborde). */
-.nic-xdp-track { flex:1; height:7px; background:var(--border); border-radius:3px; position:relative; }
-.nic-xdp-fill  { height:100%; border-radius:3px; transition:width .6s; }
-.nic-xdp-mark  { position:absolute; top:-2px; bottom:-2px; width:2px; margin-left:-1px;
-                 background:var(--text-muted); border-radius:1px; box-shadow:0 0 0 1px var(--bg-card); }
+/* B2+ — barre Queues XDP multi-segments. PLEIN = sessions live (active) · HACHURÉ = planifié
+   (provisionné, pas encore live) · PÂLE = réservé libre (ancré au marqueur, mangé droite→gauche) ·
+   TRAIT = réservation mtl_init (plafond à chaud) · fin de piste = files HW. */
+.nic-xdp-track  { flex:1; height:8px; background:var(--border); border-radius:4px; position:relative; overflow:hidden; }
+.nic-xdp-fill   { height:100%; border-radius:4px; transition:width .6s; }   /* repli pré-planifié */
+.nic-xdp-active { position:absolute; top:0; bottom:0; left:0; border-radius:4px 0 0 4px; transition:width .5s; }
+.nic-xdp-pending{ position:absolute; top:0; bottom:0; opacity:.5; transition:left .5s, width .5s;
+                  background-image:repeating-linear-gradient(45deg, rgba(255,255,255,.6) 0 3px, transparent 3px 7px); }
+.nic-xdp-free   { position:absolute; top:0; bottom:0; background:var(--text-muted); opacity:.15; transition:left .5s, width .5s; }
+.nic-xdp-mark   { position:absolute; top:0; bottom:0; width:2px; margin-left:-1px;
+                  background:#fff; box-shadow:0 0 0 1px rgba(0,0,0,.5); }
 .nic-model-lbl { font-size:0.76em; color:var(--text-muted); margin:2px 0 1px; }
 .nic-shared   { color:#e8a33d; }

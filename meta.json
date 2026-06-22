@@ -1,7 +1,13 @@
 {
-  "version": "0.25.0",
+  "version": "0.25.1",
   "date": "2026-06-22",
   "changes": {
+    "Barre Queues XDP — zone « planifié » + segments (UI, 0.25.1)": [
+      "La barre « Queues XDP » (pages Sources ET Destinations, désormais identiques) devient multi-segments : PLEIN = sessions LIVE (active, files en usage) ; HACHURÉ = PLANIFIÉ (flux RX+TX provisionnés mais pas encore live — réagit immédiatement aux ajouts/retraits de sources/destinations, même en simu) ; zone PÂLE ancrée au marqueur et mangée de DROITE→GAUCHE = files réservées LIBRES (réutilisables à chaud) ; TRAIT = réservation mtl_init (plafond à chaud) ; fin de piste = files HW. Libellé « N live · +P planifié · L libre / HW files ».",
+      "Nouveau champ orchestrateur `xdp_planned` (endpoints /api/nmos/receivers/<vmid>/detail ET /api/io/mtl) = nb de flux provisionnés (RX+TX) = files qui seront prises quand ils passeront live. Répond au « rien ne bouge quand j'ajoute/enlève » : un flux en simu ne consomme pas encore de file (active inchangé) mais la zone planifié bouge tout de suite.",
+      "Correctif cohérence : la page Destinations (static/io2110.js) utilisait encore l'ancienne barre allocated/HW → valeurs différentes de la page Sources. Les deux partagent désormais le même rendu (helper _xdpBar) et la même source de données.",
+      "UI SEULE — pas de rebuild image (control.js/control.css + static/io2110.js + routes.py)."
+    ],
     "Suivi capacité Queues XDP — barre à 3 repères (« B2 », 0.25.0)": [
       "Métrique `:8080 xdp.reserved` AJOUTÉE = files réservées au dernier `mtl_init` (rx_queues+tx_queues du lancement), FIGÉES jusqu'au prochain (re)lancement — distinct de `allocated` (qui suit la demande courante, recalculée à chaque `_write_config`) et de `active` (sessions LIVE). C'est le « plafond à chaud » : au-delà, créer une session libmtl échoue tant qu'on n'a pas redéployé (cf. sur-souscription → 0 trame). Capturée dans `_launch_mtl` (`_rx/_tx_queues_reserved`).",
       "UI carte Source/Destination : la barre « Queues XDP » devient une barre à 3 repères — remplissage = sessions LIVE (`active`), marqueur = réservation `mtl_init` (`reserved`, plafond à chaud), fin de piste = files HW (`hw_max_combined`). Libellé « N / HW files · +X à chaud, +Y après redéploiement » → vrai suivi des possibilités, distingue ajout à chaud vs redéploiement. Repli automatique sur l'ancien rendu `allocated/HW` si `reserved` absent (image pré-0.25). REBUILD IMAGE REQUIS pour que `reserved` remonte (sinon repli).",
