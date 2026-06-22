@@ -1009,32 +1009,43 @@ def _flush_ntuple():
 
 
 # Multicast PTP (SMPTE 2059-2 / IEEE 1588) : Announce/Sync/Delay sur 224.0.1.129, P2P delay sur
-# 224.0.0.107. Faute de règle dédiée, ce trafic est réparti par RSS sur toutes les queues — dont
-# celles possédées par les sockets AF-XDP de libmtl, qui l'avalent → ptp4l noyau ne reçoit plus les
-# Announce → bascules SLAVE↔MASTER permanentes (sans compteur rx_dropped). On l'épingle donc sur la
-# queue 0 (queue noyau : libmtl démarre ses queues de session à ≥1, aucune XSK sur la 0 → XDP_PASS).
+# 224.0.0.107. Par défaut RSS répartit ce trafic sur TOUTES les queues — dont celles possédées par
+# les sockets AF-XDP de libmtl, qui l'avalent → ptp4l noyau ne reçoit plus les Announce → bascules
+# SLAVE↔MASTER permanentes. La 1ʳᵉ approche (ethtool -N → queue 0) est INCOMPATIBLE avec AF-XDP
+# (ntuple ↔ flow-steering libmtl mutuellement exclusifs). On restreint donc la table RSS à la queue
+# 0 (cf. _steer_ptp_to_kernel_queue) : PTP → queue 0 (noyau), média → queues XSK via fdir libmtl.
 PTP_MCAST = ("224.0.1.129", "224.0.0.107")
 PTP_KERNEL_QUEUE = 0
 
 def _steer_ptp_to_kernel_queue():
-    """(Ré)installe les règles ntuple dirigeant le multicast PTP vers la queue noyau, APRÈS le flush
-    de _launch_mtl (sinon elles seraient purgées). Best-effort : un échec ne bloque pas le moteur."""
-    try:
-        n = 0
-        for grp in PTP_MCAST:
-            rc = subprocess.run(["ethtool", "-N", IFACE, "flow-type", "udp4",
-                                 "dst-ip", grp, "action", str(PTP_KERNEL_QUEUE)],
+    """PTP coexistence avec AF-XDP — par RESTRICTION RSS (PAS ethtool -N).
+
+    Sur l'E810/ice, les règles ntuple `ethtool -N` sont MUTUELLEMENT EXCLUSIVES avec le flow-steering
+    AF-XDP de libmtl : dès qu'une règle RX libmtl existe, l'ajout d'une règle ntuple échoue (« rmgr:
+    Cannot insert RX class rule »), et symétriquement une règle ntuple PTP préexistante fait échouer
+    la création des flows RX (« socket add flow fail for queue 1 »). On NE PEUT donc PAS épingler le
+    PTP via ntuple sur un moteur qui reçoit.
+
+    À la place on restreint la table d'indirection RSS à la SEULE queue noyau (queue 0) : tout le
+    trafic haché par RSS — dont le multicast PTP (224.0.1.129 / 224.0.0.107) — tombe sur la queue 0
+    (ptp4l noyau), tandis que libmtl dirige EXPLICITEMENT ses flux média vers les queues XSK (≥1) via
+    ses propres règles fdir, qui PRIMENT sur RSS. Aucune règle ntuple → aucun conflit. (Validé E810 :
+    RX média intacte à 50 fps après `ethtool -X equal 1`.) Réappliqué une fois après le mtl_init du
+    daemon (par sécurité, au cas où l'init toucherait la table). Best-effort."""
+    def _apply(tag):
+        try:
+            rc = subprocess.run(["ethtool", "-X", IFACE, "equal", str(PTP_KERNEL_QUEUE + 1)],
                                 stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, timeout=5)
             if rc.returncode == 0:
-                n += 1
+                print("PTP coexistence ({}): RSS restreint à la queue {} (noyau/ptp4l) ; "
+                      "média via fdir libmtl (≥1)".format(tag, PTP_KERNEL_QUEUE), flush=True)
             else:
-                print("steering PTP {} échoué: {}".format(grp, (rc.stderr or b'').decode()[:120]),
+                print("RSS restrict ({}) échoué: {}".format(tag, (rc.stderr or b'').decode()[:150]),
                       flush=True)
-        if n:
-            print("PTP steering: {} groupe(s) multicast épinglé(s) sur la queue {} (noyau/ptp4l)"
-                  .format(n, PTP_KERNEL_QUEUE), flush=True)
-    except Exception as e:
-        print("steering PTP échoué:", e, flush=True)
+        except Exception as e:
+            print("RSS restrict ({}) échoué: {}".format(tag, e), flush=True)
+    _apply("launch")
+    threading.Timer(5.0, _apply, args=("post-init",)).start()   # après le mtl_init du daemon
 
 
 def _kill_mtl():
@@ -1325,8 +1336,8 @@ def _launch_mtl():
     _mtl_proc = subprocess.Popen([MTL_RX, "--config", _CONFIG_PATH])
     _last_launch = time.time()
     print("mtl_rx daemon (re)lancé", flush=True)
-    # APRÈS le launch (donc après le flush ntuple en tête) : épingle le PTP sur la queue noyau,
-    # sinon ses Announce sont avalés par les queues AF-XDP de libmtl (bascules SLAVE↔MASTER).
+    # APRÈS le flush ntuple : PTP vers la queue noyau via RESTRICTION RSS (ethtool -N est incompatible
+    # avec le flow-steering AF-XDP de libmtl) — sinon les Announce PTP sont avalés par les queues XSK.
     _steer_ptp_to_kernel_queue()
 
 
