@@ -3,7 +3,20 @@
    par le shell ; ici on ne style que le contenu. */
 .rx-body .rx-meta { margin-bottom:6px; }
 .ens { border:1px solid var(--border-soft); border-radius:6px; padding:8px 10px; margin-bottom:8px; }
+.ens.ens-indep { border-style:dashed; }
 .ens-title { font-size:0.8em; color:var(--text-muted); margin-bottom:6px; text-transform:uppercase; letter-spacing:0.05em; }
+/* « Option A » : flux composables — ligne avec bouton de retrait + contrôles d'ajout par vidéo. */
+.io2110-flowrow { display:flex; align-items:center; gap:4px; }
+.io2110-flowrow > :first-child { flex:1 1 auto; }
+.io2110-flowrm { flex:0 0 auto; border:1px solid var(--border-soft); background:transparent; color:var(--text-muted);
+  border-radius:4px; cursor:pointer; font-size:0.85em; line-height:1; padding:3px 6px; }
+.io2110-flowrm:hover { color:var(--status-stopped-fg,#f87171); border-color:var(--status-stopped-fg,#f87171); }
+.io2110-flowctrls { display:flex; align-items:center; gap:6px; margin-top:6px; flex-wrap:wrap; }
+.io2110-flowctrls.io2110-indepadd { margin:8px 0; }
+.io2110-addflow { border:1px dashed var(--border-soft); background:transparent; color:var(--text);
+  border-radius:4px; cursor:pointer; font-size:0.85em; padding:3px 9px; }
+.io2110-addflow:hover { background:var(--surface,rgba(127,127,127,.06)); }
+.io2110-rmgrp { margin-left:auto; }
 .flow-row { display:grid; grid-template-columns: 64px 46px 104px 70px 1fr 1fr; gap:8px; align-items:center; padding:4px 6px; border-radius:4px; font-size:0.9em; }
 .flow-row + .flow-row { margin-top:3px; }
 .flow-video { background: rgba(96, 165, 250, 0.10); border-left:3px solid #60a5fa; }
