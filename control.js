@@ -224,21 +224,21 @@ window.MXLPlugins["2110_io"] = {
       const videos = receivers.filter(x => x.essence === 'video');
       const audios = receivers.filter(x => x.essence === 'audio');
       const ancs   = receivers.filter(x => x.essence === 'anc');
-      if (videos.length === 0)
-        return audios.map(a => ({video: null, audios: [a], ancs: []}))
-                     .concat(ancs.map(d => ({video: null, audios: [], ancs: [d]})));
       const groups = videos.map(v => ({video: v, audios: [], ancs: []}));
       const byVid = {};
       groups.forEach(g => { byVid[g.video.idx] = g; });
-      // Associe chaque audio/ANC à SA vidéo (video_idx) ; fallback : idx (ancien 1:1).
+      // « Option A » : chaque audio/ANC suit SA vidéo (video_idx) ; video_idx null = flux INDÉPENDANT
+      // (regroupé à part). Un container non migré sans flux retombe sur l'ancien 1:1 (video_idx = idx).
+      const indep = {video: null, audios: [], ancs: [], independent: true};
       audios.forEach(a => {
-        const vi = (a.video_idx != null) ? a.video_idx : a.idx;
-        (byVid[vi] || groups[groups.length - 1]).audios.push(a);
+        const g = (a.video_idx != null) ? byVid[a.video_idx] : null;
+        (g || indep).audios.push(a);
       });
       ancs.forEach(d => {
-        const vi = (d.video_idx != null) ? d.video_idx : d.idx;
-        (byVid[vi] || groups[groups.length - 1]).ancs.push(d);
+        const g = (d.video_idx != null) ? byVid[d.video_idx] : null;
+        (g || indep).ancs.push(d);
       });
+      if (indep.audios.length || indep.ancs.length) groups.push(indep);
       return groups;
     }
 
@@ -307,6 +307,13 @@ window.MXLPlugins["2110_io"] = {
     let _cachedVideoCount = 0;  // capacité totale déployée
     let _cachedActiveRx   = 0;  // slots simultanés autorisés (active_rx_count)
 
+    // Ligne de flux audio/ANC avec bouton de retrait granulaire (« Option A »).
+    function _rmWrap(html, fid){
+      return `<div class="io2110-flowrow">${html}`
+           + (fid ? `<button class="io2110-flowrm" data-fid="${esc(fid)}" title="Retirer ce flux">✕</button>` : '')
+           + `</div>`;
+    }
+
     function _renderBody() {
       const ens = _cachedEnsembles;
       const inner = ens.length === 0
@@ -314,30 +321,76 @@ window.MXLPlugins["2110_io"] = {
         : ens.map((g, i) => {
             const rows = [];
             if (g.video) rows.push(rowReceiver(g.video));
-            g.audios.forEach(a => rows.push(rowReceiver(a)));
-            (g.ancs || []).forEach(d => rows.push(rowReceiver(d)));
-            const titleParts = [];
-            if (g.video) titleParts.push('1 vidéo');
+            g.audios.forEach(a => rows.push(_rmWrap(rowReceiver(a), a.flow_id)));
+            (g.ancs || []).forEach(d => rows.push(_rmWrap(rowReceiver(d), d.flow_id)));
+            if (g.independent) {
+              // Flux indépendants (audio/ANC non rattachés à une vidéo).
+              return `<div class="ens ens-indep">
+                <div class="ens-title">Flux indépendants</div>
+                ${rows.join('')}
+              </div>`;
+            }
+            const titleParts = ['1 vidéo'];
             if (g.audios.length) titleParts.push(`${g.audios.length} audio`);
             if ((g.ancs || []).length) titleParts.push(`${g.ancs.length} ANC`);
+            const vfid = g.video ? (g.video.flow_id || '') : '';
+            // Ajout/retrait granulaire par vidéo : + Audio / + ANC rattachés ; ✕ retire la source entière.
+            const ctrls = vfid ? `<div class="io2110-flowctrls">
+              <button class="io2110-addflow" data-ess="audio" data-att="${esc(vfid)}">+ Audio</button>
+              <button class="io2110-addflow" data-ess="anc" data-att="${esc(vfid)}">+ ANC</button>
+              <button class="io2110-flowrm io2110-rmgrp" data-fid="${esc(vfid)}" title="Retirer cette source">✕ source</button>
+            </div>` : '';
             return `<div class="ens">
               <div class="ens-title">Ensemble #${i} — ${titleParts.join(' + ')}</div>
               ${rows.join('')}
+              ${ctrls}
             </div>`;
           }).join('');
-      const activeEnsCount = ens.filter(g => g.video && g.video.active).length;
-      const remaining = _cachedActiveRx - activeEnsCount;
-      const moreBtn = remaining > 0
+      const ensVideoCount = ens.filter(g => g.video).length;
+      // Headroom = pool pré-provisionné (video_count). Au-delà → augmenter le pool (redéploiement).
+      const moreBtn = ensVideoCount < _cachedVideoCount
         ? `<button class="io2110-more-btn">+ Ajouter une source</button>`
         : '';
-      const delBtn = _cachedActiveRx > 0
+      const delBtn = ensVideoCount > 0
         ? `<button class="io2110-more-btn io2110-del-rx">− Retirer la dernière source</button>`
         : '';
-      body.innerHTML = _cachedMeta + inner + moreBtn + delBtn + _cachedTxHtml;
-      if (remaining > 0) {
-        body.querySelector('.io2110-more-btn').onclick = async (btn) => {
-          const el = body.querySelector('.io2110-more-btn');
-          if (el) el.disabled = true;
+      // Création d'un flux INDÉPENDANT (audio/ANC sans vidéo d'attache).
+      const indepAdd = `<div class="io2110-flowctrls io2110-indepadd">
+        <span class="meta">Indépendant :</span>
+        <button class="io2110-addflow" data-ess="audio" data-att="">+ Audio</button>
+        <button class="io2110-addflow" data-ess="anc" data-att="">+ ANC</button>
+      </div>`;
+      body.innerHTML = _cachedMeta + inner + indepAdd + moreBtn + delBtn + _cachedTxHtml;
+      // Ajout granulaire de flux (rattaché si data-att, sinon indépendant).
+      body.querySelectorAll('.io2110-addflow').forEach(b => b.onclick = async () => {
+        b.disabled = true;
+        try {
+          const r = await fetch(`/api/mtl/${vmid}/flows/add`, {
+            method: 'POST', headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({role: 'rx', essence: b.dataset.ess, attached_to: b.dataset.att || null}),
+          });
+          if (!r.ok) { const j = await r.json().catch(()=>({})); toast(j.error || 'Erreur ajout flux', 'error'); }
+        } catch(e) { toast('Erreur réseau', 'error'); }
+        await refresh();
+      });
+      // Retrait granulaire d'un flux (par id ; une vidéo retire aussi ses audios/ANC attachés).
+      body.querySelectorAll('.io2110-flowrm').forEach(b => b.onclick = async () => {
+        b.disabled = true;
+        try {
+          const r = await fetch(`/api/mtl/${vmid}/flows/remove`, {
+            method: 'POST', headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({id: b.dataset.fid}),
+          });
+          const j = await r.json().catch(()=>({}));
+          if (!r.ok) toast(j.error || 'Erreur retrait flux', 'error');
+          else if (j.note) toast(j.note, 'info');
+        } catch(e) { toast('Erreur réseau', 'error'); }
+        await refresh();
+      });
+      const moreEl = body.querySelector('.io2110-more-btn:not(.io2110-del-rx)');
+      if (moreEl) {
+        moreEl.onclick = async () => {
+          moreEl.disabled = true;
           try {
             const r = await fetch(`/api/mtl/${vmid}/activate`, {
               method: 'POST', headers: {'Content-Type': 'application/json'},

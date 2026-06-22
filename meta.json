@@ -1,7 +1,14 @@
 {
-  "version": "0.23.2",
+  "version": "0.24.0",
   "date": "2026-06-22",
   "changes": {
+    "Flux composables — Sources/Destinations 2110 (« Option A », 0.24.0)": [
+      "AJOUT/RETRAIT GRANULAIRE des flux par essence (vidéo / audio / ANC), À CHAUD dans la limite du pool pré-provisionné. On crée une Source (RX) ou Destination (TX) VIDÉO, puis on y adjoint N audios + un ANC (boutons « + Audio » / « + ANC » / ✕ par carte) ; on peut aussi créer des flux INDÉPENDANTS (audio/ANC non rattachés à une vidéo). Remplace le ratio audio/vidéo HOMOGÈNE (audio_per_video, cap TX à 2 audios) : chaque vidéo a désormais son propre nombre d'audios/ANC.",
+      "Modèle : deux listes ordonnées rx_flows / tx_flows dans deploy_config.params — chaque flux {id, essence, idx, attached_to, label}. idx = slot du pool moteur (pilote le shm + le tag NMOS receiver_index → keying vmid+idx STABLE) ; attached_to = id de la vidéo (flux qui se câble/déplace avec elle) ou null (indépendant). Les compteurs *_count restent la CAPACITÉ (pool) ; les listes font foi pour le GROUPEMENT et le nombre réel de flux. Helpers app/io2110_flows.py.",
+      "Migration idempotente au boot (database.init_db) : les containers 2110_io existants reçoivent rx_flows/tx_flows DÉRIVÉS de leurs compteurs + ratio actuels (groupement audio/ANC→vidéo préservé, ensemble ACTIF reconstruit à l'identique). Rendu NMOS, page Câbles et budget de queues/lcores INCHANGÉS pour une compo homogène existante.",
+      "API : POST /api/mtl/<vmid>/flows/add {role,essence,attached_to?} et /flows/remove {id}. Les boutons « + / − source/destination » (routes /activate /deactivate) ajoutent/retirent désormais une source/destination COMPLÈTE via les flux. RX : pas de teardown live au retrait (contrainte moteur — libération effective au prochain redéploiement) ; TX : coupe le slot à chaud.",
+      "PORTÉE : changement ORCHESTRATEUR + UI uniquement — PAS de rebuild image pour le modèle et les Sources (RX). Le moteur pré-provisionne déjà le pool (video_count/audio_count/anc_count) ; le groupement attaché/indépendant est de la métadonnée orchestrateur. ⚠ Destinations (TX) au-delà de 2 audios/slot : suppose que le contrôleur :8081/tx accepte une liste audios[] de longueur N (cap [:2] levé côté orchestrateur) — à confirmer/rebâtir côté image si le contrôleur plafonnait à 2."
+    ],
     "RX ANC AF-XDP réparée (0.23.2)": [
       "RX ANC (ST 2110-40) en AF-XDP RÉPARÉE : patch libmtl st40_pipeline_rx. En AF-XDP natif les mbufs ANC arrivent avec rte_mbuf->port=UINT16_MAX (non renseigné par le chemin XSK) alors que st40_pipeline_rx exige pkt->port == port_id physique → CHAQUE paquet ANC jeté (« drop pkt: unmapped port_id 65535 ») → 0 trame ANC, timecode RP188 jamais reçu (st20/st30 ne font pas ce contrôle → seul l'ANC touché). Patch (plugins/2110_io/docker/patch_st40_afxdp_port.py, appliqué au build avant ./build.sh) : en MONO-PORT (num_port==1) on retombe sur le port 0 au lieu de jeter (le contrôle ne sert qu'au dé-doublonnage 2022-7 multi-port). REBUILD IMAGE REQUIS (recompile libmtl). Bug PRÉ-EXISTANT révélé par la 1ʳᵉ vraie source ANC."
     ],

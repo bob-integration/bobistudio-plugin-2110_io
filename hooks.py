@@ -34,10 +34,30 @@ def before_deploy(params, context):
     params = normalize_receiver_params(params, settings=context.get("settings"))
     vmid = int(context.get("vmid", 0))
     n_tx = int(params.get("tx_count") or 0)
-    # Nombre de flux audio PAR slot TX = ratio audio_count/tx_count (≥1). Chaque slot actif consomme
-    # ainsi 1 vidéo + N audio + 1 ANC ; avec N=1 → 3 queues AF_XDP/slot, ce qui fait coller la maths
-    # du budget (active*3) côté orchestrateur et évite la sur-souscription des queues.
-    n_aud_per_tx = max(1, (int(params.get("audio_count") or 0) // n_tx) if n_tx else 1)
+    nv   = int(params.get("video_count") or 0)
+    from app import io2110_flows as _iof
+    # active_rx_count / active_tx_count : fenêtre de visibilité NMOS. POSÉS D'ABORD (avant de dériver
+    # les flux) car la dérivation legacy s'appuie dessus. setdefault → préservés au re-déploiement.
+    params.setdefault("active_rx_count", min(8, nv))
+    params["active_rx_count"] = max(0, min(int(params["active_rx_count"] or 0), nv))
+    params.setdefault("active_tx_count", min(8, n_tx))
+    params["active_tx_count"] = max(0, min(int(params["active_tx_count"] or 0), n_tx))
+    # Modèle de flux composables (« Option A ») : rx_flows/tx_flows font foi pour le GROUPEMENT et le
+    # nombre d'audios/ANC par vidéo. Dérivés du legacy au 1er passage (container neuf via la palette),
+    # puis PRÉSERVÉS — le hot add/remove (routes /flows/*) les édite. Ne jamais écraser une liste.
+    if not params.get("rx_flows"):
+        params["rx_flows"] = _iof.derive_rx_flows(params)
+    if not params.get("tx_flows"):
+        params["tx_flows"] = _iof.derive_tx_flows(params)
+    params["rx_flows"] = _iof.normalize(params["rx_flows"])
+    params["tx_flows"] = _iof.normalize(params["tx_flows"])
+    tx_flows = params["tx_flows"]
+    # active_rx_count / active_tx_count = nombre de flux VIDÉO actifs (les listes font foi). Tenus
+    # synchrones car le budget de queues/lcores (docker_driver._auto_lcores, _mtl_active_caps) les lit.
+    params["active_rx_count"] = min(nv, len([f for f in params["rx_flows"] if f["essence"] == "video"])) if nv else \
+        len([f for f in params["rx_flows"] if f["essence"] == "video"])
+    params["active_tx_count"] = min(n_tx, len([f for f in tx_flows if f["essence"] == "video"]))
+    n_aud_per_tx = max(1, (int(params.get("audio_count") or 0) // n_tx) if n_tx else 1)  # défaut pool
     slots = [dict(t or {}) for t in (params.get("tx_slots") or [])]
     while len(slots) < n_tx:
         slots.append({})
@@ -52,60 +72,53 @@ def before_deploy(params, context):
         t.setdefault("height", int(params.get("height") or 1080))
         t.setdefault("fps",    float(params.get("fps") or 25))
         t.setdefault("scan",   str(params.get("scan") or "p"))
-        # Audio TX : n_aud_per_tx flux — plages 239.10.40.x, 239.10.41.x, …
-        base_a = (vmid * 2 + i) % 254 + 1
-        audios_alloc = [
-            {"multicast_ip": f"239.10.{40 + ai}.{base_a}", "dest_port": 5004 + i * 4 + ai * 2}
-            for ai in range(n_aud_per_tx)
-        ]
-        # Complète depuis l'existant si présent, sinon alloue ; TRONQUE au ratio (un container
-        # legacy provisionné avec 2 audios/slot repasse à 1 au prochain redéploiement → fin de la
-        # sur-souscription « 2 audios par TX »).
-        t["audios"] = ((t.get("audios") or []) + audios_alloc)[:n_aud_per_tx]
-        # Générateur de tonalité par sous-flux audio (autonome) — défaut OFF, 1 kHz / -18 dBFS,
-        # 8 canaux actifs sans ruptage. setdefault : préserve un réglage existant.
-        for a in t["audios"]:
-            a.setdefault("tone", {"enabled": False, "freq": 1000, "level_db": -18.0,
-                                  "active": [True] * 8, "rupted": [False] * 8})
-        # ANC TX (1 flux) : plage 239.10.50.x
+        # Audios du slot = flux audio ATTACHÉS (tx_flows), N quelconque (plus de cap à 2). Les
+        # mcast/port sont alloués par idx FLAT de flux → uniques même au-delà de 2 audios/slot.
+        # Un slot vidéo-seul (0 flux audio attaché) n'a aucune destination audio. Les slots SANS
+        # flux vidéo (pool inactif) ne sont pas touchés ici (activation = ajout de flux, route /flows).
+        aud_idxs = _iof.tx_slot_audio_idxs(tx_flows, i)
+        if aud_idxs or any(f["essence"] == "video" and f["idx"] == i for f in tx_flows):
+            existing = t.get("audios") or []
+            audios = []
+            for ai, aidx in enumerate(aud_idxs):
+                a = dict(existing[ai]) if ai < len(existing) else {}
+                a.setdefault("multicast_ip", f"239.10.{40 + (aidx % 8)}.{(vmid * 2 + aidx) % 254 + 1}")
+                a.setdefault("dest_port", 5004 + aidx * 2)
+                # Générateur de tonalité par sous-flux audio — défaut OFF, 1 kHz / -18 dBFS.
+                a.setdefault("tone", {"enabled": False, "freq": 1000, "level_db": -18.0,
+                                      "active": [True] * 8, "rupted": [False] * 8})
+                audios.append(a)
+            t["audios"] = audios
+        # ANC TX (1 flux par slot) : plage 239.10.50.x
         t.setdefault("anc_multicast_ip", f"239.10.50.{(vmid + i) % 254 + 1}")
         t.setdefault("anc_dest_port", 5008 + i * 2)
         # SMPTE 2022-7 — leg1 auto-allouée une seule fois (setdefault : ne pas écraser)
         if params.get("smpte_2022_7"):
             t.setdefault("multicast_ip_leg1", f"239.10.130.{(vmid + i) % 254 + 1}")
             t.setdefault("dest_port_leg1", t.get("dest_port") or 5000)
-            audios = t.get("audios") or []
-            for ai, a in enumerate(audios):
-                a.setdefault("multicast_ip_leg1", f"239.10.{140 + ai}.{base_a}")
+            for ai, a in enumerate(t.get("audios") or []):
+                aidx = aud_idxs[ai] if ai < len(aud_idxs) else ai
+                a.setdefault("multicast_ip_leg1", f"239.10.{140 + (aidx % 8)}.{(vmid * 2 + aidx) % 254 + 1}")
                 a.setdefault("dest_port_leg1", a.get("dest_port") or 5004)
             t.setdefault("anc_multicast_ip_leg1", f"239.10.150.{(vmid + i) % 254 + 1}")
             t.setdefault("anc_dest_port_leg1", t.get("anc_dest_port") or 5008)
     params["tx_slots"] = slots[:n_tx]
-    # Câblage INDÉPENDANT audio/ANC des sorties TX. tx_audio_count = nb total de ports audio TX
-    # (= repeat du manifeste). Migration douce : un slot dont la vidéo est câblée mais SANS câble
-    # audio/ANC explicite hérite du shm DÉRIVÉ (ancien comportement « suit la vidéo ») → les moteurs
-    # existants ne deviennent pas muets et apparaissent câblés (ré-routables). Une sortie jamais
-    # câblée reste à "" → silence (pas d'émission). setdefault : ne JAMAIS écraser un choix explicite.
-    params["tx_audio_count"] = n_tx * n_aud_per_tx
+    # Pool d'entrées audio TX (capacité contrôleur) : ≥ legacy (n_tx × défaut) ET ≥ plus haut idx de
+    # flux audio + 1 (réserve les slots pour le hot-add). tx_audio_count = repeat du manifeste.
+    max_aidx = max([f["idx"] for f in tx_flows if f["essence"] == "audio"] + [-1])
+    params["tx_audio_count"] = max(n_tx * n_aud_per_tx, max_aidx + 1)
+    # Câblage shm audio/ANC : un flux audio/ANC dont la vidéo est câblée mais sans câble explicite
+    # hérite du shm DÉRIVÉ (suit la vidéo) → pas de sortie muette. setdefault : ne jamais écraser.
     for i in range(n_tx):
         vshm = (params.get(f"tx{i}_shm") or "").strip()
-        for ai in range(n_aud_per_tx):
-            params.setdefault(f"tx_audio{i * n_aud_per_tx + ai}_shm", _derive_audio_shm(vshm, ai))
+        for ai, aidx in enumerate(_iof.tx_slot_audio_idxs(tx_flows, i)):
+            params.setdefault(f"tx_audio{aidx}_shm", _derive_audio_shm(vshm, ai))
         params.setdefault(f"tx_anc{i}_shm", _derive_anc_shm(vshm))
-    # active_rx_count / active_tx_count : combien de slots apparaissent dans NMOS.
-    # setdefault → préservé lors des re-déploiements (l'opérateur a peut-être activé des slots).
-    nv = int(params.get("video_count") or 0)
-    params.setdefault("active_rx_count", min(8, nv))
-    params["active_rx_count"] = max(0, min(int(params["active_rx_count"] or 0), nv))
-    params.setdefault("active_tx_count", min(8, n_tx))
-    params["active_tx_count"] = max(0, min(int(params["active_tx_count"] or 0), n_tx))
     return params
 
 
 def topology_ports(hostname, params, ctx):
-    nv = int(params.get("video_count") or 0)
-    na = int(params.get("audio_count") or 0)
-    nd = int(params.get("anc_count") or 0)
+    from app import io2110_flows as _iof
     video_fmt = {
         "width":  int(params.get("width") or 0),
         "height": int(params.get("height") or 0),
@@ -116,44 +129,55 @@ def topology_ports(hostname, params, ctx):
         "field_order": str(params.get("field_order") or ""),
     }
     audio_fmt = {"sample_rate": 48000, "channels": 8, "bit_depth": 24}
-    produces  = [{"shm": f"{hostname}_{i}", "kind": "video", "format": video_fmt} for i in range(nv)]
-    produces += [{"shm": f"{hostname}_audio_{i}", "kind": "audio", "format": audio_fmt} for i in range(na)]
-    produces += [{"shm": f"{hostname}_anc_{i}", "kind": "data", "format": {"type": "smpte291"}} for i in range(nd)]
+    # « Option A » : les ports produits (RX) reflètent les flux ACTIFS (rx_flows) et portent un
+    # `group` = id de la vidéo d'attache (ou la vidéo elle-même) → la page Câbles regroupe la vidéo
+    # et ses audios/ANC ; un flux indépendant a son propre groupe.
+    rx_flows = _iof.active_flows(params, "rx")
+    _fmt = {"video": video_fmt, "audio": audio_fmt, "anc": {"type": "smpte291"}}
+    _shmf = {"video": f"{hostname}_{{}}", "audio": f"{hostname}_audio_{{}}", "anc": f"{hostname}_anc_{{}}"}
+    _kindf = {"video": "video", "audio": "audio", "anc": "data"}
+    produces = []
+    for f in rx_flows:
+        ess = f["essence"]
+        produces.append({"shm": _shmf[ess].format(f["idx"]), "kind": _kindf[ess],
+                         "format": _fmt[ess],
+                         "group": f["id"] if ess == "video" else (f.get("attached_to") or f["id"])})
     # Slots TX (émetteurs) = ports d'ENTRÉE câblables → destinations MXL à droite sur la page Câbles.
-    # Le shm câblé est persisté à plat dans deploy_config sous tx{i}_shm (state_field du manifeste).
+    # Pilotés par tx_flows : par slot vidéo, le port vidéo + ses audios attachés (N) + son ANC.
     consumes = []
+    tx_flows = _iof.active_flows(params, "tx")
     txs = params.get("tx_slots") or []
-    n_tx = int(params.get("tx_count") or 0)
-    n_aud_per_tx = max(1, (na // n_tx) if n_tx else 1)
-    for i in range(n_tx):
+    for vf in [x for x in tx_flows if x["essence"] == "video"]:
+        i = vf["idx"]
         t = txs[i] if i < len(txs) else {}
-        # Port VIDÉO (2110-20)
         shm = params.get(f"tx{i}_shm") or ""
         dest = "{}:{}".format(t.get("multicast_ip"), t.get("dest_port") or 5000) if t.get("multicast_ip") else ""
-        port = {"kind": "video", "slot": i, "label": f"TX #{i + 1}",
-                "shm": shm, "dest": dest}   # dest = destination 2110-20 (éditable à chaud)
+        port = {"kind": "video", "slot": i, "label": f"TX #{i + 1}", "shm": shm, "dest": dest,
+                "group": vf["id"]}
         if not shm:
             port["disconnected"] = True
         consumes.append(port)
-        # Ports AUDIO (2110-30) — câblables indépendamment ; slot = index LINÉAIRE ap = i*N + ai
+        # Ports AUDIO (2110-30) — un par flux audio attaché ; slot = idx FLAT du flux (= tx_audio{idx}_shm)
+        aud_idxs = _iof.tx_slot_audio_idxs(tx_flows, i)
         audios = t.get("audios") or []
-        for ai in range(n_aud_per_tx):
-            ap = i * n_aud_per_tx + ai
+        for ai, ap in enumerate(aud_idxs):
             ashm = params.get(f"tx_audio{ap}_shm") or ""
             a = audios[ai] if ai < len(audios) else {}
             adest = "{}:{}".format(a.get("multicast_ip"), a.get("dest_port") or 5004) if a.get("multicast_ip") else ""
-            alabel = f"TX #{i + 1} AUD" + (f" {ai + 1}" if n_aud_per_tx > 1 else "")
-            aport = {"kind": "audio", "slot": ap, "label": alabel, "shm": ashm, "dest": adest}
+            alabel = f"TX #{i + 1} AUD" + (f" {ai + 1}" if len(aud_idxs) > 1 else "")
+            aport = {"kind": "audio", "slot": ap, "label": alabel, "shm": ashm, "dest": adest, "group": vf["id"]}
             if not ashm:
                 aport["disconnected"] = True
             consumes.append(aport)
-        # Port ANC (2110-40) — câblable indépendamment ; slot = i (espace de slots propre au kind data)
-        dshm = params.get(f"tx_anc{i}_shm") or ""
-        ddest = "{}:{}".format(t.get("anc_multicast_ip"), t.get("anc_dest_port") or 5008) if t.get("anc_multicast_ip") else ""
-        dport = {"kind": "data", "slot": i, "label": f"TX #{i + 1} ANC", "shm": dshm, "dest": ddest}
-        if not dshm:
-            dport["disconnected"] = True
-        consumes.append(dport)
+        # Port ANC (2110-40) — présent si un flux ANC est attaché ; slot = i (espace propre au kind data)
+        if _iof.tx_slot_has_anc(tx_flows, i):
+            dshm = params.get(f"tx_anc{i}_shm") or ""
+            ddest = "{}:{}".format(t.get("anc_multicast_ip"), t.get("anc_dest_port") or 5008) if t.get("anc_multicast_ip") else ""
+            dport = {"kind": "data", "slot": i, "label": f"TX #{i + 1} ANC", "shm": dshm, "dest": ddest,
+                     "group": vf["id"]}
+            if not dshm:
+                dport["disconnected"] = True
+            consumes.append(dport)
     return {"produces": produces, "consumes": consumes}
 
 
@@ -174,7 +198,12 @@ def wire_followers(kind, shm, slot, params, ctx):
     n_tx = int(params.get("tx_count") or 0)
     if not (0 <= i < n_tx):
         return None
-    n_aud_per_tx = max(1, (int(params.get("audio_count") or 0) // n_tx) if n_tx else 1)
+    # « Option A » : les audios/ANC qui SUIVENT la vidéo = les flux attachés à ce slot (tx_flows),
+    # par leur idx FLAT (= tx_audio{idx}_shm). Plus de pas fixe homogène.
+    from app import io2110_flows as _iof
+    tx_flows = _iof.active_flows(params, "tx")
+    aud_idxs = _iof.tx_slot_audio_idxs(tx_flows, i)
+    has_anc = _iof.tx_slot_has_anc(tx_flows, i)
     produces = ctx.get("producer_produces") or []     # [{essence, shm}] de la source (vide → décâblage)
     vids = [p["shm"] for p in produces if (p.get("essence") or "video") == "video"]
     auds = [p["shm"] for p in produces if p.get("essence") == "audio"]
@@ -186,29 +215,26 @@ def wire_followers(kind, shm, slot, params, ctx):
     prog_a = auds[v * ka:(v + 1) * ka] if ka else auds
     prog_d = dats[v * kd:(v + 1) * kd] if kd else dats
     followers = []
-    for ai in range(n_aud_per_tx):
-        ap = i * n_aud_per_tx + ai
+    for ai, ap in enumerate(aud_idxs):
         followers.append({"essence": "audio", "slot": ap,
                           "shm": (prog_a[ai] if ai < len(prog_a) else ""),
                           "state_field": f"tx_audio{ap}_shm"})
-    followers.append({"essence": "data", "slot": i,
-                      "shm": (prog_d[0] if prog_d else ""),
-                      "state_field": f"tx_anc{i}_shm"})
+    if has_anc:
+        followers.append({"essence": "data", "slot": i,
+                          "shm": (prog_d[0] if prog_d else ""),
+                          "state_field": f"tx_anc{i}_shm"})
     return followers
 
 
 def produced_flow_count(params, ctx):
-    return (int(params.get("video_count") or 0) + int(params.get("audio_count") or 0)
-            + int(params.get("anc_count") or 0))
+    from app import io2110_flows as _iof
+    return len(_iof.active_flows(params, "rx"))
 
 
 def produced_shms(hostname, params, ctx):
-    nv = int(params.get("video_count") or 0)
-    na = int(params.get("audio_count") or 0)
-    nd = int(params.get("anc_count") or 0)
-    return ([f"{hostname}_{i}" for i in range(nv)]
-            + [f"{hostname}_audio_{i}" for i in range(na)]
-            + [f"{hostname}_anc_{i}" for i in range(nd)])
+    from app import io2110_flows as _iof
+    _shmf = {"video": f"{hostname}_{{}}", "audio": f"{hostname}_audio_{{}}", "anc": f"{hostname}_anc_{{}}"}
+    return [_shmf[f["essence"]].format(f["idx"]) for f in _iof.active_flows(params, "rx")]
 
 
 def control_action(action, body, params, ctx):
