@@ -1,7 +1,10 @@
 {
-  "version": "0.23.0",
-  "date": "2026-06-21",
+  "version": "0.23.1",
+  "date": "2026-06-22",
   "changes": {
+    "Coexistence PTP ↔ RX AF-XDP (0.23.1)": [
+      "PTP steering RÉÉCRIT par RESTRICTION RSS au lieu d'ethtool -N (ntuple). Sur l'E810/ice, les règles ntuple `ethtool -N` sont MUTUELLEMENT EXCLUSIVES avec le flow-steering AF-XDP de libmtl : la règle ntuple PTP (0.22.18, 224.0.1.129→queue 0) empêchait la création des sessions RX (« rx_flow_create: socket add flow fail for queue 1 » → st20p_rx_create fail → rx_create_failed), et symétriquement une fois une session RX libmtl active l'ajout de la règle ntuple échoue (« rmgr: Cannot insert RX class rule »). Le moteur ne pouvait donc PAS recevoir tant que le steering PTP ntuple était posé. controller._steer_ptp_to_kernel_queue restreint désormais la table d'indirection RSS à la SEULE queue noyau (`ethtool -X <iface> equal 1`) : tout le trafic haché par RSS (dont le multicast PTP) tombe sur la queue 0 (ptp4l noyau), tandis que libmtl dirige EXPLICITEMENT ses flux média vers les queues XSK (≥1) via ses propres règles fdir, qui priment sur RSS. Aucune règle ntuple → aucun conflit. Réappliqué 5 s après le lancement (post mtl_init). _flush_ntuple (au lancement) purge l'ancienne règle ntuple PTP à la mise à jour depuis 0.22.x. Validé E810 (dl360) : RX média 50 fps intacte après bascule RSS. REBUILD IMAGE REQUIS."
+    ],
     "Migration MXL (0.23.0)": [
       "BASCULE SUR LE BUS MXL (SDK Linux Foundation). Le moteur 2110 n'écrit/ne lit plus de rings shm maison (header 64 o + ring /dev/shm/{hn}_{idx}) : il produit et consomme des FLOWS MXL (grains vidéo/data, samples audio) dans le domaine tmpfs partagé, comme tous les plugins de calcul/média déjà migrés. mtl_rx.c lie libmxl (mxlFlowWriter/Reader, OpenGrain/CommitGrain, OpenSamples/CommitSamples) ; controller.py écrit la simu/txgen via bobimxl. C'était le DERNIER producteur/consommateur 2110 encore en shm maison → les sources 2110 réelles réintègrent le bus MXL.",
       "Format porté par le flow_def (source de vérité, cohérent avec la Phase 1). Le moteur construit le flow_def JSON (video/x-mxl-planar planar octet-identique ; audio/float32 ; video/smpte291 pour l'ANC) ; les consommateurs lisent le format du flux, plus de dénormalisation source/shm_out porteuse de format. Nom de flux = basename de l'ancien shm ({hn}_{idx}) → câblage orchestrateur inchangé ; UUIDv5 déterministe identique à bobimxl.flow_id (SHA-1/libcrypto, même namespace).",
