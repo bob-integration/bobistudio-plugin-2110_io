@@ -251,7 +251,7 @@ def control_action(action, body, params, ctx):
         key = "sim_audio_slots" if essence == "audio" else "sim_video_slots"
         slots = [dict(s or {}) for s in (params.get(key) or [])]
         if not (0 <= idx < len(slots)):
-            raise ValueError(f"slot {essence} #{idx} hors limites")
+            raise ValueError(f"slot {essence} #{idx + 1} hors limites")
         slots[idx]["enabled"] = enabled
         if essence == "video" and "pattern" in body:
             slots[idx]["pattern"] = str(body["pattern"])
@@ -271,7 +271,7 @@ def control_action(action, body, params, ctx):
         except (TypeError, ValueError): idx = -1
         slots = [dict(s or {}) for s in (params.get("sim_video_slots") or [])]
         if not (0 <= idx < len(slots)):
-            raise ValueError(f"slot vidéo #{idx} hors limites")
+            raise ValueError(f"slot vidéo #{idx + 1} hors limites")
         if "enabled" in body:
             slots[idx]["ident"] = bool(body["enabled"])
         if "size" in body:
@@ -291,7 +291,7 @@ def control_action(action, body, params, ctx):
         except (TypeError, ValueError): idx = -1
         tx_slots = list(params.get("tx_slots") or [])
         if not (0 <= idx < len(tx_slots)):
-            raise ValueError(f"slot TX #{idx} hors limites")
+            raise ValueError(f"slot TX #{idx + 1} hors limites")
         slots = [dict(s or {}) for s in tx_slots]
         slots[idx]["gen_enabled"] = bool(body.get("enabled", False))
         if "pattern" in body:
@@ -307,7 +307,7 @@ def control_action(action, body, params, ctx):
         except (TypeError, ValueError): idx = -1
         tx_slots = list(params.get("tx_slots") or [])
         if not (0 <= idx < len(tx_slots)):
-            raise ValueError(f"slot TX #{idx} hors limites")
+            raise ValueError(f"slot TX #{idx + 1} hors limites")
         slots = [dict(s or {}) for s in tx_slots]
         if "enabled" in body:
             slots[idx]["ident"] = bool(body["enabled"])
@@ -326,11 +326,11 @@ def control_action(action, body, params, ctx):
         except (TypeError, ValueError): idx = ai = -1
         tx_slots = list(params.get("tx_slots") or [])
         if not (0 <= idx < len(tx_slots)):
-            raise ValueError(f"slot TX #{idx} hors limites")
+            raise ValueError(f"slot TX #{idx + 1} hors limites")
         slots = [dict(s or {}) for s in tx_slots]
         audios = [dict(a or {}) for a in (slots[idx].get("audios") or [])]
         if not (0 <= ai < len(audios)):
-            raise ValueError(f"flux audio #{ai} hors limites sur le slot TX #{idx}")
+            raise ValueError(f"flux audio #{ai + 1} hors limites sur le slot TX #{idx + 1}")
         tone = dict(audios[ai].get("tone") or
                     {"enabled": False, "freq": 1000, "level_db": -18.0,
                      "active": [True] * 8, "rupted": [False] * 8})
