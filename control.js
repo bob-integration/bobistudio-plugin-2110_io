@@ -274,7 +274,7 @@ window.MXLPlugins["2110_io"] = {
           <span class="badge" style="background:var(--bg-input,var(--bg));border:1px solid var(--border)">2110-40</span>
           ${fmtDest(anc)}</div>`);
         return `<div class="ens">
-          <div class="ens-title">Slot TX #${ti}</div>
+          <div class="ens-title">Slot TX #${Number(ti) + 1}</div>
           ${lines.join('')}
         </div>`;
       }).join('');
