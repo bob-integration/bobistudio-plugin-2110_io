@@ -1,7 +1,10 @@
 {
-  "version": "0.25.3",
-  "date": "2026-06-22",
+  "version": "0.25.4",
+  "date": "2026-06-23",
   "changes": {
+    "Affichage : numérotation des slots TX à partir de 1 (0.25.4)": [
+      "La liste « Sorties (TX) » de la carte de contrôle affichait « Slot TX #0 » (tx_idx 0-based) ; passe en « Slot TX #1 » pour s'aligner sur le reste de l'UI (RX Vidéo/Audio/ANC, cartes Destinations 2110, libellés de ports Câbles, tous déjà en base 1)."
+    ],
     "Entrelacé — calloc des buffers de weave (anti-glitch démarrage, 0.25.3)": [
       "Les buffers de pont champ↔trame `rx_scratch` (RX) et `tx_frame` (TX) sont désormais alloués en `calloc` (zéroés) au lieu de `malloc`. En régime établi sans effet (les 2 parités couvrent toutes les lignes avant publication), mais si le TOUT PREMIER champ reçu/émis est un 2e champ (sf=1 — on rejoint un flux en cours de trame), les lignes de l'autre parité étaient du garbage mémoire → une trame parasite au démarrage. Zéro coût, supprime le glitch. Aucun changement de comportement progressif. REBUILD IMAGE pour prise d'effet (mtl_rx.c). Trouvé à l'audit statique avant la validation live 1080i50."
     ],
