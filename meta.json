@@ -1,7 +1,10 @@
 {
-  "version": "0.25.2",
+  "version": "0.25.3",
   "date": "2026-06-22",
   "changes": {
+    "Entrelacé — calloc des buffers de weave (anti-glitch démarrage, 0.25.3)": [
+      "Les buffers de pont champ↔trame `rx_scratch` (RX) et `tx_frame` (TX) sont désormais alloués en `calloc` (zéroés) au lieu de `malloc`. En régime établi sans effet (les 2 parités couvrent toutes les lignes avant publication), mais si le TOUT PREMIER champ reçu/émis est un 2e champ (sf=1 — on rejoint un flux en cours de trame), les lignes de l'autre parité étaient du garbage mémoire → une trame parasite au démarrage. Zéro coût, supprime le glitch. Aucun changement de comportement progressif. REBUILD IMAGE pour prise d'effet (mtl_rx.c). Trouvé à l'audit statique avant la validation live 1080i50."
+    ],
     "Barre Queues XDP — coloration ambre du planifié au-delà du plafond (UI, 0.25.2)": [
       "La portion HACHURÉE « planifié » qui DÉPASSE le marqueur `reserved` (flux provisionnés qui ne tiennent pas dans le plafond à chaud → redéploiement requis pour les faire passer live) est désormais en AMBRE hachuré (.nic-xdp-over), distincte du planifié-à-chaud (couleur de l'actif). Le libellé passe aussi en ambre et précise « dont N > réservé ». Sources + Destinations."
     ],

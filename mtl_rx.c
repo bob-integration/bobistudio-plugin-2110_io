@@ -447,7 +447,7 @@ static void* video_rx_thread(void* arg) {
       int sf = frame->second_field ? 1 : 0;
       int parity = field_parity(sf, s->tff);
       if (!sf) mts_latch = mts;                    /* capture = instant du 1er champ */
-      if (!s->rx_scratch) s->rx_scratch = malloc(s->shm_slotsize);
+      if (!s->rx_scratch) s->rx_scratch = calloc(1, s->shm_slotsize);   /* zéroé : pas de garbage si le 1er champ reçu est un 2e champ */
       if (s->rx_scratch) field_weave(s->width, s->height, s->conv8, frame, s->rx_scratch, parity, 0);
       if (sf && s->rx_scratch) {                   /* 2e champ : trame complète → publier */
         uint64_t fi = mts_latch ? mxlTimestampToIndex(&s->mrate, mts_latch)
@@ -674,7 +674,7 @@ static void* video_tx_thread(void* arg) {
        * 2e (évite le combing si le producteur avance entre les deux get_frame). Dé-weave en lignes. */
       int sf = frame->second_field ? 1 : 0;
       int parity = field_parity(sf, s->tff);
-      if (!s->tx_frame) s->tx_frame = malloc(s->shm_slotsize);
+      if (!s->tx_frame) s->tx_frame = calloc(1, s->shm_slotsize);   /* zéroé : pas de garbage si le 1er champ émis est un 2e champ */
       if (!sf) {                                 /* 1er champ : (re)charger la trame source */
         mxlGrainInfo gi; uint8_t* payload;
         if (s->tx_frame && reader_latest(t, &gi, &payload) == 0) {
