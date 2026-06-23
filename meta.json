@@ -1,7 +1,10 @@
 {
-  "version": "0.25.4",
+  "version": "0.25.5",
   "date": "2026-06-23",
   "changes": {
+    "Messages d'erreur : index de slots/flux en base 1 (0.25.5)": [
+      "Les messages de validation (« slot vidéo #0 hors limites », « slot TX #0 hors limites », « flux audio #0 hors limites sur le slot TX #0 ») affichaient l'index brut 0-based. Passent en base 1 (#1…), cohérents avec le reste de l'UI. Les indices internes sont inchangés."
+    ],
     "Affichage : numérotation des slots TX à partir de 1 (0.25.4)": [
       "La liste « Sorties (TX) » de la carte de contrôle affichait « Slot TX #0 » (tx_idx 0-based) ; passe en « Slot TX #1 » pour s'aligner sur le reste de l'UI (RX Vidéo/Audio/ANC, cartes Destinations 2110, libellés de ports Câbles, tous déjà en base 1)."
     ],
