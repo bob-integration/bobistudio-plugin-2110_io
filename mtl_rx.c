@@ -247,13 +247,13 @@ static char* build_video_flowdef(struct sess* s, struct target* t) {
   json_object_object_add(o, "grain_rate", jrate(s->mrate));
   json_object_object_add(o, "frame_width", json_object_new_int(s->width));
   json_object_object_add(o, "frame_height", json_object_new_int(s->height));
-  /* MXL alloue un grain de CHAMP (½ trame) pour interlace_mode=interlaced_* → un memcpy
-   * TRAME PLEINE (notre modèle, field_weave) déborde le grain de ~½ trame → SEGFAULT (vérifié
-   * en prod : Ross Newt 1080i50). On déclare donc le flux MXL PROGRESSIVE → grain trame-pleine ;
-   * le contenu reste entrelacé (2 champs weavés ligne-à-ligne dans rx_scratch), conforme au modèle
-   * « 1 trame pleine par slot » des consommateurs. L'entrelacé est signalé au niveau ST 2110/NMOS
-   * (SDP scan=i), pas au niveau du grain MXL. field_order (s->tff) reste utilisé par field_weave. */
-  json_object_object_add(o, "interlace_mode", json_object_new_string("progressive"));
+  /* ENTRELACÉ NATIF « 1 grain = 1 CHAMP » (modèle SDK MXL) : interlace_mode=interlaced_tff/bff +
+   * grain_rate = cadence TRAME (25/1 ou 30000/1001). libmxl double la cadence en interne (cadence
+   * champ) et dimensionne chaque grain = 1 CHAMP (½ trame). L'identité du champ = parité de l'index
+   * de grain (index pair = 1er champ ; tff ⇒ 1er=top). On écrit/lit donc des grains-champs ;
+   * field_height reste pleine (libmxl fait le /2). */
+  json_object_object_add(o, "interlace_mode", json_object_new_string(
+      s->interlaced ? (s->tff ? "interlaced_tff" : "interlaced_bff") : "progressive"));
   json_object_object_add(o, "colorspace", json_object_new_string("BT709"));
   struct json_object* comps = json_object_new_array();
   jcomp(comps, "Y",  s->width,     s->height, s->bit_depth);
@@ -445,7 +445,7 @@ static inline int field_parity(int second_field, int tff) {
 
 static void* video_rx_thread(void* arg) {
   struct sess* s = arg;
-  uint64_t mts_latch = 0;     /* entrelacé : timestamp média du 1er champ (= capture de la trame) */
+  uint64_t frame_idx_latch = 0;   /* entrelacé : index TRAME latché sur le 1er champ (→ index champ = ×2+sf) */
   while (!s->stop) {
     struct st_frame* frame = st20p_rx_get_frame(s->vh);
     if (!frame) { usleep(1000); continue; }
@@ -455,56 +455,37 @@ static void* video_rx_thread(void* arg) {
     uint64_t mts = media_ts_to_tai(s->st, frame->tfmt, frame->timestamp, MEDIA_CLK_VIDEO);
     /* af_xdp/copy_mode : décodage unique → fan-out vers chaque cible (slot shm).
      * Chaque cible a son propre ring/index + son propre IDENT. */
+    /* CHAMP-NATIF : chaque get_frame = 1 CHAMP (entrelacé) ou 1 TRAME (progressif) → 1 grain.
+     * Index : entrelacé = index TRAME × 2 + parité de champ (libmtl pose second_field). On LATCH
+     * l'index trame sur le 1er champ — le 2e champ arrive ½ période trame plus tard, mxlTimestampToIndex
+     * l'arrondirait mal. Index pair = 1er champ (= top en tff). Plus de weave : on écrit le champ tel
+     * quel (≡ chemin progressif, juste à l'index champ). */
+    int sf = frame->second_field ? 1 : 0;
+    uint64_t fi;
     if (s->interlaced) {
-      /* On reçoit UN CHAMP par appel (libmtl pose second_field). On weave les 2 champs dans une
-       * trame pleine de travail (rx_scratch) ; on n'OUVRE/COMMIT le grain MXL qu'au 2e champ → les
-       * consommateurs lisent toujours une trame complète. Le grain est committé à l'INDEX TAI du
-       * 1er champ (instant de capture de la trame) → phase-lock A/V. */
-      int sf = frame->second_field ? 1 : 0;
-      int parity = field_parity(sf, s->tff);
-      if (!sf) mts_latch = mts;                    /* capture = instant du 1er champ */
-      if (!s->rx_scratch) s->rx_scratch = calloc(1, s->shm_slotsize);   /* zéroé : pas de garbage si le 1er champ reçu est un 2e champ */
-      if (s->rx_scratch) field_weave(s->width, s->height, s->conv8, frame, s->rx_scratch, parity, 0);
-      if (sf && s->rx_scratch) {                   /* 2e champ : trame complète → publier */
-        uint64_t fi = mts_latch ? mxlTimestampToIndex(&s->mrate, mts_latch)
-                                : mxlGetCurrentIndex(&s->mrate);
-        for (int ti = 0; ti < s->ntg; ti++) {
-          struct target* t = &s->tg[ti];
-          mxlGrainInfo gi; uint8_t* payload;
-          if (mxlFlowWriterOpenGrain(t->writer, fi, &gi, &payload) != MXL_STATUS_OK) continue;
-          /* Garde-fou anti-débordement : ne JAMAIS écrire au-delà de la taille réelle du grain
-           * (gi.grainSize ; 0 = inconnu → on fait confiance à shm_slotsize). Avec interlace_mode
-           * progressive le grain est trame-pleine, donc no-op ; mais protège contre tout flux dont
-           * le grain serait plus petit (sinon SEGFAULT comme avec interlaced_*). */
-          size_t _ncp = s->shm_slotsize;
-          if (gi.grainSize && (size_t)gi.grainSize < _ncp) _ncp = gi.grainSize;
-          memcpy(payload, s->rx_scratch, _ncp);
-          if (t->has_ident) { load_ident_patch(t); overlay_ident(s, t, payload, s->bit_depth); }
-          gi.validSlices = gi.totalSlices;
-          mxlFlowWriterCommitGrain(t->writer, &gi);
-          accum_rx_latency(t, mts_latch);
-          t->index = fi; t->recv++;
-        }
-      }
+      if (!sf) frame_idx_latch = mts ? mxlTimestampToIndex(&s->mrate, mts) : mxlGetCurrentIndex(&s->mrate);
+      fi = frame_idx_latch * 2 + (uint64_t)sf;
     } else {
-      uint64_t fi = mts ? mxlTimestampToIndex(&s->mrate, mts) : mxlGetCurrentIndex(&s->mrate);
-      for (int ti = 0; ti < s->ntg; ti++) {
-        struct target* t = &s->tg[ti];
-        mxlGrainInfo gi; uint8_t* payload;
-        if (mxlFlowWriterOpenGrain(t->writer, fi, &gi, &payload) != MXL_STATUS_OK) continue;
-        if (s->conv8) {                            /* 10→8 bits (planar10 libmtl → planar8 grain) */
-          const uint16_t* src = (const uint16_t*)frame->addr[0];
-          size_t n = s->slotsize;
-          for (size_t k = 0; k < n; k++) payload[k] = (uint8_t)(src[k] >> 2);
-        } else {
-          memcpy(payload, frame->addr[0], s->slotsize);
-        }
-        if (t->has_ident) { load_ident_patch(t); overlay_ident(s, t, payload, s->bit_depth); }
-        gi.validSlices = gi.totalSlices;
-        mxlFlowWriterCommitGrain(t->writer, &gi);
-        accum_rx_latency(t, mts);
-        t->index = fi; t->recv++;
+      fi = mts ? mxlTimestampToIndex(&s->mrate, mts) : mxlGetCurrentIndex(&s->mrate);
+    }
+    for (int ti = 0; ti < s->ntg; ti++) {
+      struct target* t = &s->tg[ti];
+      mxlGrainInfo gi; uint8_t* payload;
+      if (mxlFlowWriterOpenGrain(t->writer, fi, &gi, &payload) != MXL_STATUS_OK) continue;
+      size_t _ncp = s->slotsize;                   /* grain = 1 champ/trame = slotsize */
+      if (gi.grainSize && (size_t)gi.grainSize < _ncp) _ncp = gi.grainSize;   /* garde-fou débordement */
+      if (s->conv8) {                              /* 10→8 bits (planar10 libmtl → planar8 grain) */
+        const uint16_t* src = (const uint16_t*)frame->addr[0];
+        for (size_t k = 0; k < _ncp; k++) payload[k] = (uint8_t)(src[k] >> 2);
+      } else {
+        memcpy(payload, frame->addr[0], _ncp);
       }
+      /* IDENT : positionné en espace TRAME → désactivé en entrelacé (champ = ½ hauteur). TODO champ-aware. */
+      if (t->has_ident && !s->interlaced) { load_ident_patch(t); overlay_ident(s, t, payload, s->bit_depth); }
+      gi.validSlices = gi.totalSlices;
+      mxlFlowWriterCommitGrain(t->writer, &gi);
+      accum_rx_latency(t, mts);
+      t->index = fi; t->recv++;
     }
     st20p_rx_put_frame(s->vh, frame);
   }
@@ -633,8 +614,9 @@ static int setup_video(struct sess* s) {
   if (!s->vh) { fprintf(stderr, "mtl_rx: st20p_rx_create fail (video %s:%d)\n", s->mcast, s->udp_port); return -1; }
   s->src_framesize = st20p_rx_frame_size(s->vh);   /* = taille CHAMP si entrelacé (st_frame_size/2) */
   s->slotsize = s->conv8 ? s->src_framesize / 2 : s->src_framesize;
-  /* Grain MXL = TRAME PLEINE : en entrelacé on weave 2 champs (×2) ; en progressif = slotsize. */
-  s->shm_slotsize = s->interlaced ? s->slotsize * 2 : s->slotsize;
+  /* Champ-natif : 1 grain = 1 CHAMP (= slotsize, déjà ½ trame en entrelacé côté libmtl) ou 1 trame
+   * en progressif. Plus de ×2 (plus de weave). shm_slotsize == slotsize. */
+  s->shm_slotsize = s->slotsize;
   s->mrate = fps_to_rational(s->fps);            /* grain_rate du flowDef + grille TAI vidéo */
   if (open_targets(s) != 0) { _abort_video_setup(s); return -1; }
   fprintf(stderr, "mtl_rx[video] %dx%d%s fps=%.2f pt=%d mc=%s:%d slot=%zu ring=%d → %d cible(s):",
@@ -663,6 +645,24 @@ static int reader_latest(struct target* t, mxlGrainInfo* gi, uint8_t** payload) 
   mxlStatus st = mxlFlowReaderGetRuntimeInfo(t->reader, &rt);
   if (st == MXL_STATUS_OK && rt.headIndex != MXL_UNDEFINED_INDEX) {
     st = mxlFlowReaderGetGrainNonBlocking(t->reader, rt.headIndex, gi, payload);
+    if (st == MXL_STATUS_OK) return 0;
+  }
+  if (st == MXL_ERR_FLOW_NOT_FOUND || st == MXL_ERR_FLOW_INVALID) {
+    mxlReleaseFlowReader(g_mxl, t->reader); t->reader = NULL;
+  }
+  return -1;
+}
+
+/* Champ-natif TX : grain-champ le plus récent dont la PARITÉ d'index == field (0=1er/top en tff,
+ * 1=2e/bottom). On part de headIndex et on recule d'1 si la parité ne colle pas → on émet les 2
+ * champs de la trame la plus récente dans le bon ordre. Même gestion de recréation que reader_latest. */
+static int reader_field(struct target* t, int field, mxlGrainInfo* gi, uint8_t** payload) {
+  mxlFlowRuntimeInfo rt;
+  mxlStatus st = mxlFlowReaderGetRuntimeInfo(t->reader, &rt);
+  if (st == MXL_STATUS_OK && rt.headIndex != MXL_UNDEFINED_INDEX) {
+    uint64_t target = rt.headIndex;
+    if ((target & 1ULL) != (uint64_t)field && target > 0) target--;
+    st = mxlFlowReaderGetGrainNonBlocking(t->reader, target, gi, payload);
     if (st == MXL_STATUS_OK) return 0;
   }
   if (st == MXL_ERR_FLOW_NOT_FOUND || st == MXL_ERR_FLOW_INVALID) {
@@ -703,28 +703,26 @@ static void* video_tx_thread(void* arg) {
     }
     t->last_feed_ns = tnow;
     if (s->interlaced) {
-      /* Un CHAMP par appel (libmtl pose/alterne second_field). Les 2 champs d'une trame viennent du
-       * MÊME grain → on copie le grain (trame pleine) dans tx_frame au 1er champ, réutilisé pour le
-       * 2e (évite le combing si le producteur avance entre les deux get_frame). Dé-weave en lignes. */
+      /* CHAMP-NATIF : 1 get_frame = 1 CHAMP à émettre (libmtl pose second_field). On lit le grain-champ
+       * de même parité (reader_field) et on le copie directement dans le buffer libmtl (= 1 champ),
+       * up-shift 8→10 si pipeline 8 bits. Plus de tx_frame/weave. */
       int sf = frame->second_field ? 1 : 0;
-      int parity = field_parity(sf, s->tff);
-      if (!s->tx_frame) s->tx_frame = calloc(1, s->shm_slotsize);   /* zéroé : pas de garbage si le 1er champ émis est un 2e champ */
-      if (!sf) {                                 /* 1er champ : (re)charger la trame source */
-        mxlGrainInfo gi; uint8_t* payload;
-        if (s->tx_frame && reader_latest(t, &gi, &payload) == 0) {
-          /* Garde-fou symétrique du RX : ne JAMAIS lire au-delà de la taille réelle du grain. */
-          size_t _ncp = s->shm_slotsize;
-          if (gi.grainSize && (size_t)gi.grainSize < _ncp) _ncp = gi.grainSize;
-          memcpy(s->tx_frame, payload, _ncp);              /* grain = trame pleine */
-          latched_fi = gi.index;
-          if (t->has_ident) { load_ident_patch(t);
-            if (t->ident_patch) overlay_ident(s, t, s->tx_frame, s->bit_depth); }
-        } else if (s->tx_frame) {
-          memset(s->tx_frame, 0, s->shm_slotsize);          /* pas de grain → trame neutre */
+      uint8_t* dst = (uint8_t*)frame->addr[0];
+      mxlGrainInfo gi; uint8_t* payload;
+      if (reader_field(t, sf, &gi, &payload) == 0) {
+        size_t _ncp = s->slotsize;                 /* taille CHAMP du grain */
+        if (gi.grainSize && (size_t)gi.grainSize < _ncp) _ncp = gi.grainSize;
+        if (s->bit_depth == 8) {
+          uint16_t* d16 = (uint16_t*)dst;
+          for (size_t k = 0; k < _ncp; k++) d16[k] = (uint16_t)payload[k] << 2;   /* 8→10 */
+        } else {
+          memcpy(dst, payload, out_size < _ncp ? out_size : _ncp);
         }
+        latched_fi = gi.index;
+        /* IDENT entrelacé : positionné en espace TRAME → différé (champ = ½ hauteur). TODO champ-aware. */
+      } else {
+        memset(dst, 0, out_size);                  /* pas de grain → champ neutre */
       }
-      if (s->tx_frame) field_weave(s->width, s->height, (s->bit_depth == 8), frame, s->tx_frame, parity, 1);
-      else memset(frame->addr[0], 0, out_size);
       st20p_tx_put_frame(s->vth, frame);
       t->index = latched_fi; t->recv++;
     } else {
@@ -753,9 +751,11 @@ static void* video_tx_thread(void* arg) {
 
 static int setup_video_tx(struct sess* s) {
   if (s->ring < 2) s->ring = 2;                 /* (vestige) — MXL gère le ring du flux d'entrée */
-  /* taille d'une TRAME PLEINE du flux d'entrée (422 planar : 8b = 2·w·h, 10b = 4·w·h) = grainSize */
-  s->slotsize = (size_t)(s->bit_depth == 8 ? 2 : 4) * (size_t)s->width * (size_t)s->height;
-  s->shm_slotsize = s->slotsize;                /* entrelacé : grain = trame pleine (tx_frame) */
+  /* Champ-natif : taille d'un GRAIN = 1 CHAMP en entrelacé (½ hauteur), 1 trame en progressif.
+   * 422 planar : 8b = 2·w·h_grain, 10b = 4·w·h_grain. = grainSize du flux d'entrée. */
+  size_t h_grain = s->interlaced ? (size_t)s->height / 2 : (size_t)s->height;
+  s->slotsize = (size_t)(s->bit_depth == 8 ? 2 : 4) * (size_t)s->width * h_grain;
+  s->shm_slotsize = s->slotsize;
 
   struct st20p_tx_ops ops; memset(&ops, 0, sizeof(ops));
   ops.name = "bobi_mtl_vtx";
