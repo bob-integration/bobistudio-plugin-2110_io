@@ -1,7 +1,10 @@
 {
-  "version": "0.27.1",
-  "date": "2026-06-24",
+  "version": "0.28.0",
+  "date": "2026-06-25",
   "changes": {
+    "Entrelacé NATIF « 1 grain = 1 champ » (modèle SDK MXL, REBUILD IMAGE, 0.28.0)": [
+      "Bascule du contournement (weave 2 champs → grain trame-pleine déclaré progressive) vers le modèle NATIF du SDK MXL : flowDef interlace_mode=interlaced_tff/bff + grain_rate=cadence trame → libmxl double la cadence (champ) et chaque grain = 1 CHAMP. RX : chaque get_frame (=1 champ libmtl) → 1 grain à l'index CHAMP (index trame latché sur le 1er champ × 2 + second_field) ; plus de field_weave/rx_scratch (le RX se ramène au chemin progressif, juste à l'index champ). TX : lit le grain-champ de même parité (reader_field) et le copie dans le buffer libmtl (up-shift 8→10) ; plus de de-weave/tx_frame. shm_slotsize = taille CHAMP (fin du ×2). IDENT entrelacé différé (positionné en espace trame). Premier maillon du chantier champ-natif de bout en bout. REBUILD IMAGE bobi-mtl."
+    ],
     "RX entrelacé : corrige le SEGFAULT du commit de grain MXL (REBUILD IMAGE, 0.27.1)": [
       "Une fois la session entrelacée enfin créée+reçue (fix 0.27.0), mtl_rx segfaultait en boucle (memcpy, écriture hors page) au commit du grain — chemin de réception entrelacée jamais exécuté en vrai avant. Cause : libmxl alloue un grain de CHAMP (½ trame) pour interlace_mode=interlaced_*, alors que le code y écrit une TRAME PLEINE (field_weave) → débordement de ~½ trame. Fix : (1) build_video_flowdef déclare le flux MXL `progressive` → grain trame-pleine (le contenu reste entrelacé, 2 champs weavés ligne-à-ligne ; l'entrelacé est signalé au niveau ST 2110/NMOS via le SDP scan=i, pas au niveau du grain). (2) Garde-fous anti-débordement RX (memcpy vers le grain) ET TX (memcpy depuis le grain) bornés à gi.grainSize. Vérifié en prod : Ross Newt 1080i50 conforme (exactframerate=25; interlace=1). REBUILD IMAGE bobi-mtl requis (mtl_rx.c)."
     ],
