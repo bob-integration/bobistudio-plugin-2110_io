@@ -72,6 +72,15 @@ def before_deploy(params, context):
         t.setdefault("height", int(params.get("height") or 1080))
         t.setdefault("fps",    float(params.get("fps") or 25))
         t.setdefault("scan",   str(params.get("scan") or "p"))
+        # Cadence entrelacée = cadence TRAME (ST 2110-20), jamais la cadence CHAMP (field rate).
+        # Un slot stocké en cadence champ (≈ 2× la cadence trame de session, p.ex. 50 pour du
+        # 1080i50) faisait émettre un SDP « exactframerate=50; interlace » non conforme → tout RX
+        # abonné configurait libmtl en 50i et ne complétait aucun champ (frame_index 0).
+        # Réconciliation idempotente sur la cadence trame de session.
+        if str(t.get("scan")) == "i":
+            sess_fps = float(params.get("fps") or 25)
+            if sess_fps > 0 and float(t.get("fps") or 0) > sess_fps * 1.5:
+                t["fps"] = sess_fps
         # Audios du slot = flux audio ATTACHÉS (tx_flows), N quelconque (plus de cap à 2). Les
         # mcast/port sont alloués par idx FLAT de flux → uniques même au-delà de 2 audios/slot.
         # Un slot vidéo-seul (0 flux audio attaché) n'a aucune destination audio. Les slots SANS

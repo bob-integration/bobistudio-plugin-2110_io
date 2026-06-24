@@ -184,11 +184,18 @@ def _parse_sdp(path):
         fr = re.search(r"exactframerate=(\d+)(?:/(\d+))?", params)
         if w: info["width"] = int(w.group(1))
         if h: info["height"] = int(h.group(1))
-        if fr:
-            num = int(fr.group(1)); den = int(fr.group(2)) if fr.group(2) else 1
-            info["fps"] = round(num / den, 2)
         if "interlace" in params:
             info["interlaced"] = True
+        if fr:
+            num = int(fr.group(1)); den = int(fr.group(2)) if fr.group(2) else 1
+            fps = num / den
+            # ST 2110-20 : en entrelacé, exactframerate = cadence TRAME. Un sender non conforme
+            # peut annoncer la cadence CHAMP (field rate, p.ex. 50 pour du 1080i50) → libmtl serait
+            # alors configuré en 50i et ne complèterait aucun champ. Un flux entrelacé conforme n'a
+            # jamais exactframerate > 30 → ramener à la cadence trame.
+            if info.get("interlaced") and fps > 30:
+                fps /= 2.0
+            info["fps"] = round(fps, 2)
     info.setdefault("width", WIDTH)
     info.setdefault("height", HEIGHT)
     info.setdefault("fps", 25.0)

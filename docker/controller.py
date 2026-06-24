@@ -803,11 +803,16 @@ def _parse_sdp(path):
         fr = re.search(r"exactframerate=(\d+)(?:/(\d+))?", params)
         if w: info["width"] = int(w.group(1))
         if h: info["height"] = int(h.group(1))
-        if fr:
-            num = int(fr.group(1)); den = int(fr.group(2)) if fr.group(2) else 1
-            info["fps"] = round(num / den, 2)
         if "interlace" in params:
             info["interlaced"] = True
+        if fr:
+            num = int(fr.group(1)); den = int(fr.group(2)) if fr.group(2) else 1
+            fps = num / den
+            # ST 2110-20 : un flux entrelacé conforme n'a jamais exactframerate > 30. Une source
+            # non conforme annonçant la cadence CHAMP (field rate) est ramenée à la cadence trame.
+            if info.get("interlaced") and fps > 30:
+                fps /= 2.0
+            info["fps"] = round(fps, 2)
     info.setdefault("width", WIDTH)
     info.setdefault("height", HEIGHT)
     info.setdefault("fps", FPS)
@@ -1107,9 +1112,15 @@ def _tx_session(idx, t):
     shm = t["shm_in"] or ""
     if shm and not shm.startswith("/"):
         shm = "/dev/shm/" + shm
+    # ST 2110-20 : en entrelacé, la cadence libmtl/SDP est la cadence TRAME. Un t['fps'] hérité en
+    # cadence CHAMP (field rate, > 30 en entrelacé — via câblage ou SDP source non conforme)
+    # configurerait libmtl en 50i et casserait la session. On ramène à la cadence trame.
+    _fps = float(t["fps"] or 25)
+    if t.get("scan") == "i" and _fps > 30:
+        _fps /= 2.0
     return {"kind": "video", "role": "tx",
             "mcast": t["mcast"], "udp_port": t["udp_port"], "payload_type": t["pt"],
-            "width": t["w"], "height": t["h"], "fps": t["fps"],
+            "width": t["w"], "height": t["h"], "fps": _fps,
             # Passthrough du balayage : on ré-émet en entrelacé si la source câblée l'est.
             "interlaced": (t.get("scan") == "i"), "field_order": t.get("field_order") or "tff",
             "bit_depth": t["bd"], "ring": t["ring"], "hdr": HDR,
@@ -1130,10 +1141,16 @@ def _tx_sdp(i, t):
     """SDP ST 2110-20 d'un slot TX. Si mcast2/udp_port2 présents (SMPTE 2022-7),
     génère un unique SDP avec deux sections m=video (leg0 + leg1)."""
     sip   = SIP or "0.0.0.0"
-    scan  = "interlace; " if t.get("scan") == "i" else ""
+    interlaced = t.get("scan") == "i"
+    scan  = "interlace; " if interlaced else ""
     pt    = int(t.get("pt") or 96)
     w, h  = int(t.get("w") or 1920), int(t.get("h") or 1080)
-    fr    = _fps_str(t.get("fps"))
+    # ST 2110-20 : en entrelacé, exactframerate = cadence TRAME. Ceinture-bretelles si un slot
+    # legacy/non normalisé porte encore la cadence CHAMP (field rate, > 30 en entrelacé).
+    _fps = float(t.get("fps") or 25)
+    if interlaced and _fps > 30:
+        _fps /= 2.0
+    fr    = _fps_str(_fps)
     fmtp  = ("sampling=YCbCr-4:2:2; width={w}; height={h}; exactframerate={fr}; depth=10; "
              "{scan}colorimetry=BT709; PM=2110GPM; SSN=ST2110-20:2017; TP=2110TPN;").format(
              w=w, h=h, fr=fr, scan=scan)
