@@ -295,10 +295,21 @@ static char* build_data_flowdef(struct sess* s, struct target* t) {
   return out;
 }
 
-/* Crée le writer MXL d'une cible à partir d'un flowDef (RX/simu). Renvoie 0 si OK. */
+/* Crée le writer MXL d'une cible à partir d'un flowDef (RX/simu). Renvoie 0 si OK.
+ * GC-AND-RETRY : l'id du flux ne dépend que du NOM du slot (pas de l'interlace_mode/grain_rate).
+ * Quand un slot passe d'un producteur SIMU progressif (contrôleur) à un RX entrelacé (ce process),
+ * un flux PÉRIMÉ de def DIFFÉRENTE squatte l'id → mxlCreateFlowWriter échoue (def incompatible).
+ * Une fois l'ancien producteur libéré (le contrôleur ferme sa simu quand le slot devient live), un
+ * garbage-collect récupère le flux orphelin → on réessaie (jusqu'à ~2 s). Cas sans transition de def
+ * (progressif↔progressif : attache au flux simu existant) : succès au 1er essai, boucle non exécutée. */
 static int open_writer(struct target* t, char* flowdef) {
   bool created = false;
   mxlStatus st = mxlCreateFlowWriter(g_mxl, flowdef, NULL, &t->writer, NULL, &created);
+  for (int attempt = 0; st != MXL_STATUS_OK && attempt < 10; attempt++) {
+    mxlGarbageCollectFlows(g_mxl);          /* récupère le flux périmé une fois son producteur libéré */
+    usleep(200000);                         /* laisse la simu du contrôleur se fermer (slot devenu live) */
+    st = mxlCreateFlowWriter(g_mxl, flowdef, NULL, &t->writer, NULL, &created);
+  }
   free(flowdef);
   if (st != MXL_STATUS_OK) {
     fprintf(stderr, "mtl_rx: mxlCreateFlowWriter(%s) -> %d\n", flow_name(t->shm_path), (int)st);
@@ -573,6 +584,16 @@ static int open_targets(struct sess* s) {
   return 0;
 }
 
+/* Nettoyage d'un setup RX vidéo PARTIEL (échec après st20p_rx_create) : on NE DOIT JAMAIS orpheliner
+ * la session libmtl. Une session st20p créée puis abandonnée continue de recevoir les paquets, remplit
+ * son pool de framebuffers (jamais drainé car le thread RX n'a pas démarré) → « framebuff pool empty,
+ * back-pressure » et 0 trame remontée. On libère writers MXL + handle st20p. */
+static void _abort_video_setup(struct sess* s) {
+  for (int ti = 0; ti < s->ntg; ti++)
+    if (s->tg[ti].writer) { mxlReleaseFlowWriter(g_mxl, s->tg[ti].writer); s->tg[ti].writer = NULL; }
+  if (s->vh) { st20p_rx_free(s->vh); s->vh = NULL; }
+}
+
 static int setup_video(struct sess* s) {
   s->copy_mode = 1;   /* af_xdp/kernel uniquement dans ce contexte */
   s->out_fmt = ST_FRAME_FMT_YUV422PLANAR10LE;   /* converter présent ; conv 10→8 nous-mêmes */
@@ -604,13 +625,15 @@ static int setup_video(struct sess* s) {
   /* Grain MXL = TRAME PLEINE : en entrelacé on weave 2 champs (×2) ; en progressif = slotsize. */
   s->shm_slotsize = s->interlaced ? s->slotsize * 2 : s->slotsize;
   s->mrate = fps_to_rational(s->fps);            /* grain_rate du flowDef + grille TAI vidéo */
-  if (open_targets(s) != 0) return -1;
+  if (open_targets(s) != 0) { _abort_video_setup(s); return -1; }
   fprintf(stderr, "mtl_rx[video] %dx%d%s fps=%.2f pt=%d mc=%s:%d slot=%zu ring=%d → %d cible(s):",
           s->width, s->height, s->interlaced ? "i" : "p", s->fps, s->payload_type,
           s->mcast, s->udp_port, s->slotsize, s->ring, s->ntg);
   for (int ti = 0; ti < s->ntg; ti++) fprintf(stderr, " %s", s->tg[ti].shm_path);
   fprintf(stderr, "\n");
-  return pthread_create(&s->thread, NULL, video_rx_thread, s) == 0 ? (s->started = 1, 0) : -1;
+  if (pthread_create(&s->thread, NULL, video_rx_thread, s) != 0) { _abort_video_setup(s); return -1; }
+  s->started = 1;
+  return 0;
 }
 
 /* ═══ TX commun (lecture du flux d'entrée câblé via un reader MXL) ═════════════ */

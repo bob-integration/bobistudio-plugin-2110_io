@@ -1,7 +1,16 @@
 {
-  "version": "0.25.5",
-  "date": "2026-06-23",
+  "version": "0.27.0",
+  "date": "2026-06-24",
   "changes": {
+    "RX entrelacé : corrige rx_create_failed sur transition de flow-def MXL (REBUILD IMAGE, 0.27.0)": [
+      "Un RX entrelacé (ex. abonnement d'un 1080i50 conforme — Ross Newt, exactframerate=25; interlace) échouait en `rx_create_failed` alors que les paquets arrivaient. Cause : l'id du flux MXL ne dépend que du NOM du slot, pas de l'interlace_mode/grain_rate. Le producteur SIMU progressif du contrôleur tient `<hn>_<idx>` en def PROGRESSIVE ; quand mtl_rx veut créer le writer en def INTERLACÉE, `mxlCreateFlowWriter` renvoie une erreur (def incompatible) → `setup_video` -1. Un RX progressif marche (def identique → attache au flux simu). FIX dans mtl_rx.c : (1) `open_writer` fait GC-AND-RETRY (jusqu'à ~2 s) — une fois la simu du slot fermée (le slot devient live), le garbage-collect récupère le flux orphelin et la création réussit avec la nouvelle def ; cas sans transition = succès au 1er essai, boucle non exécutée ; (2) `setup_video` libère le handle st20p (`st20p_rx_free`) sur tout échec après création — sans ça la session libmtl restait orpheline, recevait les paquets sans jamais les drainer → « framebuff pool empty / back-pressure » et 0 trame. REBUILD IMAGE bobi-mtl requis (mtl_rx.c). Note : transition simu progressif → RX interlacé = le flux est recréé → brève reconnexion SIGBUS des consommateurs (multiviews), gérée. Le progressif↔progressif reste sans recréation."
+    ],
+    "Affichage : ensembles RX numérotés à partir de 1 (0.26.0)": [
+      "Le titre « Ensemble #0 » de la carte de contrôle (page Source 2110) passe en « Ensemble #1 » pour s'aligner sur le reste de l'UI déjà en base 1 (slots TX, libellés Vidéo/Audio/ANC, SDP). Les indices internes sont inchangés."
+    ],
+    "Entrelacé — cadence TRAME dans le SDP TX (corrige RX 1080i50 à 0 trame, 0.26.0)": [
+      "Un slot TX entrelacé stockait la cadence CHAMP (field rate, p.ex. 50 pour du 1080i50) au lieu de la cadence TRAME. Le SDP émis annonçait alors « exactframerate=50; interlace » (non conforme ST 2110-20) → tout RX abonné configurait libmtl en 50i, attendant 100 champs/s sur un fil à 50 champs/s, et ne complétait AUCUN champ (frame_index 0, image noire). Corrigé côté ORCHESTRATEUR (prend effet au simple redeploy, sans rebuild image) : normalisation idempotente de la cadence des slots entrelacés vers la cadence trame de session au déploiement (hooks.py) → le SDP TX redevient « exactframerate=25; interlace » même avec le controller.py déjà bâti, car _tx_sdp lit la cadence normalisée ; l'origine UI (routes.api_mtl_tx_format) stocke désormais la cadence trame. Durcissement défensif EMBARQUÉ (prend effet au prochain rebuild image) contre un sender tiers non conforme : _tx_sdp + _tx_session + le parseur SDP RX (controller._parse_sdp) ramènent une cadence > 30 en entrelacé à la cadence trame. Aucun changement progressif."
+    ],
     "Messages d'erreur : index de slots/flux en base 1 (0.25.5)": [
       "Les messages de validation (« slot vidéo #0 hors limites », « slot TX #0 hors limites », « flux audio #0 hors limites sur le slot TX #0 ») affichaient l'index brut 0-based. Passent en base 1 (#1…), cohérents avec le reste de l'UI. Les indices internes sont inchangés."
     ],

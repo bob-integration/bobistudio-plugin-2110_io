@@ -376,7 +376,7 @@ window.MXLPlugins["2110_io"] = {
               <button class="io2110-flowrm io2110-rmgrp" data-fid="${esc(vfid)}" title="Retirer cette source">✕ source</button>
             </div>` : '';
             return `<div class="ens">
-              <div class="ens-title">Ensemble #${i} — ${titleParts.join(' + ')}</div>
+              <div class="ens-title">Ensemble #${i + 1} — ${titleParts.join(' + ')}</div>
               ${rows.join('')}
               ${ctrls}
             </div>`;
