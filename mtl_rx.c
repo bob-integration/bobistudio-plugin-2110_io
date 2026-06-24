@@ -247,8 +247,13 @@ static char* build_video_flowdef(struct sess* s, struct target* t) {
   json_object_object_add(o, "grain_rate", jrate(s->mrate));
   json_object_object_add(o, "frame_width", json_object_new_int(s->width));
   json_object_object_add(o, "frame_height", json_object_new_int(s->height));
-  json_object_object_add(o, "interlace_mode", json_object_new_string(
-      s->interlaced ? (s->tff ? "interlaced_tff" : "interlaced_bff") : "progressive"));
+  /* MXL alloue un grain de CHAMP (½ trame) pour interlace_mode=interlaced_* → un memcpy
+   * TRAME PLEINE (notre modèle, field_weave) déborde le grain de ~½ trame → SEGFAULT (vérifié
+   * en prod : Ross Newt 1080i50). On déclare donc le flux MXL PROGRESSIVE → grain trame-pleine ;
+   * le contenu reste entrelacé (2 champs weavés ligne-à-ligne dans rx_scratch), conforme au modèle
+   * « 1 trame pleine par slot » des consommateurs. L'entrelacé est signalé au niveau ST 2110/NMOS
+   * (SDP scan=i), pas au niveau du grain MXL. field_order (s->tff) reste utilisé par field_weave. */
+  json_object_object_add(o, "interlace_mode", json_object_new_string("progressive"));
   json_object_object_add(o, "colorspace", json_object_new_string("BT709"));
   struct json_object* comps = json_object_new_array();
   jcomp(comps, "Y",  s->width,     s->height, s->bit_depth);
@@ -467,7 +472,13 @@ static void* video_rx_thread(void* arg) {
           struct target* t = &s->tg[ti];
           mxlGrainInfo gi; uint8_t* payload;
           if (mxlFlowWriterOpenGrain(t->writer, fi, &gi, &payload) != MXL_STATUS_OK) continue;
-          memcpy(payload, s->rx_scratch, s->shm_slotsize);
+          /* Garde-fou anti-débordement : ne JAMAIS écrire au-delà de la taille réelle du grain
+           * (gi.grainSize ; 0 = inconnu → on fait confiance à shm_slotsize). Avec interlace_mode
+           * progressive le grain est trame-pleine, donc no-op ; mais protège contre tout flux dont
+           * le grain serait plus petit (sinon SEGFAULT comme avec interlaced_*). */
+          size_t _ncp = s->shm_slotsize;
+          if (gi.grainSize && (size_t)gi.grainSize < _ncp) _ncp = gi.grainSize;
+          memcpy(payload, s->rx_scratch, _ncp);
           if (t->has_ident) { load_ident_patch(t); overlay_ident(s, t, payload, s->bit_depth); }
           gi.validSlices = gi.totalSlices;
           mxlFlowWriterCommitGrain(t->writer, &gi);
@@ -701,7 +712,10 @@ static void* video_tx_thread(void* arg) {
       if (!sf) {                                 /* 1er champ : (re)charger la trame source */
         mxlGrainInfo gi; uint8_t* payload;
         if (s->tx_frame && reader_latest(t, &gi, &payload) == 0) {
-          memcpy(s->tx_frame, payload, s->shm_slotsize);   /* grain = trame pleine */
+          /* Garde-fou symétrique du RX : ne JAMAIS lire au-delà de la taille réelle du grain. */
+          size_t _ncp = s->shm_slotsize;
+          if (gi.grainSize && (size_t)gi.grainSize < _ncp) _ncp = gi.grainSize;
+          memcpy(s->tx_frame, payload, _ncp);              /* grain = trame pleine */
           latched_fi = gi.index;
           if (t->has_ident) { load_ident_patch(t);
             if (t->ident_patch) overlay_ident(s, t, s->tx_frame, s->bit_depth); }
