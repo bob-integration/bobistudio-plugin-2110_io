@@ -724,7 +724,10 @@ static void* video_tx_thread(void* arg) {
       int sf = frame->second_field ? 1 : 0;
       uint8_t* dst = (uint8_t*)frame->addr[0];
       mxlGrainInfo gi; uint8_t* payload;
-      if (reader_field(t, sf, s->tff, &gi, &payload) == 0) {
+      /* A/B 0.28.4 (TEST) : dominance INVERSÉE (!s->tff) pour trancher le peigne-sur-cut (phase de
+       * champ décalée d'1). Si le cut redevient propre → l'inversion est le fix (à rendre permanent/
+       * configurable). Si le statique se met à peigner → ce n'est pas la dominance, revert 0.28.3. */
+      if (reader_field(t, sf, !s->tff, &gi, &payload) == 0) {
         size_t _ncp = s->slotsize;                 /* taille CHAMP du grain */
         if (gi.grainSize && (size_t)gi.grainSize < _ncp) _ncp = gi.grainSize;
         if (s->bit_depth == 8) {
