@@ -1748,6 +1748,7 @@ def _txgen_loop(idx):
     name = "{}_txgen_{}".format(HOSTNAME, idx)
     writer = None; res = None; fi = 0; patch = None; patch_age = 0
     next_t = None   # échéance absolue (monotone) du prochain GRAIN → pacing exact (compense le calcul)
+    last_tai = -1   # entrelacé : dernier index TRAME TAI écrit (genlock PTP, anti-doublon/anti-saut)
     def _close():
         nonlocal writer, res
         if writer is not None:
@@ -1790,20 +1791,26 @@ def _txgen_loop(idx):
                 writer = _mk_video_writer(name, w, h, fps, interlace=il_mode); res = (w, h, il, fo)
                 patch = None; patch_age = 0   # forcer recalcul ident après resize
             if il:
-                # ENTRELACÉ : 2 grains-CHAMPS par trame, aux index CHAMP (fi×2 + champ). Mire de test
-                # de champ (field-aware) ; tout autre motif est éclaté en champs (lignes paires/impaires).
+                # ENTRELACÉ GENLOCK PTP : 2 grains-CHAMPS par trame, aux index CHAMP de la GRILLE TAI
+                # (frame_tai×2 + champ). On suit l'index TAI (writer._next_index, cadence trame) AU LIEU
+                # d'un compteur monotone → la mire est verrouillée sur le PTP comme le TX → fluide (plus
+                # de répétition/saut dû à la dérive txgen(monotone)↔TX(PTP)). Dédoublonnage : on n'écrit
+                # qu'aux NOUVEAUX index TAI (même trame → on attend la suivante).
+                frame_tai = int(writer._next_index())
+                if frame_tai <= last_tai:
+                    time.sleep(0.004); continue   # même trame TAI → attendre la suivante
+                last_tai = frame_tai
                 fh = h // 2
                 layf = _layout(w, fh)
-                full = None if pat == "field_test" else _get_pattern(pat, fi, lay)
+                full = None if pat == "field_test" else _get_pattern(pat, frame_tai, lay)
                 for fld in (0, 1):
                     if pat == "field_test":
-                        yy, cbb, crr = _field_test(fi, fld, w, fh)
+                        yy, cbb, crr = _field_test(frame_tai, fld, w, fh)
                     else:
                         yy, cbb, crr = full[0][fld::2], full[1][fld::2], full[2][fld::2]
-                    _, gi, view = writer.open_grain(index=fi * 2 + fld)
+                    _, gi, view = writer.open_grain(index=frame_tai * 2 + fld)
                     _fill_grain_planes(view, layf, yy, cbb, crr)
                     writer.commit(gi)
-                    _pace(0.5 / fps)   # 1 CHAMP = ½ période trame → cadence champ EXACTE 50/s (anti-late)
             else:
                 y_arr, cb_arr, cr_arr = _get_pattern(pat, fi, lay)
                 # IDENT user actif → mtl_rx incrustera l'IDENT sur la mire au passage du feeder TX ;
