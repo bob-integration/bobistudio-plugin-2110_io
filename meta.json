@@ -1,7 +1,10 @@
 {
-  "version": "0.28.0",
+  "version": "0.28.1",
   "date": "2026-06-25",
   "changes": {
+    "Fix TX entrelacé : apparier les 2 champs de la MÊME trame (anti-peigne/saccade, REBUILD IMAGE, 0.28.1)": [
+      "Retour recette (testeur, écran SDI natif) : peigne + saccades sur le MOUVEMENT (propre en figé) sur la boucle Rx→Tx, source directe propre → défaut introduit par le moteur, pas l'affichage. Cause : reader_field() lisait pour CHAQUE champ indépendamment le dernier grain de bonne parité, sans garantir qu'ils viennent de la MÊME trame → le champ haut de la trame N était émis avec le champ bas de la trame N+1 dès qu'il y avait du jitter (weave temporellement incohérent). Fix : on latche l'index PAIR sur le 1er champ (struct target.field_base) et le 2e champ lit field_base+1 (l'impair de la MÊME trame) au lieu du « dernier impair » ; repli sur le dernier impair si l'apparié n'est pas encore écrit. REBUILD IMAGE bobi-mtl."
+    ],
     "Entrelacé NATIF « 1 grain = 1 champ » (modèle SDK MXL, REBUILD IMAGE, 0.28.0)": [
       "Bascule du contournement (weave 2 champs → grain trame-pleine déclaré progressive) vers le modèle NATIF du SDK MXL : flowDef interlace_mode=interlaced_tff/bff + grain_rate=cadence trame → libmxl double la cadence (champ) et chaque grain = 1 CHAMP. RX : chaque get_frame (=1 champ libmtl) → 1 grain à l'index CHAMP (index trame latché sur le 1er champ × 2 + second_field) ; plus de field_weave/rx_scratch (le RX se ramène au chemin progressif, juste à l'index champ). TX : lit le grain-champ de même parité (reader_field) et le copie dans le buffer libmtl (up-shift 8→10) ; plus de de-weave/tx_frame. shm_slotsize = taille CHAMP (fin du ×2). IDENT entrelacé différé (positionné en espace trame). Premier maillon du chantier champ-natif de bout en bout. REBUILD IMAGE bobi-mtl."
     ],
