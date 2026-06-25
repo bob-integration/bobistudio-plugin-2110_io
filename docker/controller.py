@@ -1791,6 +1791,8 @@ def _txgen_loop(idx):
                     _, gi, view = writer.open_grain(index=fi * 2 + fld)
                     _fill_grain_planes(view, layf, yy, cbb, crr)
                     writer.commit(gi)
+                    if fld == 0:
+                        time.sleep(0.5 / fps)   # espacer les 2 CHAMPS de ½ période (cadence champ régulière, anti-late)
             else:
                 y_arr, cb_arr, cr_arr = _get_pattern(pat, fi, lay)
                 # IDENT user actif → mtl_rx incrustera l'IDENT sur la mire au passage du feeder TX ;
@@ -1811,7 +1813,7 @@ def _txgen_loop(idx):
             print("txgen err idx={}: {}".format(idx, e), flush=True)
             _close(); time.sleep(0.2); continue
         fi += 1
-        time.sleep(1.0 / fps)
+        time.sleep((0.5 if il else 1.0) / fps)   # entrelacé : ½ période déjà dormie entre les 2 champs
 
 
 def _build_tone_second(freq, level_db, chan_on):
