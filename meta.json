@@ -1,7 +1,10 @@
 {
-  "version": "0.28.5",
+  "version": "0.29.0",
   "date": "2026-06-25",
   "changes": {
+    "Mire de TEST DE CHAMP entrelacée (diagnostic in/out) + simu txgen entrelacée native (0.29.0)": [
+      "Diagnostic entrée vs sortie : le générateur TX (txgen) devient ENTRELACÉ NATIF (2 grains-champs/trame, déclaré interlaced, écrit aux index champ) quand le slot est en scan=i. Nouveau motif `field_test` (field-aware) : fond gris + barre verticale qui avance de 24 px/CHAMP (mouvement fort → peigne net si timing de champ faux) + marqueur de champ haut-gauche (clair champ0/sombre champ1) + teinte chroma verte(0)/magenta(1) → ordre de champ visible à l'oeil. Route :8082 /fieldtest {idx,enabled,field_order} : bascule un slot TX en mire générée 1080i (mémorise+restaure le câblage réel). Mire GÉNÉRÉE = ne dépend PAS du Newt : si elle combe à l'écran = défaut d'ÉMISSION TX ; si propre = défaut d'ENTRÉE RX. Complète aussi la simu entrelacée différée. REBUILD IMAGE."
+    ],
     "Revert de l'expérience 0.28.4 — dominance TFF confirmée (pas de rebuild, 0.28.5)": [
       "L'A/B 0.28.4 (dominance inversée) a EMPIRÉ : peigne à CHAQUE micro-mouvement = swap spatial → la dominance TFF de 0.28.3 est la BONNE. Code remis dans l'état 0.28.3 (reader_field(... s->tff ...)). Image runtime repointée sur bobi-mtl:0.28.3 (aucun rebuild). CONCLUSION : le peigne-sur-cut résiduel (cuts entre plans d'une scène + forts contrastes en mouvement) n'est PAS une question de dominance de champ. Piste suivante : alignement/phase de TRAME entre la reconstruction RX→TX et la source (le direct est propre) — à diagnostiquer via analyseur 2110 (ordre de champ + timestamps RTP de notre TX vs Newt direct)."
     ],

@@ -266,11 +266,38 @@ def _fps_rational(f):
     return int(round(f)), 1
 
 
-def _mk_video_writer(name, w, h, fps):
-    """Writer MXL vidéo planar (index_mode tai → grille continue avec le live RX)."""
+def _mk_video_writer(name, w, h, fps, interlace="progressive"):
+    """Writer MXL vidéo planar (index_mode tai → grille continue avec le live RX).
+    `interlace`=interlaced_tff/bff → libmxl dimensionne chaque grain à 1 CHAMP (½h) et double la
+    cadence ; le producteur écrit 2 grains-champs/trame aux index CHAMP (cf. _txgen_loop)."""
     n, d = _fps_rational(fps)
     return bobimxl.Writer(_mxl(), name, w, h, chroma=CHROMA, bit_depth=BIT_DEPTH,
-                          fps_num=n, fps_den=d, index_mode="tai")
+                          fps_num=n, fps_den=d, index_mode="tai", interlace=interlace)
+
+
+def _field_test(fi, f, w, fh):
+    """Mire de TEST DE CHAMP (entrelacé) — révèle l'ordre/le timing de champ à l'œil.
+    f = 0 (1er champ = TOP en tff) / 1 (2e champ = BOTTOM). Renvoie des plans de CHAMP (fh = h/2).
+    Contenu : fond gris + BARRE verticale qui avance de 24 px/CHAMP (mouvement fort → peigne net si
+    le timing de champ est faux) + BLOC marqueur haut-gauche (clair en champ 0 / sombre en champ 1)
+    + teinte chroma VERTE(champ 0)/MAGENTA(champ 1) → on voit l'ordre de champ sur tout bord. Si la
+    sortie est bonne : barre fluide, lignes vert/magenta régulières. Si défaut : peigne sur la barre."""
+    dt = np.dtype(_DT)
+    GRAY = (_BLACK + _WHITE) // 2
+    y = np.full((fh, w), GRAY, dtype=dt)
+    fp = fi * 2 + f                                  # compteur de CHAMP global (cadence champ)
+    bx = (fp * 24) % w                               # barre : +24 px par CHAMP
+    x2 = min(bx + 16, w)
+    y[:, bx:x2] = _WHITE
+    if bx + 16 > w:
+        y[:, 0:(bx + 16 - w)] = _WHITE
+    y[0:max(2, fh // 8), 0:max(2, w // 8)] = _WHITE if f == 0 else _BLACK   # marqueur de champ
+    uv_w, uv_h = w // _CW, fh // _CH
+    tint = (24 << (BIT_DEPTH - 8)) if _DEEP else 24
+    off = -tint if f == 0 else tint                  # vert (champ 0) vs magenta (champ 1)
+    cb = np.full((uv_h, uv_w), _NEUTRAL + off, dtype=dt)
+    cr = np.full((uv_h, uv_w), _NEUTRAL + off, dtype=dt)
+    return y, cb, cr
 
 
 def _fill_grain_planes(view, lay, y, cb, cr):
@@ -695,6 +722,37 @@ class ControlHandler(BaseHTTPRequestHandler):
             _tx_gen_apply(slot)
             return self._json(200, {"ok": True})
 
+        if path == "/fieldtest":    # DIAGNOSTIC : mire de TEST DE CHAMP entrelacée sur un slot TX
+            # Bascule le slot en mire GÉNÉRÉE 1080i (sans le Newt) → isole entrée vs sortie : si la
+            # mire combe à l'écran = défaut d'ÉMISSION TX ; si propre = défaut d'ENTRÉE (RX). On
+            # mémorise le câblage réel pour le restaurer à l'extinction (enabled=false).
+            try: slot = int(body.get("idx", 0))
+            except Exception: slot = -1
+            if not (0 <= slot < N_TX):
+                return self._json(400, {"error": "slot TX hors limites"})
+            on = bool(body.get("enabled", True))
+            fo = "bff" if str(body.get("field_order", "tff")).lower() == "bff" else "tff"
+            with _tx_lock:
+                t = _tx[slot]
+                if on:
+                    if slot not in _fieldtest_saved:
+                        _fieldtest_saved[slot] = (t["cable_shm"], t["w"], t["h"], t["fps"],
+                                                  t["scan"], t["field_order"])
+                    t["cable_shm"] = None
+                    t["w"], t["h"], t["fps"] = 1920, 1080, 25.0
+                    t["scan"], t["field_order"] = "i", fo
+                else:
+                    sv = _fieldtest_saved.pop(slot, None)
+                    if sv:
+                        (t["cable_shm"], t["w"], t["h"], t["fps"],
+                         t["scan"], t["field_order"]) = sv
+            with _tx_gen_lock:
+                _tx_gen[slot]["user_enabled"] = on
+                if on:
+                    _tx_gen[slot]["pattern"] = "field_test"
+            _tx_gen_apply(slot)
+            return self._json(200, {"ok": True, "slot": slot, "enabled": on, "field_order": fo})
+
         try:
             idx = int(body.get("idx", 0))
         except Exception:
@@ -935,6 +993,9 @@ _tx_lock = threading.Lock()
 _tx_gen = [{"user_enabled": False, "enabled": False, "pattern": "bars",
             "ident": False, "ident_size": 0} for _ in range(N_TX)]
 _tx_gen_lock = threading.Lock()
+# Mire de test de champ (route :8082 /fieldtest) : sauvegarde du câblage réel par slot pour
+# restauration à l'extinction (le slot bascule en mire générée 1080i le temps du diagnostic).
+_fieldtest_saved = {}
 
 # Générateur de TONALITÉ par sortie audio (autonome, indépendant du GEN vidéo) — modèle des entrées :
 # par (slot i, sous-flux audio ai) {enabled, freq, level_db, active[8], rupted[8]}. Quand enabled,
@@ -1700,32 +1761,52 @@ def _txgen_loop(idx):
             continue
         with _tx_lock:
             w, h, fps = _tx[idx]["w"], _tx[idx]["h"], _tx[idx]["fps"]
+            il = (_tx[idx].get("scan") == "i")
+            fo = _tx[idx].get("field_order") or "tff"
         with _tx_gen_lock:
             pat = _tx_gen[idx]["pattern"]
         fps = max(1.0, float(fps or FPS))
+        if il and fps > 30:          # cadence stockée en CHAMP (50) → cadence TRAME pour le flowDef
+            fps = fps / 2.0
         lay = _layout(w, h)
         try:
-            if writer is None or res != (w, h):
+            if writer is None or res != (w, h, il, fo):
                 _close()
                 try: _mxl().garbage_collect()
                 except Exception: pass
-                writer = _mk_video_writer(name, w, h, fps); res = (w, h)
+                il_mode = (("interlaced_bff" if fo == "bff" else "interlaced_tff") if il else "progressive")
+                writer = _mk_video_writer(name, w, h, fps, interlace=il_mode); res = (w, h, il, fo)
                 patch = None; patch_age = 0   # forcer recalcul ident après resize
-            y_arr, cb_arr, cr_arr = _get_pattern(pat, fi, lay)
-            # IDENT user actif → mtl_rx incrustera l'IDENT sur la mire au passage du feeder TX ;
-            # on n'ajoute PAS le libellé auto de la mire (évite le doublon à l'écran).
-            with _tx_gen_lock:
-                user_ident = _tx_gen[idx]["ident"]
-            if user_ident:
-                patch = None
-            elif patch_age <= 0 or patch is None:
-                patch = _txgen_ident_patch(idx); patch_age = int(fps)  # recalcul 1× par seconde
+            if il:
+                # ENTRELACÉ : 2 grains-CHAMPS par trame, aux index CHAMP (fi×2 + champ). Mire de test
+                # de champ (field-aware) ; tout autre motif est éclaté en champs (lignes paires/impaires).
+                fh = h // 2
+                layf = _layout(w, fh)
+                full = None if pat == "field_test" else _get_pattern(pat, fi, lay)
+                for fld in (0, 1):
+                    if pat == "field_test":
+                        yy, cbb, crr = _field_test(fi, fld, w, fh)
+                    else:
+                        yy, cbb, crr = full[0][fld::2], full[1][fld::2], full[2][fld::2]
+                    _, gi, view = writer.open_grain(index=fi * 2 + fld)
+                    _fill_grain_planes(view, layf, yy, cbb, crr)
+                    writer.commit(gi)
             else:
-                patch_age -= 1
-            _, gi, view = writer.open_grain()
-            _fill_grain_planes(view, lay, y_arr, cb_arr, cr_arr)
-            _overlay_patch(view, 0, patch, lay)
-            writer.commit(gi)
+                y_arr, cb_arr, cr_arr = _get_pattern(pat, fi, lay)
+                # IDENT user actif → mtl_rx incrustera l'IDENT sur la mire au passage du feeder TX ;
+                # on n'ajoute PAS le libellé auto de la mire (évite le doublon à l'écran).
+                with _tx_gen_lock:
+                    user_ident = _tx_gen[idx]["ident"]
+                if user_ident:
+                    patch = None
+                elif patch_age <= 0 or patch is None:
+                    patch = _txgen_ident_patch(idx); patch_age = int(fps)  # recalcul 1× par seconde
+                else:
+                    patch_age -= 1
+                _, gi, view = writer.open_grain()
+                _fill_grain_planes(view, lay, y_arr, cb_arr, cr_arr)
+                _overlay_patch(view, 0, patch, lay)
+                writer.commit(gi)
         except Exception as e:
             print("txgen err idx={}: {}".format(idx, e), flush=True)
             _close(); time.sleep(0.2); continue
