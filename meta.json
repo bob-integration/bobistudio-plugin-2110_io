@@ -1,7 +1,10 @@
 {
-  "version": "0.29.1",
+  "version": "0.29.2",
   "date": "2026-06-25",
   "changes": {
+    "Mire txgen : pacing par échéance absolue (cadence exacte, 0.29.2)": [
+      "0.29.1 dormait un sleep fixe par champ sans compenser le temps de génération du motif → ~47,6 champs/s (au lieu de 50) → le TX (50/s PTP) dépassait le producteur → répétitions/judder/late. Fix : pacing par ÉCHÉANCE absolue monotone (_pace) qui compense le calcul → 50,000 champs/s exact, late stable. Mire de diagnostic propre."
+    ],
     "Mire de test de champ : pacing champ régulier (anti-late, 0.29.1)": [
       "0.29.0 écrivait les 2 grains-champs en RAFALE puis dormait 1 trame → cadence irrégulière (compteur late du TX qui s'emballe, mire saccadée). Fix : on espace les 2 champs de ½ période trame (20 ms @25) → cadence champ régulière 50/s, late stable. Diagnostic propre."
     ],

@@ -1746,12 +1746,23 @@ def _txgen_loop(idx):
     le lit comme n'importe quel flux d'entrée câblé. Overlay ident (nom + GEN + dest) via PIL."""
     name = "{}_txgen_{}".format(HOSTNAME, idx)
     writer = None; res = None; fi = 0; patch = None; patch_age = 0
+    next_t = None   # échéance absolue (monotone) du prochain GRAIN → pacing exact (compense le calcul)
     def _close():
         nonlocal writer, res
         if writer is not None:
             try: writer.close()
             except Exception: pass
         writer = None; res = None
+    def _pace(period):
+        # dort jusqu'à l'échéance (next_t += period), compense le temps de génération ; resync si
+        # on accumule >½ période de retard (évite de courir derrière indéfiniment).
+        nonlocal next_t
+        next_t = (time.monotonic() if next_t is None else next_t) + period
+        dt = next_t - time.monotonic()
+        if dt > 0:
+            time.sleep(dt)
+        elif dt < -period:
+            next_t = time.monotonic()
     while True:
         with _tx_gen_lock:
             gen_on = _tx_gen[idx]["enabled"]
@@ -1791,8 +1802,7 @@ def _txgen_loop(idx):
                     _, gi, view = writer.open_grain(index=fi * 2 + fld)
                     _fill_grain_planes(view, layf, yy, cbb, crr)
                     writer.commit(gi)
-                    if fld == 0:
-                        time.sleep(0.5 / fps)   # espacer les 2 CHAMPS de ½ période (cadence champ régulière, anti-late)
+                    _pace(0.5 / fps)   # 1 CHAMP = ½ période trame → cadence champ EXACTE 50/s (anti-late)
             else:
                 y_arr, cb_arr, cr_arr = _get_pattern(pat, fi, lay)
                 # IDENT user actif → mtl_rx incrustera l'IDENT sur la mire au passage du feeder TX ;
@@ -1811,9 +1821,10 @@ def _txgen_loop(idx):
                 writer.commit(gi)
         except Exception as e:
             print("txgen err idx={}: {}".format(idx, e), flush=True)
-            _close(); time.sleep(0.2); continue
+            _close(); next_t = None; time.sleep(0.2); continue
         fi += 1
-        time.sleep((0.5 if il else 1.0) / fps)   # entrelacé : ½ période déjà dormie entre les 2 champs
+        if not il:
+            _pace(1.0 / fps)   # progressif : 1 grain = 1 trame (l'entrelacé a déjà pacé ses 2 champs)
 
 
 def _build_tone_second(freq, level_db, chan_on):
