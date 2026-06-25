@@ -1,7 +1,10 @@
 {
-  "version": "0.28.4",
+  "version": "0.28.5",
   "date": "2026-06-25",
   "changes": {
+    "Revert de l'expérience 0.28.4 — dominance TFF confirmée (pas de rebuild, 0.28.5)": [
+      "L'A/B 0.28.4 (dominance inversée) a EMPIRÉ : peigne à CHAQUE micro-mouvement = swap spatial → la dominance TFF de 0.28.3 est la BONNE. Code remis dans l'état 0.28.3 (reader_field(... s->tff ...)). Image runtime repointée sur bobi-mtl:0.28.3 (aucun rebuild). CONCLUSION : le peigne-sur-cut résiduel (cuts entre plans d'une scène + forts contrastes en mouvement) n'est PAS une question de dominance de champ. Piste suivante : alignement/phase de TRAME entre la reconstruction RX→TX et la source (le direct est propre) — à diagnostiquer via analyseur 2110 (ordre de champ + timestamps RTP de notre TX vs Newt direct)."
+    ],
     "A/B TEST dominance inversée (peigne sur cut, REBUILD, 0.28.4)": [
       "TEST empirique (validé avec l'équipe) : statique propre mais CUT combé via BobiStudio (cut propre en direct) = decalage d'1 champ dans la phase de trame au TX. Le slot TX suit le field_order de la source (passthrough tff) → pour trancher, on INVERSE la dominance émise (reader_field !s->tff). Si le cut redevient propre → l'inversion est le fix (a rendre permanent/configurable proprement). Si le statique peigne → ce n'est pas la dominance, revert 0.28.3. REBUILD IMAGE."
     ],
