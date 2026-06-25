@@ -1,7 +1,10 @@
 {
-  "version": "0.28.1",
+  "version": "0.28.2",
   "date": "2026-06-25",
   "changes": {
+    "Fix TX entrelacé : cadence séquentielle + dominance de champ pilotable (anti-saccade, REBUILD IMAGE, 0.28.2)": [
+      "Retour recette : peigne + saccades PERSISTENT après 0.28.1 (max sur plans serrés, fort contraste, mouvement). Analyse : (1) SACCADES = cadence — le TX lisait la trame « la plus récente » à chaque émission, donc avec la dérive RX(50,5/s)↔TX(50/s) il répétait/sautait des trames. Fix : émission SÉQUENTIELLE/monotone (reader_field consomme tx_frame+1, rattrape la dernière si en retard >2 trames ou pas encore produite). (2) DOMINANCE DE CHAMP désormais pilotée par la config field_order (tff/bff) : 1er champ émis = TOP(grain pair) en TFF, BOTTOM(grain impair) en BFF → permet un A/B TFF↔BFF si l'inversion de champ est en cause, sans re-build. Même-trame préservé (anti-peigne). REBUILD IMAGE bobi-mtl."
+    ],
     "Fix TX entrelacé : apparier les 2 champs de la MÊME trame (anti-peigne/saccade, REBUILD IMAGE, 0.28.1)": [
       "Retour recette (testeur, écran SDI natif) : peigne + saccades sur le MOUVEMENT (propre en figé) sur la boucle Rx→Tx, source directe propre → défaut introduit par le moteur, pas l'affichage. Cause : reader_field() lisait pour CHAQUE champ indépendamment le dernier grain de bonne parité, sans garantir qu'ils viennent de la MÊME trame → le champ haut de la trame N était émis avec le champ bas de la trame N+1 dès qu'il y avait du jitter (weave temporellement incohérent). Fix : on latche l'index PAIR sur le 1er champ (struct target.field_base) et le 2e champ lit field_base+1 (l'impair de la MÊME trame) au lieu du « dernier impair » ; repli sur le dernier impair si l'apparié n'est pas encore écrit. REBUILD IMAGE bobi-mtl."
     ],
