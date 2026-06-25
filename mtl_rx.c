@@ -780,7 +780,13 @@ static int setup_video_tx(struct sess* s) {
   snprintf(ops.port.port[MTL_SESSION_PORT_P], MTL_PORT_MAX_LEN, "%s", s->portname);
   ops.port.udp_port[MTL_SESSION_PORT_P] = s->udp_port;
   ops.port.payload_type = s->payload_type;
-  ops.width = s->width; ops.height = s->height; ops.fps = to_st_fps(s->fps);
+  /* CADENCE ENTRELACÉ (fix racine du peigne) : libmtl TX entrelacé avec fps=cadence TRAME (P25)
+   * pace get_frame à la période TRAME (40 ms) → 1 champ/40 ms = 25 champs/s = MOITIÉ de 1080i50 →
+   * le désentrelaceur récepteur peigne. On passe la cadence CHAMP (×2 → P50) : libmtl pace alors à
+   * 20 ms/champ = 50 champs/s, ET signale toujours exactframerate=25 dans le SDP (il /2 en entrelacé).
+   * Le RX n'était pas affecté (cadencé par le réseau, pas par ops.fps). */
+  ops.width = s->width; ops.height = s->height;
+  ops.fps = to_st_fps(s->interlaced ? s->fps * 2.0 : s->fps);
   ops.interlaced = s->interlaced ? true : false;
   ops.input_fmt = ST_FRAME_FMT_YUV422PLANAR10LE;   /* on fournit du 10-bit (up-shift 8→10 nous-mêmes) */
   ops.transport_fmt = ST20_FMT_YUV_422_10BIT;

@@ -1,7 +1,10 @@
 {
-  "version": "0.29.3",
+  "version": "0.29.4",
   "date": "2026-06-25",
   "changes": {
+    "FIX RACINE : TX entrelacé émettait à MOITIÉ de cadence champ (peigne) (REBUILD, 0.29.4)": [
+      "Diagnostic via mire de test + instrumentation TXDBG : le TX entrelacé émettait à 25 champs/s au lieu de 50 (timestamps RTP espacés de 40ms = période TRAME au lieu de 20ms = période CHAMP ; trames sautées). libmtl st20p_tx interlacé avec ops.fps=cadence TRAME (P25) pace get_frame à la période trame → 1 champ/40ms. Le récepteur attend 50 champs/s → moitié → son désentrelaceur PEIGNE sur le mouvement (symptôme d'origine, sur le Newt comme sur la mire). Le RX n'était pas touché (cadencé par le réseau). FIX : passer la cadence CHAMP (×2 → P50) à libmtl pour le TX entrelacé → 50 champs/s (20ms), trames consécutives, late=0, SDP toujours exactframerate=25 (libmtl /2 en entrelacé). Couvre toutes les sorties entrelacées (Newt + mire). REBUILD IMAGE."
+    ],
     "Mire test de champ : barre liée à la TRAME (test d'appariement non-ambigu, 0.29.3)": [
       "0.29.0-2 : la barre avançait par CHAMP (24px/champ) → même une émission CORRECTE peignait/dédoublait → diagnostic ambigu. Fix : position de barre liée à la TRAME (fi) → les 2 champs d'une même trame ont la barre au MÊME X. Émission OK = barre NETTE unique ; champs mal appariés = barre dédoublée 32px. Distingue enfin un vrai bug d'appariement TX d'un peigne de mire normal."
     ],
