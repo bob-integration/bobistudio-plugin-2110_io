@@ -1,7 +1,10 @@
 {
-  "version": "0.29.7",
+  "version": "0.29.8",
   "date": "2026-06-25",
   "changes": {
+    "Fix : _SCALE manquant pour les barres de couleur (0.29.8)": [
+      "0.29.7 référençait _SCALE non défini → txgen erreur 'name _SCALE is not defined', mire pas produite. Ajout de _SCALE (8-bit réf → profondeur courante)."
+    ],
     "Mire test chroma : bande large multicolore, mouvement lent (test de traînée) (0.29.7)": [
       "Le motif field_test devient une BANDE LARGE de barres de couleur 100% (blanc/jaune/cyan/vert/magenta/rouge/bleu, 48px chacune) qui avance LENTEMENT (6 px/trame), position liée à la TRAME (genlock, même X pour les 2 champs). Sert à vérifier l'absence de TRAÎNÉE/smearing de chroma 4:2:2 derrière les bords colorés en mouvement. Marqueur de champ conservé."
     ],
