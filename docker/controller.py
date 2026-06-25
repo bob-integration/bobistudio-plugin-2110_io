@@ -276,21 +276,22 @@ def _mk_video_writer(name, w, h, fps, interlace="progressive"):
 
 
 def _field_test(fi, f, w, fh):
-    """Mire de TEST DE CHAMP (entrelacé) — révèle l'ordre/le timing de champ à l'œil.
-    f = 0 (1er champ = TOP en tff) / 1 (2e champ = BOTTOM). Renvoie des plans de CHAMP (fh = h/2).
-    Contenu : fond gris + BARRE verticale qui avance de 24 px/CHAMP (mouvement fort → peigne net si
-    le timing de champ est faux) + BLOC marqueur haut-gauche (clair en champ 0 / sombre en champ 1)
-    + teinte chroma VERTE(champ 0)/MAGENTA(champ 1) → on voit l'ordre de champ sur tout bord. Si la
-    sortie est bonne : barre fluide, lignes vert/magenta régulières. Si défaut : peigne sur la barre."""
+    """Mire de TEST D'APPARIEMENT DE CHAMP (entrelacé) — conçue pour que l'ÉMISSION CORRECTE soit
+    PROPRE et qu'un défaut saute aux yeux. f = 0 (1er champ/TOP en tff) / 1 (2e champ/BOTTOM).
+    Plans de CHAMP (fh = h/2).
+    - BARRE verticale dont la position dépend de la TRAME (fi), PAS du champ → les 2 champs d'une
+      MÊME trame ont la barre au MÊME X. Émission OK = barre NETTE unique (fluide, 32 px/trame).
+      Champs MAL APPARIÉS (1 champ d'une trame + 1 champ d'une autre) = barre DÉDOUBLÉE/peigne 32 px.
+    - Marqueur haut-gauche clair(champ0)/sombre(champ1) + teinte vert(champ0)/magenta(champ1) :
+      émission OK = fines lignes vert/magenta alternées RÉGULIÈRES ; ordre de champ inversé = motif
+      inversé. → on distingue bug d'appariement (barre double) de bug d'ordre (lignes inversées)."""
     dt = np.dtype(_DT)
     GRAY = (_BLACK + _WHITE) // 2
     y = np.full((fh, w), GRAY, dtype=dt)
-    fp = fi * 2 + f                                  # compteur de CHAMP global (cadence champ)
-    bx = (fp * 24) % w                               # barre : +24 px par CHAMP
-    x2 = min(bx + 16, w)
-    y[:, bx:x2] = _WHITE
-    if bx + 16 > w:
-        y[:, 0:(bx + 16 - w)] = _WHITE
+    bx = (fi * 32) % w                               # position liée à la TRAME (même X pour les 2 champs)
+    y[:, bx:min(bx + 24, w)] = _WHITE
+    if bx + 24 > w:
+        y[:, 0:(bx + 24 - w)] = _WHITE
     y[0:max(2, fh // 8), 0:max(2, w // 8)] = _WHITE if f == 0 else _BLACK   # marqueur de champ
     uv_w, uv_h = w // _CW, fh // _CH
     tint = (24 << (BIT_DEPTH - 8)) if _DEEP else 24

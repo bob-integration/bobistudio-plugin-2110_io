@@ -1,7 +1,10 @@
 {
-  "version": "0.29.2",
+  "version": "0.29.3",
   "date": "2026-06-25",
   "changes": {
+    "Mire test de champ : barre liée à la TRAME (test d'appariement non-ambigu, 0.29.3)": [
+      "0.29.0-2 : la barre avançait par CHAMP (24px/champ) → même une émission CORRECTE peignait/dédoublait → diagnostic ambigu. Fix : position de barre liée à la TRAME (fi) → les 2 champs d'une même trame ont la barre au MÊME X. Émission OK = barre NETTE unique ; champs mal appariés = barre dédoublée 32px. Distingue enfin un vrai bug d'appariement TX d'un peigne de mire normal."
+    ],
     "Mire txgen : pacing par échéance absolue (cadence exacte, 0.29.2)": [
       "0.29.1 dormait un sleep fixe par champ sans compenser le temps de génération du motif → ~47,6 champs/s (au lieu de 50) → le TX (50/s PTP) dépassait le producteur → répétitions/judder/late. Fix : pacing par ÉCHÉANCE absolue monotone (_pace) qui compense le calcul → 50,000 champs/s exact, late stable. Mire de diagnostic propre."
     ],
