@@ -292,12 +292,12 @@ def _field_test(fi, f, w, fh):
     y[:, bx:min(bx + 24, w)] = _WHITE
     if bx + 24 > w:
         y[:, 0:(bx + 24 - w)] = _WHITE
-    y[0:max(2, fh // 8), 0:max(2, w // 8)] = _WHITE if f == 0 else _BLACK   # marqueur de champ
+    y[0:max(2, fh // 8), 0:max(2, w // 8)] = _WHITE if f == 0 else _BLACK   # marqueur de champ (luma)
+    # CHROMA NEUTRE (plus de teinte vert/magenta par champ) : barre blanche sur gris, sans couleur.
+    # → s'il reste du vert/magenta autour de la barre à l'écran, c'est un VRAI artefact de chroma.
     uv_w, uv_h = w // _CW, fh // _CH
-    tint = (24 << (BIT_DEPTH - 8)) if _DEEP else 24
-    off = -tint if f == 0 else tint                  # vert (champ 0) vs magenta (champ 1)
-    cb = np.full((uv_h, uv_w), _NEUTRAL + off, dtype=dt)
-    cr = np.full((uv_h, uv_w), _NEUTRAL + off, dtype=dt)
+    cb = np.full((uv_h, uv_w), _NEUTRAL, dtype=dt)
+    cr = np.full((uv_h, uv_w), _NEUTRAL, dtype=dt)
     return y, cb, cr
 
 
