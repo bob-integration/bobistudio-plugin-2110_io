@@ -1,7 +1,10 @@
 {
-  "version": "0.29.5",
+  "version": "0.29.6",
   "date": "2026-06-25",
   "changes": {
+    "Mire test de champ GENLOCK PTP — fluide (0.29.6)": [
+      "La mire txgen entrelacée écrivait aux index TRAME d'un compteur MONOTONE → dérive vs le TX (cadencé PTP) → petits sauts/répétitions de la barre. Fix : écrire aux index de la GRILLE TAI (writer._next_index, genlock PTP comme le TX) avec dédoublonnage (n'écrit qu'aux nouveaux index TAI) → barre fluide, verrouillée PTP. Ne touche QUE la mire générée."
+    ],
     "Mire test de champ : chroma neutre (barre blanche, sans teinte) (0.29.5)": [
       "Retrait de la teinte vert(champ0)/magenta(champ1) de la mire field_test → barre blanche sur gris neutre. Isole un vrai artefact de chroma : s'il reste du vert/magenta autour de la barre, c'est le pipeline, pas la mire. Marqueur de champ (luma) conservé."
     ],
