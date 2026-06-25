@@ -153,10 +153,8 @@ struct target {
   uint64_t recv;           /* compteur reçu (pour le débit) */
   uint64_t late;           /* TX vidéo : trames en retard (get_frame > 1,5 période = epoch raté) */
   uint64_t last_feed_ns;   /* TX vidéo : instant (monotone) du dernier get_frame réussi */
-  uint64_t field_base;     /* TX entrelacé : index du 1er champ de la trame courante (MÊME trame pour
-                            * les 2 champs → anti-peigne). Parité = TOP(pair) en TFF, BOTTOM(impair) en BFF. */
-  uint64_t tx_frame;       /* TX entrelacé : dernière TRAME d'entrée émise (index trame) → émission
-                            * SÉQUENTIELLE/monotone (anti-saccade) au lieu de « la plus récente ». */
+  uint64_t field_base;     /* TX entrelacé : index du 1er champ de la trame émise (MÊME trame pour les
+                            * 2 champs → anti-peigne). Parité = TOP(pair) en TFF, BOTTOM(impair) en BFF. */
   /* RX vidéo : latence de réception (segment A = capture média → écriture shm), moyenne glissante
    * sur la fenêtre de stats. lat_sum en ns, lat_cnt = nb d'échantillons ; reset à chaque write_stats. */
   uint64_t lat_sum; uint32_t lat_cnt;
@@ -657,28 +655,24 @@ static int reader_latest(struct target* t, mxlGrainInfo* gi, uint8_t** payload) 
   return -1;
 }
 
-/* Champ-natif TX — émet les 2 champs de la MÊME trame (anti-peigne), à cadence SÉQUENTIELLE
- * (anti-saccade), avec la dominance pilotée par `tff` (anti-inversion de champ).
- * Grains indexés : index TRAME×2 + parité (pair = TOP, impair = BOTTOM).
- *  - field==0 (1er champ de la trame émise) : choisit la trame à émettre de façon MONOTONE
- *    (tx_frame+1) au lieu de « la plus récente » → plus de répétition/saut quand RX (50,5/s) et TX
- *    (50/s) dérivent. Repli : trame pas encore produite → on répète la dernière ; retard > 2 trames
- *    → on rattrape la dernière. Parité du 1er champ = TOP(pair) en TFF, BOTTOM(impair) en BFF.
- *  - field==1 (2e champ) : l'autre parité de la MÊME trame. */
+/* Champ-natif TX — émet les 2 champs de la MÊME trame COMPLÈTE, dominance pilotée par `tff`.
+ * Mesuré : la RX livre des grains-champs CONSÉCUTIFS réguliers (20 ms, 50/s, aucun saut). Donc on
+ * émet simplement la dernière trame COMPLÈTE = (trame de tête − 1) → ses 2 champs sont garantis
+ * écrits (anti-peigne), latence constante d'1 trame, AUCUN rattrapage/compteur → la cadence suit la
+ * source sans dérive ni répétition (le ×2-catch-up de 0.28.2 saccadait). Grains : index TRAME×2 +
+ * parité (pair = TOP, impair = BOTTOM). 1er champ (field==0) = TOP(pair) en TFF, BOTTOM(impair) en BFF.
+ *  - field==0 : ancre field_base sur la trame de tête−1, parité selon tff.
+ *  - field==1 : l'autre parité de la MÊME trame. */
 static int reader_field(struct target* t, int field, int tff, mxlGrainInfo* gi, uint8_t** payload) {
   mxlFlowRuntimeInfo rt;
   mxlStatus st = mxlFlowReaderGetRuntimeInfo(t->reader, &rt);
   if (st == MXL_STATUS_OK && rt.headIndex != MXL_UNDEFINED_INDEX) {
     uint64_t head = rt.headIndex;
-    uint64_t latest_even = (head & 1ULL) ? head - 1 : head;
-    uint64_t latest_frame = latest_even / 2;
+    uint64_t latest_frame = ((head & 1ULL) ? head - 1 : head) / 2;
     uint64_t target;
     if (field == 0) {
-      uint64_t next = t->tx_frame + 1;
-      if (t->tx_frame == 0 || next > latest_frame || latest_frame > next + 2)
-        next = latest_frame;                 /* 1er passage / source en avance ou en retard → rattrape */
-      t->tx_frame = next;
-      t->field_base = next * 2 + (tff ? 0 : 1);   /* TOP(pair) en TFF, BOTTOM(impair) en BFF */
+      uint64_t frame = latest_frame ? latest_frame - 1 : 0;   /* dernière trame COMPLÈTE */
+      t->field_base = frame * 2 + (tff ? 0 : 1);              /* TOP(pair) en TFF, BOTTOM(impair) en BFF */
       target = t->field_base;
     } else {
       target = tff ? (t->field_base + 1) : (t->field_base - 1);   /* 2e champ, MÊME trame */
