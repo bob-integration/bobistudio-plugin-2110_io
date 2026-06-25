@@ -153,8 +153,10 @@ struct target {
   uint64_t recv;           /* compteur reçu (pour le débit) */
   uint64_t late;           /* TX vidéo : trames en retard (get_frame > 1,5 période = epoch raté) */
   uint64_t last_feed_ns;   /* TX vidéo : instant (monotone) du dernier get_frame réussi */
-  uint64_t field_base;     /* TX entrelacé : index PAIR latché sur le 1er champ → le 2e champ lit
-                            * base+1 (MÊME trame) au lieu du « dernier impair » (anti-peigne/saccade) */
+  uint64_t field_base;     /* TX entrelacé : index du 1er champ de la trame courante (MÊME trame pour
+                            * les 2 champs → anti-peigne). Parité = TOP(pair) en TFF, BOTTOM(impair) en BFF. */
+  uint64_t tx_frame;       /* TX entrelacé : dernière TRAME d'entrée émise (index trame) → émission
+                            * SÉQUENTIELLE/monotone (anti-saccade) au lieu de « la plus récente ». */
   /* RX vidéo : latence de réception (segment A = capture média → écriture shm), moyenne glissante
    * sur la fenêtre de stats. lat_sum en ns, lat_cnt = nb d'échantillons ; reset à chaque write_stats. */
   uint64_t lat_sum; uint32_t lat_cnt;
@@ -655,32 +657,33 @@ static int reader_latest(struct target* t, mxlGrainInfo* gi, uint8_t** payload) 
   return -1;
 }
 
-/* Champ-natif TX : émet les 2 champs de la MÊME trame, dans l'ordre. Les grains sont indexés
- * index TRAME×2 + parité (pair = 1er champ = top en tff). PIÈGE corrigé : lire « le dernier grain
- * de bonne parité » INDÉPENDAMMENT pour chaque champ apparie le top de la trame N avec le bottom de
- * la trame N+1 dès qu'il y a du jitter → PEIGNE + SACCADES sur le mouvement (rien en figé). Donc :
- *  - 1er champ (field==0) : on prend le grain PAIR le plus récent et on LATCHE son index (field_base) ;
- *  - 2e champ (field==1)  : on lit field_base+1 (l'IMPAIR de la MÊME trame), pas « le dernier impair ».
- * Repli : si field_base+1 pas encore écrit, on tente le dernier impair (mieux qu'un champ noir). */
-static int reader_field(struct target* t, int field, mxlGrainInfo* gi, uint8_t** payload) {
+/* Champ-natif TX — émet les 2 champs de la MÊME trame (anti-peigne), à cadence SÉQUENTIELLE
+ * (anti-saccade), avec la dominance pilotée par `tff` (anti-inversion de champ).
+ * Grains indexés : index TRAME×2 + parité (pair = TOP, impair = BOTTOM).
+ *  - field==0 (1er champ de la trame émise) : choisit la trame à émettre de façon MONOTONE
+ *    (tx_frame+1) au lieu de « la plus récente » → plus de répétition/saut quand RX (50,5/s) et TX
+ *    (50/s) dérivent. Repli : trame pas encore produite → on répète la dernière ; retard > 2 trames
+ *    → on rattrape la dernière. Parité du 1er champ = TOP(pair) en TFF, BOTTOM(impair) en BFF.
+ *  - field==1 (2e champ) : l'autre parité de la MÊME trame. */
+static int reader_field(struct target* t, int field, int tff, mxlGrainInfo* gi, uint8_t** payload) {
   mxlFlowRuntimeInfo rt;
   mxlStatus st = mxlFlowReaderGetRuntimeInfo(t->reader, &rt);
   if (st == MXL_STATUS_OK && rt.headIndex != MXL_UNDEFINED_INDEX) {
+    uint64_t head = rt.headIndex;
+    uint64_t latest_even = (head & 1ULL) ? head - 1 : head;
+    uint64_t latest_frame = latest_even / 2;
     uint64_t target;
     if (field == 0) {
-      target = rt.headIndex;
-      if ((target & 1ULL) && target > 0) target--;   /* recule sur l'index PAIR (1er champ) */
-      t->field_base = target;                          /* latch : ancre la trame */
+      uint64_t next = t->tx_frame + 1;
+      if (t->tx_frame == 0 || next > latest_frame || latest_frame > next + 2)
+        next = latest_frame;                 /* 1er passage / source en avance ou en retard → rattrape */
+      t->tx_frame = next;
+      t->field_base = next * 2 + (tff ? 0 : 1);   /* TOP(pair) en TFF, BOTTOM(impair) en BFF */
+      target = t->field_base;
     } else {
-      target = t->field_base + 1;                      /* 2e champ de la MÊME trame */
-      if (target > rt.headIndex) target = rt.headIndex; /* garde-fou : pas au-delà de la tête */
+      target = tff ? (t->field_base + 1) : (t->field_base - 1);   /* 2e champ, MÊME trame */
     }
     st = mxlFlowReaderGetGrainNonBlocking(t->reader, target, gi, payload);
-    if (st != MXL_STATUS_OK && field == 1) {
-      /* repli : l'impair apparié pas (encore) lisible → dernier impair disponible */
-      uint64_t alt = rt.headIndex; if (!(alt & 1ULL) && alt > 0) alt--;
-      st = mxlFlowReaderGetGrainNonBlocking(t->reader, alt, gi, payload);
-    }
     if (st == MXL_STATUS_OK) return 0;
   }
   if (st == MXL_ERR_FLOW_NOT_FOUND || st == MXL_ERR_FLOW_INVALID) {
@@ -727,7 +730,7 @@ static void* video_tx_thread(void* arg) {
       int sf = frame->second_field ? 1 : 0;
       uint8_t* dst = (uint8_t*)frame->addr[0];
       mxlGrainInfo gi; uint8_t* payload;
-      if (reader_field(t, sf, &gi, &payload) == 0) {
+      if (reader_field(t, sf, s->tff, &gi, &payload) == 0) {
         size_t _ncp = s->slotsize;                 /* taille CHAMP du grain */
         if (gi.grainSize && (size_t)gi.grainSize < _ncp) _ncp = gi.grainSize;
         if (s->bit_depth == 8) {
