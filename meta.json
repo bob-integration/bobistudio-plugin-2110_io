@@ -1,7 +1,10 @@
 {
-  "version": "0.28.2",
+  "version": "0.28.3",
   "date": "2026-06-25",
   "changes": {
+    "Fix TX entrelacé : émettre la dernière trame COMPLÈTE (revert du séquentiel saccadeur, REBUILD IMAGE, 0.28.3)": [
+      "0.28.2 a EMPIRÉ (plus saccadé, décalage de champs qui glisse). MESURE objective (sonde lecture seule dans le conteneur) : la RX livre des grains-champs CONSÉCUTIFS et réguliers (~20 ms, 50/s, 0 saut/0 répétition) → l'entrée est saine, le défaut est dans l'émission TX. Le compteur séquentiel + rattrapage (×2 catch-up) répétait/sautait des trames quand TX et RX dérivent. Fix : reader_field émet simplement la dernière trame COMPLÈTE = (trame de tête − 1), ses 2 champs appariés (garantis écrits → anti-peigne), latence constante d'1 trame, AUCUN compteur/rattrapage → la cadence suit la source sans dérive ni stutter. Dominance de champ toujours pilotable par field_order (tff/bff) pour A/B si peigne résiduel. REBUILD IMAGE bobi-mtl."
+    ],
     "Fix TX entrelacé : cadence séquentielle + dominance de champ pilotable (anti-saccade, REBUILD IMAGE, 0.28.2)": [
       "Retour recette : peigne + saccades PERSISTENT après 0.28.1 (max sur plans serrés, fort contraste, mouvement). Analyse : (1) SACCADES = cadence — le TX lisait la trame « la plus récente » à chaque émission, donc avec la dérive RX(50,5/s)↔TX(50/s) il répétait/sautait des trames. Fix : émission SÉQUENTIELLE/monotone (reader_field consomme tx_frame+1, rattrape la dernière si en retard >2 trames ou pas encore produite). (2) DOMINANCE DE CHAMP désormais pilotée par la config field_order (tff/bff) : 1er champ émis = TOP(grain pair) en TFF, BOTTOM(grain impair) en BFF → permet un A/B TFF↔BFF si l'inversion de champ est en cause, sans re-build. Même-trame préservé (anti-peigne). REBUILD IMAGE bobi-mtl."
     ],
