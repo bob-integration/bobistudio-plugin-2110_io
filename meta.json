@@ -1,7 +1,10 @@
 {
-  "version": "0.28.3",
+  "version": "0.28.4",
   "date": "2026-06-25",
   "changes": {
+    "A/B TEST dominance inversée (peigne sur cut, REBUILD, 0.28.4)": [
+      "TEST empirique (validé avec l'équipe) : statique propre mais CUT combé via BobiStudio (cut propre en direct) = decalage d'1 champ dans la phase de trame au TX. Le slot TX suit le field_order de la source (passthrough tff) → pour trancher, on INVERSE la dominance émise (reader_field !s->tff). Si le cut redevient propre → l'inversion est le fix (a rendre permanent/configurable proprement). Si le statique peigne → ce n'est pas la dominance, revert 0.28.3. REBUILD IMAGE."
+    ],
     "Fix TX entrelacé : émettre la dernière trame COMPLÈTE (revert du séquentiel saccadeur, REBUILD IMAGE, 0.28.3)": [
       "0.28.2 a EMPIRÉ (plus saccadé, décalage de champs qui glisse). MESURE objective (sonde lecture seule dans le conteneur) : la RX livre des grains-champs CONSÉCUTIFS et réguliers (~20 ms, 50/s, 0 saut/0 répétition) → l'entrée est saine, le défaut est dans l'émission TX. Le compteur séquentiel + rattrapage (×2 catch-up) répétait/sautait des trames quand TX et RX dérivent. Fix : reader_field émet simplement la dernière trame COMPLÈTE = (trame de tête − 1), ses 2 champs appariés (garantis écrits → anti-peigne), latence constante d'1 trame, AUCUN compteur/rattrapage → la cadence suit la source sans dérive ni stutter. Dominance de champ toujours pilotable par field_order (tff/bff) pour A/B si peigne résiduel. REBUILD IMAGE bobi-mtl."
     ],
