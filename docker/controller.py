@@ -227,6 +227,7 @@ _DT      = "<u2" if _DEEP else "u1"
 _NEUTRAL = 1 << (BIT_DEPTH - 1)
 _BLACK   = 16 << (BIT_DEPTH - 8) if _DEEP else 16
 _WHITE   = 235 << (BIT_DEPTH - 8) if _DEEP else 235
+_SCALE   = (1 << (BIT_DEPTH - 8)) if _DEEP else 1   # 8-bit ref → profondeur courante (barres de couleur)
 _CW = {"420": 2, "422": 2, "444": 1}.get(CHROMA, 2)
 _CH = {"420": 2, "422": 1, "444": 1}.get(CHROMA, 1)
 
