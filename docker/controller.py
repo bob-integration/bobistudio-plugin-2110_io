@@ -275,29 +275,39 @@ def _mk_video_writer(name, w, h, fps, interlace="progressive"):
                           fps_num=n, fps_den=d, index_mode="tai", interlace=interlace)
 
 
+# Barres de couleur 100% (Y, Cb, Cr en 8 bits, centre chroma 128) → mises à l'échelle bit-depth.
+_COLORBARS = [(235, 128, 128), (210, 16, 146), (170, 166, 16), (145, 54, 34),
+              (106, 202, 222), (63, 102, 240), (32, 240, 118)]   # blanc jaune cyan vert magenta rouge bleu
+
+
 def _field_test(fi, f, w, fh):
-    """Mire de TEST D'APPARIEMENT DE CHAMP (entrelacé) — conçue pour que l'ÉMISSION CORRECTE soit
-    PROPRE et qu'un défaut saute aux yeux. f = 0 (1er champ/TOP en tff) / 1 (2e champ/BOTTOM).
-    Plans de CHAMP (fh = h/2).
-    - BARRE verticale dont la position dépend de la TRAME (fi), PAS du champ → les 2 champs d'une
-      MÊME trame ont la barre au MÊME X. Émission OK = barre NETTE unique (fluide, 32 px/trame).
-      Champs MAL APPARIÉS (1 champ d'une trame + 1 champ d'une autre) = barre DÉDOUBLÉE/peigne 32 px.
-    - Marqueur haut-gauche clair(champ0)/sombre(champ1) + teinte vert(champ0)/magenta(champ1) :
-      émission OK = fines lignes vert/magenta alternées RÉGULIÈRES ; ordre de champ inversé = motif
-      inversé. → on distingue bug d'appariement (barre double) de bug d'ordre (lignes inversées)."""
+    """Mire de TEST CHROMA + APPARIEMENT DE CHAMP (entrelacé). f = 0 (1er champ/TOP en tff) / 1 (2e).
+    Plans de CHAMP (fh = h/2). Une BANDE LARGE multicolore (barres 100%) qui avance LENTEMENT, dont la
+    position dépend de la TRAME (fi) → les 2 champs d'une même trame ont la bande au MÊME X.
+    - Émission OK = bande NETTE, couleurs franches, AUCUNE traînée derrière les bords colorés en
+      mouvement (test de smearing/traînée de chroma 4:2:2 en entrelacé).
+    - Champs mal appariés = bande dédoublée/peigne. Marqueur haut-gauche clair(champ0)/sombre(champ1)."""
     dt = np.dtype(_DT)
     GRAY = (_BLACK + _WHITE) // 2
-    y = np.full((fh, w), GRAY, dtype=dt)
-    bx = (fi * 32) % w                               # position liée à la TRAME (même X pour les 2 champs)
-    y[:, bx:min(bx + 24, w)] = _WHITE
-    if bx + 24 > w:
-        y[:, 0:(bx + 24 - w)] = _WHITE
-    y[0:max(2, fh // 8), 0:max(2, w // 8)] = _WHITE if f == 0 else _BLACK   # marqueur de champ (luma)
-    # CHROMA NEUTRE (plus de teinte vert/magenta par champ) : barre blanche sur gris, sans couleur.
-    # → s'il reste du vert/magenta autour de la barre à l'écran, c'est un VRAI artefact de chroma.
     uv_w, uv_h = w // _CW, fh // _CH
-    cb = np.full((uv_h, uv_w), _NEUTRAL, dtype=dt)
-    cr = np.full((uv_h, uv_w), _NEUTRAL, dtype=dt)
+    STRIPE = 48
+    bx = (fi * 6) % w                                # LENT : 6 px/trame ; lié à la TRAME (même X / champ)
+    # rangées-modèles (gris partout + bande de barres au début), puis roll à la position bx
+    yrow  = np.full(w, GRAY, dtype=dt)
+    cbrow = np.full(uv_w, _NEUTRAL, dtype=dt)
+    crrow = np.full(uv_w, _NEUTRAL, dtype=dt)
+    for i, (by, bcb, bcr) in enumerate(_COLORBARS):
+        x0, x1 = i * STRIPE, (i + 1) * STRIPE
+        yrow[x0:x1] = by * _SCALE
+        cbrow[x0 // _CW:x1 // _CW] = bcb * _SCALE
+        crrow[x0 // _CW:x1 // _CW] = bcr * _SCALE
+    yrow  = np.roll(yrow, bx)
+    cbrow = np.roll(cbrow, bx // _CW)
+    crrow = np.roll(crrow, bx // _CW)
+    y  = np.tile(yrow, (fh, 1))
+    cb = np.tile(cbrow, (uv_h, 1))
+    cr = np.tile(crrow, (uv_h, 1))
+    y[0:max(2, fh // 8), 0:max(2, w // 8)] = _WHITE if f == 0 else _BLACK   # marqueur de champ (luma)
     return y, cb, cr
 
 
