@@ -1,7 +1,10 @@
 {
-  "version": "0.29.6",
+  "version": "0.29.7",
   "date": "2026-06-25",
   "changes": {
+    "Mire test chroma : bande large multicolore, mouvement lent (test de traînée) (0.29.7)": [
+      "Le motif field_test devient une BANDE LARGE de barres de couleur 100% (blanc/jaune/cyan/vert/magenta/rouge/bleu, 48px chacune) qui avance LENTEMENT (6 px/trame), position liée à la TRAME (genlock, même X pour les 2 champs). Sert à vérifier l'absence de TRAÎNÉE/smearing de chroma 4:2:2 derrière les bords colorés en mouvement. Marqueur de champ conservé."
+    ],
     "Mire test de champ GENLOCK PTP — fluide (0.29.6)": [
       "La mire txgen entrelacée écrivait aux index TRAME d'un compteur MONOTONE → dérive vs le TX (cadencé PTP) → petits sauts/répétitions de la barre. Fix : écrire aux index de la GRILLE TAI (writer._next_index, genlock PTP comme le TX) avec dédoublonnage (n'écrit qu'aux nouveaux index TAI) → barre fluide, verrouillée PTP. Ne touche QUE la mire générée."
     ],
