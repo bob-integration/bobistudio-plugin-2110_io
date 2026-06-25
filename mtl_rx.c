@@ -153,6 +153,8 @@ struct target {
   uint64_t recv;           /* compteur reçu (pour le débit) */
   uint64_t late;           /* TX vidéo : trames en retard (get_frame > 1,5 période = epoch raté) */
   uint64_t last_feed_ns;   /* TX vidéo : instant (monotone) du dernier get_frame réussi */
+  uint64_t field_base;     /* TX entrelacé : index PAIR latché sur le 1er champ → le 2e champ lit
+                            * base+1 (MÊME trame) au lieu du « dernier impair » (anti-peigne/saccade) */
   /* RX vidéo : latence de réception (segment A = capture média → écriture shm), moyenne glissante
    * sur la fenêtre de stats. lat_sum en ns, lat_cnt = nb d'échantillons ; reset à chaque write_stats. */
   uint64_t lat_sum; uint32_t lat_cnt;
@@ -653,16 +655,32 @@ static int reader_latest(struct target* t, mxlGrainInfo* gi, uint8_t** payload) 
   return -1;
 }
 
-/* Champ-natif TX : grain-champ le plus récent dont la PARITÉ d'index == field (0=1er/top en tff,
- * 1=2e/bottom). On part de headIndex et on recule d'1 si la parité ne colle pas → on émet les 2
- * champs de la trame la plus récente dans le bon ordre. Même gestion de recréation que reader_latest. */
+/* Champ-natif TX : émet les 2 champs de la MÊME trame, dans l'ordre. Les grains sont indexés
+ * index TRAME×2 + parité (pair = 1er champ = top en tff). PIÈGE corrigé : lire « le dernier grain
+ * de bonne parité » INDÉPENDAMMENT pour chaque champ apparie le top de la trame N avec le bottom de
+ * la trame N+1 dès qu'il y a du jitter → PEIGNE + SACCADES sur le mouvement (rien en figé). Donc :
+ *  - 1er champ (field==0) : on prend le grain PAIR le plus récent et on LATCHE son index (field_base) ;
+ *  - 2e champ (field==1)  : on lit field_base+1 (l'IMPAIR de la MÊME trame), pas « le dernier impair ».
+ * Repli : si field_base+1 pas encore écrit, on tente le dernier impair (mieux qu'un champ noir). */
 static int reader_field(struct target* t, int field, mxlGrainInfo* gi, uint8_t** payload) {
   mxlFlowRuntimeInfo rt;
   mxlStatus st = mxlFlowReaderGetRuntimeInfo(t->reader, &rt);
   if (st == MXL_STATUS_OK && rt.headIndex != MXL_UNDEFINED_INDEX) {
-    uint64_t target = rt.headIndex;
-    if ((target & 1ULL) != (uint64_t)field && target > 0) target--;
+    uint64_t target;
+    if (field == 0) {
+      target = rt.headIndex;
+      if ((target & 1ULL) && target > 0) target--;   /* recule sur l'index PAIR (1er champ) */
+      t->field_base = target;                          /* latch : ancre la trame */
+    } else {
+      target = t->field_base + 1;                      /* 2e champ de la MÊME trame */
+      if (target > rt.headIndex) target = rt.headIndex; /* garde-fou : pas au-delà de la tête */
+    }
     st = mxlFlowReaderGetGrainNonBlocking(t->reader, target, gi, payload);
+    if (st != MXL_STATUS_OK && field == 1) {
+      /* repli : l'impair apparié pas (encore) lisible → dernier impair disponible */
+      uint64_t alt = rt.headIndex; if (!(alt & 1ULL) && alt > 0) alt--;
+      st = mxlFlowReaderGetGrainNonBlocking(t->reader, alt, gi, payload);
+    }
     if (st == MXL_STATUS_OK) return 0;
   }
   if (st == MXL_ERR_FLOW_NOT_FOUND || st == MXL_ERR_FLOW_INVALID) {
