@@ -145,11 +145,24 @@ def topology_ports(hostname, params, ctx):
     _fmt = {"video": video_fmt, "audio": audio_fmt, "anc": {"type": "smpte291"}}
     _shmf = {"video": f"{hostname}_{{}}", "audio": f"{hostname}_audio_{{}}", "anc": f"{hostname}_anc_{{}}"}
     _kindf = {"video": "video", "audio": "audio", "anc": "data"}
+    # Format PAR-FLUX : un moteur RX multi-entrées peut mélanger progressif/entrelacé. Le scan/dims
+    # réels de chaque entrée sont posés dans `params['rx_fmt'][idx]` au moment de l'abonnement
+    # (services/nmos:_propagate_sdp_format, lu du SDP). On surcharge le format global par-port pour
+    # que la page Câbles affiche le i/p correct par entrée (repli sur le global si absent).
+    rx_fmt = params.get("rx_fmt") or {}
     produces = []
     for f in rx_flows:
         ess = f["essence"]
+        pfmt = _fmt[ess]
+        if ess == "video":
+            sf = rx_fmt.get(str(f["idx"]))
+            if sf:
+                pfmt = dict(video_fmt)
+                for k in ("width", "height", "fps", "scan", "field_order"):
+                    if sf.get(k) not in (None, ""):
+                        pfmt[k] = sf[k]
         produces.append({"shm": _shmf[ess].format(f["idx"]), "kind": _kindf[ess],
-                         "format": _fmt[ess],
+                         "format": pfmt,
                          "group": f["id"] if ess == "video" else (f.get("attached_to") or f["id"])})
     # Slots TX (émetteurs) = ports d'ENTRÉE câblables → destinations MXL à droite sur la page Câbles.
     # Pilotés par tx_flows : par slot vidéo, le port vidéo + ses audios attachés (N) + son ANC.

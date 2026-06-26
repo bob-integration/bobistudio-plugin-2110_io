@@ -154,6 +154,9 @@ struct target {
   uint64_t late;           /* TX vidéo : trames en retard (get_frame > 1,5 période = epoch raté) */
   uint64_t last_feed_ns;   /* TX vidéo : instant (monotone) du dernier get_frame réussi */
   int      dbg_depth_logged; /* TX vidéo : log one-shot grainSize/out_size/_src8 au 1er grain */
+  uint64_t tx_src_idx;     /* TX vidéo : dernier index de grain SOURCE lu (détection flux figé) */
+  uint64_t tx_src_idx_ns;  /* TX vidéo : instant (monotone) où tx_src_idx a changé pour la dernière fois */
+  int      tx_src_idx_init; /* TX vidéo : tx_src_idx amorcé ? (0 au (ré)ouverture du reader) */
   uint64_t field_base;     /* TX entrelacé : index du 1er champ de la trame émise (MÊME trame pour les
                             * 2 champs → anti-peigne). Parité = TOP(pair) en TFF, BOTTOM(impair) en BFF. */
   /* RX vidéo : latence de réception (segment A = capture média → écriture shm), moyenne glissante
@@ -638,7 +641,32 @@ static int setup_video(struct sess* s) {
 static int open_reader(struct target* t) {
   char id[37]; flow_id_str(flow_name(t->shm_path), id);
   if (mxlCreateFlowReader(g_mxl, id, NULL, &t->reader) != MXL_STATUS_OK) { t->reader = NULL; return -1; }
+  t->tx_src_idx_init = 0;   /* nouveau reader → ré-amorce la détection de flux figé */
   return 0;
+}
+
+/* Reconnexion sur flux SOURCE figé : un producteur redéployé (ex. multiview) DÉTRUIT puis RECRÉE son
+ * flux MXL SOUS LE MÊME NOM → l'ancien ring orphelin reste lisible et reader_latest/reader_field
+ * renvoient indéfiniment le DERNIER grain (index figé, AUCUNE erreur → aucune libération) → la sortie
+ * TX se fige sur la dernière trame jusqu'à un re-câble manuel. Si l'index source n'avance plus au-delà
+ * de TX_REOPEN_STALE_NS, on libère le reader → open_reader le recrée sur la génération COURANTE du flux
+ * (résolution par nom). Sans danger pour une source légitimement statique (elle relit son grain).
+ * `idx` = index du grain courant ; `tnow` = mono_ns() ; à appeler APRÈS une lecture réussie. */
+#define TX_REOPEN_STALE_NS 1000000000ULL   /* 1 s sans avancée d'index ⇒ flux périmé → reconnexion */
+static void tx_reopen_if_stale(struct target* t, uint64_t idx, uint64_t tnow) {
+  if (!t->tx_src_idx_init || idx != t->tx_src_idx) {
+    t->tx_src_idx = idx; t->tx_src_idx_ns = tnow; t->tx_src_idx_init = 1;
+    return;
+  }
+  if (tnow - t->tx_src_idx_ns > TX_REOPEN_STALE_NS) {
+    /* Détacher le reader de l'ancien ring PUIS réclamer l'orphelin : le flux périmé a son writer
+     * MORT (producteur redéployé) mais reste « vivant » dans le domaine tant qu'un reader y est
+     * attaché et qu'aucun GC ne passe → une simple réouverture par nom retomberait DESSUS (c'est
+     * pourquoi le re-câble immédiat ne suffisait qu'après un délai laissant le GC opérer). On force
+     * donc le GC ici → open_reader (tour suivant) résout le NOUVEAU flux vivant du producteur. */
+    mxlReleaseFlowReader(g_mxl, t->reader); t->reader = NULL;
+    mxlGarbageCollectFlows(g_mxl);
+  }
 }
 
 /* Dernier grain dispo (NON bloquant) → 0 + (gi,payload), ou -1. Flux recréé (producteur redéployé)
@@ -746,6 +774,7 @@ static void* video_tx_thread(void* arg) {
           memcpy(dst, payload, out_size < _gs ? out_size : _gs);
         }
         latched_fi = gi.index;
+        tx_reopen_if_stale(t, gi.index, tnow);   /* flux figé (producteur redéployé) → reconnexion */
         /* IDENT entrelacé : positionné en espace TRAME → différé (champ = ½ hauteur). TODO champ-aware. */
       } else {
         memset(dst, 0, out_size);                  /* pas de grain → champ neutre */
@@ -781,6 +810,7 @@ static void* video_tx_thread(void* arg) {
         /* IDENT : dst est une trame pleine planaire TOUJOURS 10-bit (input_fmt PLANAR10LE). */
         if (t->has_ident) { load_ident_patch(t); overlay_ident(s, t, dst, 10); }
         t->index = gi.index;
+        tx_reopen_if_stale(t, gi.index, tnow);   /* flux figé (producteur redéployé) → reconnexion */
       } else {
         memset(dst, 0, out_size);               /* pas de grain → trame neutre */
       }
