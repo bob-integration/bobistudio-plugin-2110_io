@@ -153,6 +153,7 @@ struct target {
   uint64_t recv;           /* compteur reçu (pour le débit) */
   uint64_t late;           /* TX vidéo : trames en retard (get_frame > 1,5 période = epoch raté) */
   uint64_t last_feed_ns;   /* TX vidéo : instant (monotone) du dernier get_frame réussi */
+  int      dbg_depth_logged; /* TX vidéo : log one-shot grainSize/out_size/_src8 au 1er grain */
   uint64_t field_base;     /* TX entrelacé : index du 1er champ de la trame émise (MÊME trame pour les
                             * 2 champs → anti-peigne). Parité = TOP(pair) en TFF, BOTTOM(impair) en BFF. */
   /* RX vidéo : latence de réception (segment A = capture média → écriture shm), moyenne glissante
@@ -725,13 +726,24 @@ static void* video_tx_thread(void* arg) {
       uint8_t* dst = (uint8_t*)frame->addr[0];
       mxlGrainInfo gi; uint8_t* payload;
       if (reader_field(t, sf, s->tff, &gi, &payload) == 0) {
-        size_t _ncp = s->slotsize;                 /* taille CHAMP du grain */
-        if (gi.grainSize && (size_t)gi.grainSize < _ncp) _ncp = gi.grainSize;
-        if (s->bit_depth == 8) {
+        /* MXL-NATIF : profondeur SOURCE dérivée du GRAIN, PAS de s->bit_depth (cf. branche
+         * progressive). Détection robuste : grain = 1 CHAMP en entrelacé → taille 8-bit attendue
+         * = 2·w·(h/2) ; 8-bit si grainSize == exp8 OU == moitié d'out_size (= champ 10-bit). */
+        size_t _gs = (size_t)gi.grainSize;
+        size_t _exp8 = (size_t)2 * (size_t)s->width * ((size_t)s->height / 2);   /* CHAMP */
+        int _src8 = (_gs > 0 && (_gs == _exp8 || _gs * 2 == out_size));
+        if (!t->dbg_depth_logged) {
+          fprintf(stderr, "mtl_rx[video TX dbg i] shm=%s grainSize=%zu out_size=%zu exp8(2w·h/2)=%zu "
+                  "gs2==out=%d gs==exp8=%d _src8=%d\n",
+                  t->shm_path, _gs, out_size, _exp8,
+                  (int)(_gs * 2 == out_size), (int)(_gs == _exp8), _src8);
+          t->dbg_depth_logged = 1;
+        }
+        if (_src8) {
           uint16_t* d16 = (uint16_t*)dst;
-          for (size_t k = 0; k < _ncp; k++) d16[k] = (uint16_t)payload[k] << 2;   /* 8→10 */
+          for (size_t k = 0; k < _gs; k++) d16[k] = (uint16_t)payload[k] << 2;   /* 8→10 */
         } else {
-          memcpy(dst, payload, out_size < _ncp ? out_size : _ncp);
+          memcpy(dst, payload, out_size < _gs ? out_size : _gs);
         }
         latched_fi = gi.index;
         /* IDENT entrelacé : positionné en espace TRAME → différé (champ = ½ hauteur). TODO champ-aware. */
@@ -744,12 +756,27 @@ static void* video_tx_thread(void* arg) {
       mxlGrainInfo gi; uint8_t* payload;
       uint8_t* dst = (uint8_t*)frame->addr[0];
       if (reader_latest(t, &gi, &payload) == 0) {
-        if (s->bit_depth == 8) {
+        /* MXL-NATIF : profondeur SOURCE dérivée du GRAIN (flux auto-descriptif), PAS de s->bit_depth
+         * (valeur poussée — au câblage à chaud la session TX défaute à bit_depth=10, donc une source
+         * 8-bit comme la multiview était versée brute dans le buffer 10-bit → sortie 2110 VERTE).
+         * Détection ROBUSTE immune au padding : 8-bit si grainSize == taille planar 8-bit attendue
+         * (géométrie, 422 : Y+Cb+Cr = 2·w·h) OU == moitié d'out_size (buffer libmtl 10-bit). Une
+         * vraie source 10-bit (grain == out_size == 2·exp8) ne déclenche aucune des deux → memcpy. */
+        size_t _gs = (size_t)gi.grainSize;
+        size_t _exp8 = (size_t)2 * (size_t)s->width * (size_t)s->height;
+        int _src8 = (_gs > 0 && (_gs == _exp8 || _gs * 2 == out_size));
+        if (!t->dbg_depth_logged) {
+          fprintf(stderr, "mtl_rx[video TX dbg] shm=%s grainSize=%zu out_size=%zu exp8(2wh)=%zu "
+                  "gs2==out=%d gs==exp8=%d _src8=%d\n",
+                  t->shm_path, _gs, out_size, _exp8,
+                  (int)(_gs * 2 == out_size), (int)(_gs == _exp8), _src8);
+          t->dbg_depth_logged = 1;
+        }
+        if (_src8) {
           uint16_t* d16 = (uint16_t*)dst;
-          size_t n = s->slotsize;               /* 8 bits : slotsize octets = n échantillons */
-          for (size_t k = 0; k < n; k++) d16[k] = (uint16_t)payload[k] << 2;   /* 8→10 */
+          for (size_t k = 0; k < _gs; k++) d16[k] = (uint16_t)payload[k] << 2;   /* 8→10 */
         } else {
-          memcpy(dst, payload, out_size < s->slotsize ? out_size : s->slotsize);
+          memcpy(dst, payload, out_size < _gs ? out_size : _gs);
         }
         /* IDENT : dst est une trame pleine planaire TOUJOURS 10-bit (input_fmt PLANAR10LE). */
         if (t->has_ident) { load_ident_patch(t); overlay_ident(s, t, dst, 10); }
