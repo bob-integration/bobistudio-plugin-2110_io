@@ -1,7 +1,11 @@
 {
-  "version": "0.29.8",
-  "date": "2026-06-25",
+  "version": "0.29.9",
+  "date": "2026-06-26",
   "changes": {
+    "Fix : profondeur TX dérivée du SHM (sortie 2110 VERTE) — MXL-natif (0.29.9)": [
+      "Une sortie TX virait au VERT (grosses perturbations) quand sa source était 8-bit (ex. multiview) et qu'elle avait été câblée À CHAUD. Cause : la session TX, créée par le câblage hot, prenait bit_depth=10 (défaut jint quand le JSON ne le porte pas) → la conversion 8→10 (up-shift <<2) était SAUTÉE → le grain 8-bit était versé tel quel (memcpy) dans le buffer libmtl TOUJOURS 10-bit → octets décalés → vert. Un redéploiement (push_tx_slots envoie bit_depth=8) corrigeait par hasard.",
+      "Fix MXL-natif : video_tx_thread (progressif ET entrelacé champ-natif) DÉRIVE désormais la profondeur de la SOURCE du GRAIN lui-même (flux auto-descriptif) au lieu de s->bit_depth (valeur poussée). Détection ROBUSTE immune au padding : source = 8-bit si grainSize matche la taille planar 8-bit ATTENDUE depuis la géométrie (2·w·h octets, = ce qu'un producteur 8-bit publie) OU vaut la moitié du buffer libmtl 10-bit (out_size = st20p_tx_frame_size) → up-shift <<2. Une vraie source 10-bit (grain == out_size, ni == exp8 ni == out_size/2) ne déclenche aucune des deux → memcpy direct. Immunise contre toute valeur de bit_depth fausse/manquante ET tout padding éventuel de out_size, quel que soit le chemin (hot ou deploy). Un log one-shot par cible TX trace grainSize/out_size/exp8/_src8 sur stderr. REBUILD IMAGE bobi-mtl REQUIS."
+    ],
     "Fix : _SCALE manquant pour les barres de couleur (0.29.8)": [
       "0.29.7 référençait _SCALE non défini → txgen erreur 'name _SCALE is not defined', mire pas produite. Ajout de _SCALE (8-bit réf → profondeur courante)."
     ],
