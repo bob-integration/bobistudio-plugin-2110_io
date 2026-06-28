@@ -1,7 +1,22 @@
 {
-  "version": "0.29.10",
-  "date": "2026-06-26",
+  "version": "0.29.13",
+  "date": "2026-06-28",
   "changes": {
+    "Générateur audio : PRÉCÉDENCE sur la source réelle (écrase le RX 2110-30) (REBUILD, 0.29.13)": [
+      "Symptôme : activer le générateur de tonalité sur un slot qui reçoit un audio 2110-30 réel ne changeait rien — on continuait de voir la source d'origine moduler (le générateur restait en veille).",
+      "Cause : depuis 0.29.12, le générateur n'écrivait que si AUCUN audio réel n'était reçu (_audio_live). Sur un slot avec audio réel abonné, il ne prenait jamais la main.",
+      "Fix : précédence du générateur, comme la tonalité TX écrase le câble. Quand la tonalité est activée sur un slot, _manager_loop NE crée PAS la session RX audio (mtl_rx cesse d'écrire le flux) et _audio_live passe à False → _simu_audio_loop écrit la tonalité. Le simu loop attend que _audio_live tombe à False (piloté par le manager) avant d'écrire → pas de conflit double-writer sur le shm. Toggle réversible : désactiver la tonalité recrée la session RX réelle. REBUILD IMAGE bobi-mtl REQUIS."
+    ],
+    "Fix : générateur audio simu gaté sur la liveness AUDIO, pas vidéo (REBUILD, 0.29.12)": [
+      "Symptôme : un slot avec la VIDÉO live (mtl_rx) mais SANS audio reçu n'avait NI audio source NI générateur — la tonalité de simu refusait de s'écrire. Un slot en simu vidéo (générateur), lui, fonctionnait.",
+      "Cause : _simu_audio_loop était gaté sur _live[idx] (liveness VIDÉO). Vidéo live ⇒ générateur audio en veille, alors que l'audio n'était pas reçu → flux audio vide.",
+      "Fix : suivi de la liveness AUDIO par slot (_audio_live[idx], = SDP 2110-30 actif, mis à jour dans _manager_loop) et gating du générateur dessus. La tonalité s'écrit dès qu'aucun audio RÉEL n'est reçu sur le slot, indépendamment de la vidéo ; un audio 2110-30 réel reprend la main automatiquement (le consommateur se reconnecte). Aucun conflit d'écriture (mtl_rx n'écrit l'audio que si une session audio existe). REBUILD IMAGE bobi-mtl REQUIS."
+    ],
+    "Générateur de TONALITÉ audio en SIMULATION (RX) — VU-mètres consommateurs (REBUILD, 0.29.11)": [
+      "Symptôme : une entrée RX en simu (mire) montrait bien la vidéo dans un consommateur (ex. multiview/quad) mais AUCUN audio — les VU-mètres restaient vides même en activant le « générateur audio ».",
+      "Cause : (1) le générateur de mire simu (_simu_loop) n'écrivait QUE la vidéo, jamais le flux audio dérivé {hn}_audio_{idx} que lit le consommateur ; (2) le handler de contrôle /gen ignorait essence : un toggle « générateur audio » (essence=audio) basculait en réalité le gen VIDÉO du slot, sans effet audio.",
+      "Fix : nouvelle boucle _simu_audio_loop(idx) — un thread par slot RX audio — qui écrit une sinusoïde (défaut 1 kHz/-18 dBFS, 8 ch, ruptage 0,9/0,1) dans le FLUX MXL {hn}_audio_{idx} TANT QUE le slot est en simu (pas servi par mtl_rx) ET que le générateur audio est activé. /gen essence=audio pilote désormais ce générateur (_sim_tone par slot : enabled/freq/level_db/active/rupted), symétrique du générateur de tonalité TX. REBUILD IMAGE bobi-mtl REQUIS."
+    ],
     "Fix : sortie TX figée quand le producteur (multiview) est redéployé — reconnexion du flux (0.29.10)": [
       "Symptôme : en (re)déployant un multiview câblé sur une sortie TX, l'image émise se FIGEAIT jusqu'à ce qu'on défasse/refasse le câble. Capturé en trace : la latence d'entrée du TX sur le shm du multiview croissait linéairement (930 ms → 17 s+) = le TX relisait éternellement le même grain.",
       "Cause : un producteur redéployé DÉTRUIT puis RECRÉE son flux MXL SOUS LE MÊME NOM. L'ancien ring orphelin reste lisible → reader_latest/reader_field renvoient indéfiniment le dernier grain (index figé, AUCUNE erreur MXL → le reader n'était jamais libéré). Seul un re-câble (:8082/input) forçait la réouverture. Le handler SIGBUS ne couvre pas ce cas (recréation MXL silencieuse, pas de SIGBUS).",

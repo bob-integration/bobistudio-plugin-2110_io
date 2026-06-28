@@ -771,7 +771,25 @@ class ControlHandler(BaseHTTPRequestHandler):
             idx = -1
         if not (0 <= idx < N_VIDEO):
             return self._json(400, {"error": "idx hors limites"})
-        if path == "/gen":          # bascule générateur simu (force la mire sur ce slot)
+        if path == "/gen":          # bascule générateur simu : mire VIDÉO ou TONALITÉ audio (essence)
+            if body.get("essence") == "audio":   # générateur de tonalité de la simu RX (VU-mètres)
+                with _sim_tone_lock:
+                    tn = _sim_tone[idx]
+                    if "enabled" in body:
+                        tn["enabled"] = bool(body["enabled"])
+                    if "freq" in body:
+                        try: tn["freq"] = max(20, min(20000, int(body["freq"] or 1000)))
+                        except Exception: pass
+                    if "level_db" in body:
+                        try: tn["level_db"] = max(-60.0, min(0.0, float(body["level_db"])))
+                        except Exception: pass
+                    if isinstance(body.get("active"), list):
+                        tn["active"] = [bool(x) for x in body["active"][:A_CHANNELS]] + \
+                                       [False] * max(0, A_CHANNELS - len(body["active"]))
+                    if isinstance(body.get("rupted"), list):
+                        tn["rupted"] = [bool(x) for x in body["rupted"][:A_CHANNELS]] + \
+                                       [False] * max(0, A_CHANNELS - len(body["rupted"]))
+                return self._json(200, {"ok": True})
             with _ctl_lock:
                 _ctl[idx]["gen"] = bool(body.get("enabled"))
                 if "pattern" in body:
@@ -973,6 +991,8 @@ _mtl_proc = None
 _mtl_lock = threading.Lock()
 _cur_sig = None
 _live = [False] * N_VIDEO     # slot vidéo idx actuellement servi par mtl_rx ?
+_audio_live = [False] * N_AUDIO   # slot audio idx servi par mtl_rx (SDP 2110-30 actif) ? — INDÉPENDANT
+                                  # de la vidéo : un slot peut avoir la vidéo live SANS audio reçu.
 _last_launch = 0.0            # horodatage du dernier (re)lancement de mtl_rx
 _fail_streak = 0             # échecs rapides consécutifs (backoff)
 
@@ -1016,6 +1036,13 @@ def _default_tone():
     return {"enabled": False, "freq": 1000, "level_db": -18.0,
             "active": [True] * A_CHANNELS, "rupted": [False] * A_CHANNELS}
 _tx_tone = [[_default_tone() for _ in range(2)] for _ in range(N_TX)]
+
+# Générateur de TONALITÉ de SIMULATION (RX) par slot vidéo — pendant audio de la mire vidéo simu.
+# Quand le slot N'EST PAS servi par mtl_rx (simu) et que le générateur audio est activé (UI →
+# /gen essence=audio), on écrit une sinusoïde dans son FLUX AUDIO ({hn}_audio_{idx}), que les
+# consommateurs (multiview…) lisent pour leurs VU-mètres. Même forme/ruptage que _tx_tone.
+_sim_tone = [_default_tone() for _ in range(N_VIDEO)]
+_sim_tone_lock = threading.Lock()
 
 
 def _tx_lat_monitor():
@@ -1618,10 +1645,18 @@ def _manager_loop():
             _live[idx] = idx in active
 
         # Sessions RX audio (2110-30) : SDP audio actif → écrit /dev/shm/{hn}_audio_{idx} en L24 BE.
+        # _audio_live[idx] pilote le générateur de tonalité simu (_simu_audio_loop) : tonalité écrite
+        # SEULEMENT si aucun audio RÉEL n'écrit le flux (indépendant de la liveness vidéo).
+        # PRÉCÉDENCE du GÉNÉRATEUR : si la tonalité est activée sur un slot, elle ÉCRASE la source
+        # réelle — on NE crée PAS la session RX audio (mtl_rx cesse d'écrire le flux) et _audio_live
+        # passe à False → _simu_audio_loop prend la main (évite le conflit double-writer sur le shm).
         for idx in range(N_AUDIO):
             apath = "{}/nmos_recv_a_{}.sdp".format(SDP_DIR, idx)
             ainfo = _parse_sdp_audio(apath) if os.path.exists(apath) else None
-            if ainfo:
+            with _sim_tone_lock:
+                gen_on = bool(_sim_tone[idx]["enabled"]) if idx < len(_sim_tone) else False
+            _audio_live[idx] = bool(ainfo) and not gen_on
+            if ainfo and not gen_on:
                 sessions.append(_audio_session(idx, ainfo))
 
         # Sessions RX ANC (2110-40) : SDP smpte291 actif → écrit /dev/shm/{hn}_anc_{idx} + timecode.
@@ -1925,6 +1960,60 @@ def _txgen_audio_loop(idx, ai):
         time.sleep(0.001)   # 1ms
 
 
+def _simu_audio_loop(idx):
+    """Tonalité de SIMULATION sur le FLUX MXL audio du slot ({hn}_audio_{idx}) TANT QUE le slot
+    n'est PAS servi par mtl_rx (live) ET que le générateur audio est activé (_sim_tone[idx]).
+    Donne un signal aux VU-mètres des consommateurs (multiview…) quand l'entrée est en mire.
+    Pendant RX de _txgen_audio_loop : mêmes buffers 1 s (ruptage 0,9 ON / 0,1 OFF), float32 8ch."""
+    SR = 48000
+    N = SR // 1000                                # 48 éch. = 1 ms
+    name = "{}_audio_{}".format(HOSTNAME, idx)
+    writer = None; fi = 0
+    sig = None; buf_on = None; buf_off = None
+    def _close():
+        nonlocal writer
+        if writer is not None:
+            try: writer.close()
+            except Exception: pass
+        writer = None
+    while True:
+        with _sim_tone_lock:
+            tone = dict(_sim_tone[idx])
+        # AUDIO live (mtl_rx possède le flux audio = SDP 2110-30 actif) ou MXL absent ou tonalité off
+        # → veille, flux fermé. NB : gating sur la liveness AUDIO, PAS vidéo — un slot à vidéo live
+        # mais sans audio reçu DOIT pouvoir servir la tonalité générée (sinon « ni source ni gén »).
+        audio_live = _audio_live[idx] if idx < len(_audio_live) else False
+        if audio_live or not _HAS_MXL or not tone.get("enabled"):
+            if writer is not None: _close()
+            sig = None
+            time.sleep(0.1)
+            continue
+        try:
+            if writer is None:
+                writer = bobimxl.AudioWriter(_mxl(), name, channels=A_CHANNELS,
+                                             sample_rate=SR, index_mode="tai")
+            active = (tone.get("active") or [])
+            rupted = (tone.get("rupted") or [])
+            freq = int(tone.get("freq") or 1000)
+            level = float(tone.get("level_db") if tone.get("level_db") is not None else -18.0)
+            on_mask  = [bool(active[c]) if c < len(active) else False for c in range(A_CHANNELS)]
+            off_mask = [on_mask[c] and not (c < len(rupted) and bool(rupted[c])) for c in range(A_CHANNELS)]
+            nsig = (freq, level, tuple(on_mask), tuple(off_mask))
+            if nsig != sig:
+                buf_on  = _build_tone_second(freq, level, on_mask)
+                buf_off = _build_tone_second(freq, level, off_mask)
+                sig = nsig
+            c = fi % 1000                            # position dans la seconde (ruptage)
+            src = buf_on if c < 900 else buf_off
+            chunk = src[c * N:(c + 1) * N]
+            writer.write(chunk)                      # (48,8) float32 → index TAI interne
+        except Exception as e:
+            print("simu audio err idx={}: {}".format(idx, e), flush=True)
+            _close(); sig = None; time.sleep(0.2); continue
+        fi += 1
+        time.sleep(0.001)   # 1ms
+
+
 def _cleanup(*a):
     # Arrêt du conteneur : teardown gracieux du daemon (SIGTERM → free sessions + mtl_stop/uninit)
     # puis purge XDP (_kill_mtl). C'est le SEUL endroit qui arrête mtl_rx (plus de kill par changement).
@@ -1940,6 +2029,8 @@ signal.signal(signal.SIGINT, _cleanup)
 # UN manager central qui pilote l'unique mtl_rx multi-session.
 for _i in range(N_VIDEO):
     threading.Thread(target=_simu_loop, args=(_i,), daemon=True).start()
+    if _i < N_AUDIO:        # tonalité de simu sur le flux audio dérivé du slot (VU-mètres consommateurs)
+        threading.Thread(target=_simu_audio_loop, args=(_i,), daemon=True).start()
 threading.Thread(target=_manager_loop, daemon=True).start()
 # Générateur TX : un thread vidéo + 2 threads audio par slot TX (restent en veille si gen off).
 for _i in range(N_TX):
