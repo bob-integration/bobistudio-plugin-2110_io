@@ -22,12 +22,13 @@
 
 # ---------------------------------------------------------------- étage builder : compiler libmxl
 FROM debian:trixie-slim AS mxl-builder
-ARG MXL_REF=v1.0.1
+ARG MXL_REF=v1.1.0-beta-1
 ENV DEBIAN_FRONTEND=noninteractive
 ENV VCPKG_ROOT=/opt/vcpkg
 RUN apt-get update && apt-get install -y --no-install-recommends \
       git ca-certificates build-essential cmake ninja-build pkg-config \
       autoconf automake autoconf-archive libtool nasm bison flex libpcap-dev \
+      libfabric-dev \
       curl zip unzip tar \
  && rm -rf /var/lib/apt/lists/*
 RUN git clone https://github.com/microsoft/vcpkg.git "$VCPKG_ROOT" \
@@ -41,7 +42,7 @@ RUN cmake -S . -B build -G Ninja \
       -DCMAKE_C_COMPILER=gcc -DCMAKE_CXX_COMPILER=g++ \
       -DBUILD_SHARED_LIBS=ON -DBUILD_TOOLS=ON \
       -DBUILD_DOCS=OFF -DBUILD_TESTS=OFF -DBUILD_UTILS=OFF \
-      -DMXL_ENABLE_FABRICS_OFI=OFF \
+      -DMXL_ENABLE_FABRICS_OFI=ON \
       -DCMAKE_INSTALL_PREFIX=/opt/mxl-install \
       || { echo "===== vcpkg-manifest-install.log ====="; \
            tail -n 120 /src/mxl/build/vcpkg-manifest-install.log 2>/dev/null; \
@@ -64,6 +65,7 @@ ENV PKG_CONFIG_PATH=/usr/local/lib/x86_64-linux-gnu/pkgconfig:/usr/local/lib/pkg
 RUN apt-get update && apt-get install -y --no-install-recommends \
       git build-essential meson ninja-build pkg-config python3-pyelftools \
       libnuma-dev libssl-dev libjson-c-dev libpcap-dev rdma-core libibverbs-dev \
+      libfabric1 \
       libcap-ng-dev m4 sudo unzip cmake systemtap-sdt-dev libgtest-dev libgmock-dev \
       libxdp-dev libbpf-dev libelf-dev clang llvm gcc-multilib \
       ca-certificates iproute2 ethtool wget curl \
