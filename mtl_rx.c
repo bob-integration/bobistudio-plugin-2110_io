@@ -98,6 +98,32 @@ static uint64_t media_ts_to_tai(mtl_handle st, enum st10_timestamp_fmt tfmt,
  * Domaine surchargeable par MXL_DOMAIN (isole un banc). Créée dans main(), à vie. */
 static mxlInstance g_mxl = NULL;
 
+/* ── Ports MTL (NIC) du device ── un mtl_init unique peut déclarer plusieurs NIC média
+ * (MTL_PORT_MAX). Remplis à l'init, puis résolus PAR SESSION via le nom d'iface (multi-NIC :
+ * chaque session vise la NIC qui porte physiquement son mcast — AF-XDP, pas d'auto-sélection). */
+struct mtl_port_ent { char iface[64]; char portname[MTL_PORT_MAX_LEN]; };
+static struct mtl_port_ent g_ports[MTL_PORT_MAX];
+static int g_nports = 0;
+
+/* Nom de port MTL selon le PMD : native_af_xdp:<if> / kernel:<if> / <if> (PCI/dpdk). */
+static void build_portname(const char* pmd, const char* iface, char out[MTL_PORT_MAX_LEN]) {
+  if (!strcmp(pmd, "af_xdp"))      snprintf(out, MTL_PORT_MAX_LEN, "native_af_xdp:%s", iface);
+  else if (!strcmp(pmd, "kernel")) snprintf(out, MTL_PORT_MAX_LEN, "kernel:%s", iface);
+  else                             snprintf(out, MTL_PORT_MAX_LEN, "%s", iface);
+}
+
+/* Résout un nom d'iface vers le portname MTL initialisé. iface vide → port 0 (mono-NIC).
+ * Renvoie l'index de port (≥0) ; -1 si l'iface est demandée mais inconnue du device → `out` reste
+ * vide et l'appelant (reconcile) remonte `unknown_iface`. */
+static int resolve_port(const char* iface, char out[MTL_PORT_MAX_LEN]) {
+  out[0] = '\0';
+  if (g_nports <= 0) return -1;
+  if (!iface || !iface[0]) { snprintf(out, MTL_PORT_MAX_LEN, "%s", g_ports[0].portname); return 0; }
+  for (int k = 0; k < g_nports; k++)
+    if (!strcmp(g_ports[k].iface, iface)) { snprintf(out, MTL_PORT_MAX_LEN, "%s", g_ports[k].portname); return k; }
+  return -1;
+}
+
 /* Namespace UUIDv5 Bobi.Studio = uuid5(NAMESPACE_DNS, "mxl.bobi.studio") — DOIT être identique à
  * bobimxl._NS_BOBI (sinon les flux écrits ici ne sont pas trouvés par les consommateurs Python). */
 static const uint8_t NS_BOBI[16] = {
@@ -173,7 +199,13 @@ struct sess {
   enum sess_kind kind;
   enum sess_role role;      /* RX (wire→shm) ou TX (shm→wire) */
   mtl_handle st;            /* partagé (mtl_init unique) */
-  char portname[MTL_PORT_MAX_LEN];
+  char portname[MTL_PORT_MAX_LEN];   /* leg primaire (NIC résolue depuis `iface`) */
+  char iface[64];           /* nom de NIC du leg primaire ('' = port 0 / mono-NIC) */
+  /* ── 2022-7 (leg redondant red/blue) — conçu mais NON émis par le socle (num_leg=1) ── */
+  char portname_r[MTL_PORT_MAX_LEN]; /* leg redondant (vide = mono-leg) */
+  char iface_r[64];         /* nom de NIC du leg redondant */
+  char mcast_r[64]; int udp_port_r;  /* mcast/port de la 2ᵉ patte */
+  int  num_leg;             /* 1 (socle) ou 2 (2022-7) */
   /* réseau */
   char mcast[64];
   int  udp_port, payload_type;
@@ -602,10 +634,15 @@ static int setup_video(struct sess* s) {
   struct st20p_rx_ops ops; memset(&ops, 0, sizeof(ops));
   ops.name = "bobi_mtl_v";
   ops.priv = s;
-  ops.port.num_port = 1;
+  ops.port.num_port = s->num_leg;
   inet_pton(AF_INET, s->mcast, ops.port.ip_addr[MTL_SESSION_PORT_P]);
   snprintf(ops.port.port[MTL_SESSION_PORT_P], MTL_PORT_MAX_LEN, "%s", s->portname);
   ops.port.udp_port[MTL_SESSION_PORT_P] = s->udp_port;
+  if (s->num_leg == 2) {   /* 2022-7 : 2ᵉ patte red/blue */
+    inet_pton(AF_INET, s->mcast_r, ops.port.ip_addr[MTL_SESSION_PORT_R]);
+    snprintf(ops.port.port[MTL_SESSION_PORT_R], MTL_PORT_MAX_LEN, "%s", s->portname_r);
+    ops.port.udp_port[MTL_SESSION_PORT_R] = s->udp_port_r;
+  }
   ops.port.payload_type = s->payload_type;
   ops.width = s->width; ops.height = s->height; ops.fps = to_st_fps(s->fps);
   ops.interlaced = s->interlaced ? true : false;
@@ -832,10 +869,15 @@ static int setup_video_tx(struct sess* s) {
   struct st20p_tx_ops ops; memset(&ops, 0, sizeof(ops));
   ops.name = "bobi_mtl_vtx";
   ops.priv = s;
-  ops.port.num_port = 1;
+  ops.port.num_port = s->num_leg;
   inet_pton(AF_INET, s->mcast, ops.port.dip_addr[MTL_SESSION_PORT_P]);   /* destination */
   snprintf(ops.port.port[MTL_SESSION_PORT_P], MTL_PORT_MAX_LEN, "%s", s->portname);
   ops.port.udp_port[MTL_SESSION_PORT_P] = s->udp_port;
+  if (s->num_leg == 2) {   /* 2022-7 : 2ᵉ patte red/blue */
+    inet_pton(AF_INET, s->mcast_r, ops.port.dip_addr[MTL_SESSION_PORT_R]);
+    snprintf(ops.port.port[MTL_SESSION_PORT_R], MTL_PORT_MAX_LEN, "%s", s->portname_r);
+    ops.port.udp_port[MTL_SESSION_PORT_R] = s->udp_port_r;
+  }
   ops.port.payload_type = s->payload_type;
   /* CADENCE ENTRELACÉ (fix racine du peigne) : libmtl TX entrelacé avec fps=cadence TRAME (P25)
    * pace get_frame à la période TRAME (40 ms) → 1 champ/40 ms = 25 champs/s = MOITIÉ de 1080i50 →
@@ -868,10 +910,15 @@ static int setup_audio(struct sess* s) {
   struct st30p_rx_ops ops; memset(&ops, 0, sizeof(ops));
   ops.name = "bobi_mtl_a";
   ops.priv = s;
-  ops.port.num_port = 1;
+  ops.port.num_port = s->num_leg;
   inet_pton(AF_INET, s->mcast, ops.port.ip_addr[MTL_SESSION_PORT_P]);
   snprintf(ops.port.port[MTL_SESSION_PORT_P], MTL_PORT_MAX_LEN, "%s", s->portname);
   ops.port.udp_port[MTL_SESSION_PORT_P] = s->udp_port;
+  if (s->num_leg == 2) {   /* 2022-7 : 2ᵉ patte red/blue */
+    inet_pton(AF_INET, s->mcast_r, ops.port.ip_addr[MTL_SESSION_PORT_R]);
+    snprintf(ops.port.port[MTL_SESSION_PORT_R], MTL_PORT_MAX_LEN, "%s", s->portname_r);
+    ops.port.udp_port[MTL_SESSION_PORT_R] = s->udp_port_r;
+  }
   ops.port.payload_type = s->payload_type;
   ops.fmt = ST30_FMT_PCM24;
   ops.channel = (uint16_t)s->channels;
@@ -960,10 +1007,15 @@ static int setup_audio_tx(struct sess* s) {
   struct st30p_tx_ops ops; memset(&ops, 0, sizeof(ops));
   ops.name = "bobi_mtl_atx";
   ops.priv = s;
-  ops.port.num_port = 1;
+  ops.port.num_port = s->num_leg;
   inet_pton(AF_INET, s->mcast, ops.port.dip_addr[MTL_SESSION_PORT_P]);   /* destination */
   snprintf(ops.port.port[MTL_SESSION_PORT_P], MTL_PORT_MAX_LEN, "%s", s->portname);
   ops.port.udp_port[MTL_SESSION_PORT_P] = s->udp_port;
+  if (s->num_leg == 2) {   /* 2022-7 : 2ᵉ patte red/blue */
+    inet_pton(AF_INET, s->mcast_r, ops.port.dip_addr[MTL_SESSION_PORT_R]);
+    snprintf(ops.port.port[MTL_SESSION_PORT_R], MTL_PORT_MAX_LEN, "%s", s->portname_r);
+    ops.port.udp_port[MTL_SESSION_PORT_R] = s->udp_port_r;
+  }
   ops.port.payload_type = s->payload_type;
   ops.fmt = ST30_FMT_PCM24;
   ops.channel = (uint16_t)s->channels;
@@ -1089,10 +1141,15 @@ static int setup_data(struct sess* s) {
   struct st40p_rx_ops ops; memset(&ops, 0, sizeof(ops));
   ops.name = "bobi_mtl_d";
   ops.priv = s;
-  ops.port.num_port = 1;
+  ops.port.num_port = s->num_leg;
   inet_pton(AF_INET, s->mcast, ops.port.ip_addr[MTL_SESSION_PORT_P]);
   snprintf(ops.port.port[MTL_SESSION_PORT_P], MTL_PORT_MAX_LEN, "%s", s->portname);
   ops.port.udp_port[MTL_SESSION_PORT_P] = s->udp_port;
+  if (s->num_leg == 2) {   /* 2022-7 : 2ᵉ patte red/blue */
+    inet_pton(AF_INET, s->mcast_r, ops.port.ip_addr[MTL_SESSION_PORT_R]);
+    snprintf(ops.port.port[MTL_SESSION_PORT_R], MTL_PORT_MAX_LEN, "%s", s->portname_r);
+    ops.port.udp_port[MTL_SESSION_PORT_R] = s->udp_port_r;
+  }
   ops.port.payload_type = s->payload_type;
   ops.framebuff_cnt = 4;
   ops.max_udw_buff_size = s->max_udw;
@@ -1117,10 +1174,15 @@ static int setup_data_tx(struct sess* s) {
   struct st40p_tx_ops ops; memset(&ops, 0, sizeof(ops));
   ops.name = "bobi_mtl_dtx";
   ops.priv = s;
-  ops.port.num_port = 1;
+  ops.port.num_port = s->num_leg;
   inet_pton(AF_INET, s->mcast, ops.port.dip_addr[MTL_SESSION_PORT_P]);   /* destination */
   snprintf(ops.port.port[MTL_SESSION_PORT_P], MTL_PORT_MAX_LEN, "%s", s->portname);
   ops.port.udp_port[MTL_SESSION_PORT_P] = s->udp_port;
+  if (s->num_leg == 2) {   /* 2022-7 : 2ᵉ patte red/blue */
+    inet_pton(AF_INET, s->mcast_r, ops.port.dip_addr[MTL_SESSION_PORT_R]);
+    snprintf(ops.port.port[MTL_SESSION_PORT_R], MTL_PORT_MAX_LEN, "%s", s->portname_r);
+    ops.port.udp_port[MTL_SESSION_PORT_R] = s->udp_port_r;
+  }
   ops.port.payload_type = s->payload_type;
   ops.fps = to_st_fps(s->fps);
   ops.interlaced = false;
@@ -1174,6 +1236,22 @@ static int parse_session_into(struct json_object* j, struct sess* s) {
   snprintf(s->mcast,sizeof(s->mcast),"%s",jstr(j,"mcast",""));
   s->udp_port=jint(j,"udp_port",0); s->payload_type=jint(j,"payload_type",96);
   s->ring=jint(j,"ring", s->kind==K_AUDIO?100:8); s->hdr=jint(j,"hdr",64);
+  /* multi-NIC : `iface` (leg primaire) → portname résolu (vide = iface inconnu, détecté au create).
+   * `iface` absent → port 0 (mono-NIC). 2022-7 : `iface2`/`mcast2`/`udp_port2` = 2ᵉ leg (red/blue). */
+  snprintf(s->iface, sizeof(s->iface), "%s", jstr(j,"iface",""));
+  resolve_port(s->iface, s->portname);
+  const char* ifn2 = jstr(j,"iface2","");
+  const char* mc2  = jstr(j,"mcast2","");
+  int up2 = jint(j,"udp_port2",0);
+  if (ifn2[0] && mc2[0] && up2) {
+    snprintf(s->iface_r, sizeof(s->iface_r), "%s", ifn2);
+    snprintf(s->mcast_r, sizeof(s->mcast_r), "%s", mc2);
+    s->udp_port_r = up2;
+    resolve_port(ifn2, s->portname_r);
+    s->num_leg = 2;
+  } else {
+    s->num_leg = 1;
+  }
   if (s->kind == K_VIDEO) {
     s->width=jint(j,"width",1920); s->height=jint(j,"height",1080);
     s->fps=jdbl(j,"fps",25.0); s->interlaced=jint(j,"interlaced",0);
@@ -1199,10 +1277,11 @@ static int parse_session_into(struct json_object* j, struct sess* s) {
 /* Signature = identité réseau + format + cibles. Un sig différent ⇒ on libère l'ancienne session et
  * on en recrée une (flow RX recyclé, device/XDP intacts ⇒ pas de faute PTP). */
 static void compute_sig(struct sess* s) {
-  int n = snprintf(s->sig, sizeof(s->sig), "%d|%d|%s|%d|%d|%dx%d|%.2f|i%d|f%d|bd%d|r%d|ch%d|ap%.3f|",
+  int n = snprintf(s->sig, sizeof(s->sig),
+                   "%d|%d|%s|%d|%d|%dx%d|%.2f|i%d|f%d|bd%d|r%d|ch%d|ap%.3f|if%s|if2%s|mc2%s|p2%d|",
                    s->role, s->kind, s->mcast, s->udp_port, s->payload_type,
                    s->width, s->height, s->fps, s->interlaced, s->tff, s->bit_depth, s->ring,
-                   s->channels, s->a_ptime);
+                   s->channels, s->a_ptime, s->iface, s->iface_r, s->mcast_r, s->udp_port_r);
   for (int ti = 0; ti < s->ntg && n > 0 && n < (int)sizeof(s->sig); ti++)
     n += snprintf(s->sig + n, sizeof(s->sig) - n, "%s>%s,",
                   s->tg[ti].shm_path, s->tg[ti].has_ident ? s->tg[ti].ident_file : "-");
@@ -1287,7 +1366,25 @@ static void reconcile(struct sess* reg, const char* path, mtl_handle st, const c
     if (slot < 0) { fprintf(stderr,"mtl_rx: registre plein, session ignorée\n"); continue; }
     struct sess* s = &reg[slot];
     *s = want;
-    s->st = st; snprintf(s->portname, sizeof(s->portname), "%s", portname); s->stop = 0;
+    s->st = st; s->stop = 0;
+    /* `iface` absent → portname déjà résolu sur le port 0 par parse. Repli mono-NIC ultime
+     * (g_ports vide) : le portname global du device. */
+    if (!s->portname[0] && !s->iface[0]) snprintf(s->portname, sizeof(s->portname), "%s", portname);
+    /* iface DEMANDÉE mais inconnue du device → pas de session, erreur explicite sur le slot. */
+    if (!s->portname[0]) {
+      fprintf(stderr,"mtl_rx: session %s:%d sur iface inconnue '%s' — ignorée\n",
+              s->mcast, s->udp_port, s->iface);
+      if (s->role != ROLE_TX)
+        for (int ti = 0; ti < s->ntg; ti++) write_stats_error(&s->tg[ti], "unknown_iface");
+      memset(s,0,sizeof(*s));
+      continue;
+    }
+    /* 2022-7 : leg redondant sur iface inconnue → dégrade en mono-leg (le primaire reste valide). */
+    if (s->num_leg == 2 && !s->portname_r[0]) {
+      fprintf(stderr,"mtl_rx: leg redondant %s:%d sur iface inconnue '%s' — mono-leg\n",
+              s->mcast_r, s->udp_port_r, s->iface_r);
+      s->num_leg = 1;
+    }
     int r = (s->role == ROLE_TX)
             ? ((s->kind == K_AUDIO) ? setup_audio_tx(s) : (s->kind == K_DATA) ? setup_data_tx(s) : setup_video_tx(s))
             : ((s->kind == K_AUDIO) ? setup_audio(s)    : (s->kind == K_DATA) ? setup_data(s)    : setup_video(s));
@@ -1395,18 +1492,42 @@ int main(int argc, char** argv) {
     int rx_q = jint(root,"rx_queues", 8);   /* plafond de sessions RX (= rx_count du moteur) */
     int tx_q = jint(root,"tx_queues", 1);   /* TX : Phase 2 (1 = file de contrôle IGMP/ARP) */
     int quota_mbs = jint(root,"quota_mbs", 5000);   /* Mb/s max par scheduler (lcore), cf. mtl_init */
-    json_object_put(root);
-    if (!iface[0]) { fprintf(stderr,"mtl_rx: config sans iface\n"); return 1; }
-
-    if (!strcmp(pmd,"af_xdp"))      snprintf(portname,sizeof(portname),"native_af_xdp:%s",iface);
-    else if (!strcmp(pmd,"kernel")) snprintf(portname,sizeof(portname),"kernel:%s",iface);
-    else                            snprintf(portname,sizeof(portname),"%s",iface);
-
     struct mtl_init_params p; memset(&p, 0, sizeof(p));
-    p.num_ports = 1;
-    snprintf(p.port[MTL_PORT_P], MTL_PORT_MAX_LEN, "%s", portname);
-    if (sip[0]) inet_pton(AF_INET, sip, p.sip_addr[MTL_PORT_P]);
-    p.pmd[MTL_PORT_P] = mtl_pmd_by_port_name(portname);
+    /* ── Ports (NIC) du device ── multi-NIC : tableau "ports":[{iface,sip,rx_queues,tx_queues}].
+     * Repli rétro-compat : "ports" absent → un seul port depuis les scalaires iface/sip/rx_queues/
+     * tx_queues (config legacy / mono-NIC). g_ports sert ensuite à résoudre session→port par iface. */
+    struct json_object* jports;
+    if (json_object_object_get_ex(root,"ports",&jports) && json_object_is_type(jports,json_type_array)) {
+      int np = json_object_array_length(jports);
+      for (int k = 0; k < np && g_nports < MTL_PORT_MAX; k++) {
+        struct json_object* pj = json_object_array_get_idx(jports, k);
+        const char* pif = jstr(pj,"iface","");
+        if (!pif[0]) continue;
+        int idx = g_nports++;
+        snprintf(g_ports[idx].iface, sizeof(g_ports[idx].iface), "%s", pif);
+        build_portname(pmd, pif, g_ports[idx].portname);
+        snprintf(p.port[idx], MTL_PORT_MAX_LEN, "%s", g_ports[idx].portname);
+        const char* psip = jstr(pj,"sip","");
+        if (psip[0]) inet_pton(AF_INET, psip, p.sip_addr[idx]);
+        p.pmd[idx] = mtl_pmd_by_port_name(g_ports[idx].portname);
+        int prxq = jint(pj,"rx_queues", 8), ptxq = jint(pj,"tx_queues", 1);
+        p.rx_queues_cnt[idx] = prxq > 0 ? prxq : 1;
+        p.tx_queues_cnt[idx] = ptxq > 0 ? ptxq : 1;
+      }
+    } else if (iface[0]) {   /* repli scalaire (mono-NIC) */
+      int idx = g_nports++;
+      snprintf(g_ports[idx].iface, sizeof(g_ports[idx].iface), "%s", iface);
+      build_portname(pmd, iface, g_ports[idx].portname);
+      snprintf(p.port[idx], MTL_PORT_MAX_LEN, "%s", g_ports[idx].portname);
+      if (sip[0]) inet_pton(AF_INET, sip, p.sip_addr[idx]);
+      p.pmd[idx] = mtl_pmd_by_port_name(g_ports[idx].portname);
+      p.rx_queues_cnt[idx] = rx_q > 0 ? rx_q : 1;
+      p.tx_queues_cnt[idx] = tx_q > 0 ? tx_q : 1;
+    }
+    json_object_put(root);
+    if (g_nports < 1) { fprintf(stderr,"mtl_rx: config sans port/iface\n"); return 1; }
+    p.num_ports = g_nports;
+    snprintf(portname, sizeof(portname), "%s", g_ports[0].portname);   /* défaut mono-NIC (reconcile) */
     /* AUTO_START_STOP : en AF_XDP le flow/XSK se crée AVEC le démarrage du device, déclenché par le
      * 1ᵉʳ st20p_rx_create (impossible de pré-démarrer un device vide : « add flow fail »). Le device
      * se start/stop au gré du nombre de sessions, mais le XDP reste attaché tant que mtl_init vit
@@ -1420,13 +1541,11 @@ int main(int argc, char** argv) {
     p.data_quota_mbs_per_sch = quota_mbs > 0 ? (uint32_t)quota_mbs : 0;
     p.log_level = MTL_LOG_LEVEL_INFO;
     p.lcores = lcores[0] ? lcores : NULL;
-    p.rx_queues_cnt[MTL_PORT_P] = rx_q > 0 ? rx_q : 1;
-    p.tx_queues_cnt[MTL_PORT_P] = tx_q > 0 ? tx_q : 1;
 
     mtl_handle st = mtl_init(&p);
     if (!st) { fprintf(stderr, "mtl_rx: mtl_init fail\n"); return 1; }
-    fprintf(stderr, "mtl_rx: daemon up (iface=%s rx_q=%d tx_q=%d) — réconciliation à chaud\n",
-            iface, rx_q, tx_q);
+    fprintf(stderr, "mtl_rx: daemon up (%d port(s), rx_q[0]=%u tx_q[0]=%u) — réconciliation à chaud\n",
+            g_nports, p.rx_queues_cnt[0], p.tx_queues_cnt[0]);
 
     long cfg_mtime = 0; struct stat cst;
     reconcile(reg, config, st, portname);                 /* état initial */
@@ -1452,9 +1571,7 @@ int main(int argc, char** argv) {
 
   /* ═══ LEGACY one-shot ═══ (tests manuels : 1 session vidéo depuis les args, pas de réconciliation) */
   if (!l_mcast || !l_port || !l_shm || !iface[0]) { usage(argv[0]); return 1; }
-  if (!strcmp(pmd,"af_xdp"))      snprintf(portname,sizeof(portname),"native_af_xdp:%s",iface);
-  else if (!strcmp(pmd,"kernel")) snprintf(portname,sizeof(portname),"kernel:%s",iface);
-  else                            snprintf(portname,sizeof(portname),"%s",iface);
+  build_portname(pmd, iface, portname);
 
   struct mtl_init_params p; memset(&p, 0, sizeof(p));
   p.num_ports = 1;
@@ -1472,7 +1589,7 @@ int main(int argc, char** argv) {
   mtl_handle st = mtl_init(&p);
   if (!st) { fprintf(stderr, "mtl_rx: mtl_init fail\n"); return 1; }
 
-  struct sess* s = &reg[0]; s->kind = K_VIDEO;
+  struct sess* s = &reg[0]; s->kind = K_VIDEO; s->num_leg = 1;
   snprintf(s->mcast,sizeof(s->mcast),"%s",l_mcast);
   s->udp_port=l_port; s->payload_type=l_pt; s->ring=l_ring; s->hdr=l_hdr;
   s->width=l_w; s->height=l_h; s->fps=l_fps; s->interlaced=l_inter; s->bit_depth=l_bd;
