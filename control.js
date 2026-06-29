@@ -216,7 +216,7 @@ window.MXLPlugins["2110_io"] = {
         ${sdpCtl}
         <span>${stateBadge(r.active, r.rx_stalled)}</span>
         ${rateCell}
-        <span class="net-addr" title="entrée 2110"><span class="net-arrow">↘</span>${net}</span>
+        <span class="net-addr" title="entrée 2110"><span class="net-arrow">↘</span>${portSelector('rx', r.idx, r.port)}${net}</span>
         <span class="mxl-path" title="sortie MXL (shared memory)">→ ${mxl}</span>
       </div>`;
     }
@@ -273,8 +273,9 @@ window.MXLPlugins["2110_io"] = {
         if (anc) lines.push(`<div class="flow-row" style="gap:8px;align-items:center">
           <span class="badge" style="background:var(--bg-input,var(--bg));border:1px solid var(--border)">2110-40</span>
           ${fmtDest(anc)}</div>`);
+        const _txPort = (vid && vid.port) || (auds[0] && auds[0].port) || (anc && anc.port) || null;
         return `<div class="ens">
-          <div class="ens-title">Slot TX #${Number(ti) + 1}</div>
+          <div class="ens-title">Slot TX #${Number(ti) + 1}${portSelector('tx', Number(ti), _txPort)}</div>
           ${lines.join('')}
         </div>`;
       }).join('');
@@ -306,6 +307,20 @@ window.MXLPlugins["2110_io"] = {
     let _cachedTxHtml    = '';
     let _cachedVideoCount = 0;  // capacité totale déployée
     let _cachedActiveRx   = 0;  // slots simultanés autorisés (active_rx_count)
+    let _nodePorts        = [];  // ports média du nœud (multi-NIC) ; [] = mono-port → pas de sélecteur
+
+    // Sélecteur de PORT (NIC) d'un slot — multi-NIC seulement (≥2 ports). « Auto » = répartition
+    // automatique (badge du port effectif courant) ; un port précis = épinglage. POST /api/mtl/<vmid>/pin.
+    function portSelector(role, idx, port){
+      if (!_nodePorts || _nodePorts.length < 2) return '';
+      const cur = (port && port.pinned) ? port.iface : '';   // '' = Auto
+      const eff = (port && port.iface) || '';
+      const opts = [`<option value=""${cur===''?' selected':''}>Auto${eff?` (${esc(eff)})`:''}</option>`]
+        .concat(_nodePorts.map(p =>
+          `<option value="${esc(p.ifname)}"${cur===p.ifname?' selected':''}>${esc(p.ifname)}${p.network?` · ${esc(p.network)}`:''}</option>`)).join('');
+      return `<span class="port-wrap"><select class="port-sel" data-role="${role}" data-idx="${idx}"
+                title="Port (NIC) de ce slot — Auto = répartition automatique entre les ports du réseau">${opts}</select></span>`;
+    }
 
     // Ligne de flux audio/ANC avec bouton de retrait granulaire (« Option A »).
     function _rmWrap(html, fid){
@@ -460,6 +475,7 @@ window.MXLPlugins["2110_io"] = {
             cs = (cd && cd.length) ? cd[0] : null; }
       catch(e){ cs = null; }
       const recvs = (c && c.receivers) || [];
+      _nodePorts = (c && c.ports) || [];
       const activeCount = recvs.filter(x => x.active).length;
       _cachedVideoCount = (c && c.video_count) || recvs.length;
       _cachedActiveRx   = (c && c.active_rx_count) || _cachedVideoCount;
@@ -616,6 +632,27 @@ window.MXLPlugins["2110_io"] = {
         toast('Échec du changement de mire : ' + err.message, 'error');
       }
     }
+    // Délégation : changement de PORT (NIC) d'un slot — épinglage / retour à l'auto (multi-NIC).
+    async function onPortChange(e){
+      const sel = e.target.closest('.port-sel');
+      if (!sel || !body.contains(sel)) return;
+      const role = sel.dataset.role;
+      const idx = parseInt(sel.dataset.idx, 10);
+      const iface = sel.value;   // '' = Auto (répartition)
+      sel.disabled = true;
+      try {
+        const resp = await fetch(`/api/mtl/${vmid}/pin`, {
+          method: 'POST', headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({role, idx, iface}),
+        });
+        if (!resp.ok) { const j = await resp.json().catch(()=>({})); throw new Error(j.error || ('HTTP ' + resp.status)); }
+        setTimeout(refresh, 700);   // laisse reconcile déplacer la session
+      } catch(err) {
+        toast('Échec de l\'épinglage de port : ' + err.message, 'error');
+      } finally {
+        sel.disabled = false;
+      }
+    }
 
     // ── SDP : ouverture de la modale d'affichage / abonnement manuel ──────────
     function _closeSdpModal(){ const m = document.getElementById('rx-sdp-modal'); if (m) m.remove(); }
@@ -684,6 +721,7 @@ window.MXLPlugins["2110_io"] = {
     body.addEventListener('click', onClickIdent);
     body.addEventListener('click', onClickSdp);
     body.addEventListener('change', onPatternChange);
+    body.addEventListener('change', onPortChange);
     body.addEventListener('pointerdown', onKnobDown);
     body.addEventListener('pointermove', onKnobMove);
     body.addEventListener('pointerup', onKnobUp);

@@ -171,6 +171,10 @@ def _get_n_cpus():
 
 
 IFACE      = os.environ.get("IFACE") or "ens1f0np0"
+# Multi-NIC : liste des interfaces média (CSV `IFACES`, aligné avec `SIPS`). IFACE = 1ʳᵉ NIC,
+# conservée pour tout le code mono-NIC existant (purge XDP/ntuple, steering PTP, sip des SDP).
+# Mono-NIC → liste à un élément (= IFACE) → strictement iso-comportement.
+IFACES     = [s.strip() for s in (os.environ.get("IFACES") or IFACE).split(",") if s.strip()] or [IFACE]
 LCORES     = os.environ.get("LCORES") or "1,2,3"
 # Quota Mb/s par scheduler (lcore) libmtl : au-delà, les nouvelles sessions vont sur un autre
 # lcore (≈ 2×1080p50 à 5000). Sans quota, tout s'empile sur sch_0 → epoch drops à la charge.
@@ -198,6 +202,53 @@ def _detect_iface_ip(iface):
         return ""
 
 SIP = os.environ.get("SIP") or _detect_iface_ip(IFACE)
+
+# IP source PAR NIC (CSV `SIPS`, aligné sur IFACES) ; manquante pour une NIC → auto-détection
+# locale. Le 1ᵉʳ élément reste piloté par `SIP` (rétro-compat). Émis dans config.ports[].sip.
+_sips_env = [s.strip() for s in (os.environ.get("SIPS") or "").split(",")]
+SIPS = []
+for _i, _if in enumerate(IFACES):
+    _s = _sips_env[_i] if (_i < len(_sips_env) and _sips_env[_i]) else ""
+    SIPS.append(_s or _detect_iface_ip(_if))
+if SIPS:
+    SIPS[0] = SIP or SIPS[0]
+
+# Répartition des sessions sur les ports (multi-NIC). Par défaut le moteur RÉPARTIT automatiquement
+# ses sessions sur les ports du RÉSEAU PRIMAIRE (modulo slot → stable + équilibré, sans flapping) ;
+# un slot peut être ÉPINGLÉ sur un port précis (RX_PINS/_tx[i]['iface'], poussé par l'orchestrateur,
+# mutable à chaud via :8081/pin). En RX (AF-XDP/IGMP) une session ne reçoit que sur le port qui a
+# rejoint le groupe → on ne répartit qu'entre ports d'un MÊME réseau (le primaire).
+# PORT_NETS = network_id par port (aligné sur IFACES) ; PRIMARY_NET = réseau primaire.
+_PORT_NETS = [s.strip() for s in (os.environ.get("PORT_NETS") or "").split(",")]
+_PRIMARY_NET = (os.environ.get("PRIMARY_NET") or "").strip()
+# _auto_ports = ports candidats à la répartition auto = ceux du réseau primaire (repli : tous les
+# ports si réseau inconnu / un seul réseau déclaré).
+if _PRIMARY_NET and len(_PORT_NETS) == len(IFACES):
+    _auto_ports = [IFACES[i] for i in range(len(IFACES)) if _PORT_NETS[i] == _PRIMARY_NET] or list(IFACES)
+else:
+    _auto_ports = list(IFACES)
+
+def _parse_iface_map(envname):
+    try:
+        m = json.loads(os.environ.get(envname) or "{}")
+        return {int(k): str(v) for k, v in m.items() if v in IFACES}
+    except Exception:
+        return {}
+RX_PINS = _parse_iface_map("RX_PINS")   # {slot: ifname} ; mutable à chaud (:8081/pin)
+_pins_lock = threading.Lock()
+
+def _auto_iface(idx):
+    """Port auto pour un slot non épinglé : modulo stable sur les ports du réseau primaire."""
+    return _auto_ports[int(idx) % len(_auto_ports)] if _auto_ports else IFACE
+
+def _rx_iface(idx):
+    with _pins_lock:
+        pin = RX_PINS.get(int(idx))
+    return pin if pin in IFACES else _auto_iface(idx)
+
+def _tx_iface(idx, pin=None):
+    """Port TX : épinglage poussé via /tx (_tx[i]['iface']), sinon répartition auto."""
+    return pin if pin in IFACES else _auto_iface(idx)
 
 
 def _detect_iface_mac(iface):
@@ -577,6 +628,30 @@ class AgentHandler(BaseHTTPRequestHandler):
                 return self._json(500, {"error": str(e)})
             return self._json(200, {"ok": True})
 
+        if route == "/pin":                      # ── Épinglage de port d'un slot (multi-NIC, À CHAUD)
+            role = body.get("role", "rx")
+            try:
+                idx = int(body.get("idx") or 0)
+            except Exception:
+                return self._json(400, {"error": "idx invalide"})
+            ifn = (body.get("iface") or "").strip()   # "" / null → retour à la répartition auto
+            if ifn and ifn not in IFACES:
+                return self._json(400, {"error": "port inconnu: {}".format(ifn)})
+            if role == "tx":
+                if not (0 <= idx < N_TX):
+                    return self._json(400, {"error": "idx TX hors limites"})
+                with _tx_lock:
+                    _tx[idx]["iface"] = ifn or None
+            else:
+                with _pins_lock:
+                    if ifn:
+                        RX_PINS[idx] = ifn
+                    else:
+                        RX_PINS.pop(idx, None)
+            # _manager_loop re-tague au tour suivant → reconcile déplace la session (≤0,5 s).
+            return self._json(200, {"ok": True, "iface": ifn or None,
+                                    "auto": _auto_iface(idx) if not ifn else None})
+
         if route == "/tx":                       # ── TX : spec complète d'un slot sender (poussée par l'orchestrateur)
             try:
                 idx = int(body.get("idx", 0))
@@ -592,6 +667,7 @@ class AgentHandler(BaseHTTPRequestHandler):
                 if "mcast2"    in body: t["mcast2"]    = body.get("mcast2") or None
                 if "udp_port2" in body: t["udp_port2"] = int(body.get("udp_port2") or 0)
                 if "pt"        in body: t["pt"]        = int(body.get("pt") or 96)
+                if "iface"     in body: t["iface"]     = (body.get("iface") or "").strip() or None
                 if "shm_in"    in body: t["shm_in"]    = (body.get("shm_in") or "").strip() or None
                 if "audios" in body:
                     t["audios"] = [{"mcast": a.get("mcast") or None,
@@ -925,9 +1001,9 @@ def _parse_sdp_audio(path):
     return {"port": int(m.group(1)), "pt": int(m.group(2)), "mcast": c.group(1),
             "channels": A_CHANNELS, "ptime": ptime}
 
-def _audio_session(idx, info):
+def _audio_session(idx, info, iface=IFACE):
     """Session RX audio st30 → /dev/shm/{hn}_audio_{idx} (L24 8ch BE, écrit tel quel par mtl_rx)."""
-    return {"kind": "audio", "role": "rx",
+    return {"kind": "audio", "role": "rx", "iface": iface,
             "mcast": info["mcast"], "udp_port": info["port"], "payload_type": info["pt"],
             "channels": info.get("channels", A_CHANNELS), "ptime": info.get("ptime", A_PTIME_DEF),
             "ring": A_RING, "hdr": HDR,
@@ -939,9 +1015,9 @@ def _derive_audio_shm(video_shm, idx=0):
     m = re.match(r"^(.*)_(\d+)$", (video_shm or "").strip())
     return "{}_audio_{}".format(m.group(1), idx) if m else None
 
-def _audio_tx_session(idx, acfg, shm_in):
+def _audio_tx_session(idx, acfg, shm_in, iface=IFACE):
     """Session TX audio st30 : émet le shm audio d'entrée (BE passthrough) vers la dest audio."""
-    return {"kind": "audio", "role": "tx",
+    return {"kind": "audio", "role": "tx", "iface": iface,
             "mcast": acfg["mcast"], "udp_port": acfg["port"], "payload_type": acfg.get("pt", 97),
             "channels": A_CHANNELS, "ptime": A_PTIME_DEF, "ring": A_RING, "hdr": HDR,
             "targets": [{"idx": idx, "shm": shm_in, "stats": "/tmp/mtl_atx{}.json".format(idx)}]}
@@ -961,9 +1037,9 @@ def _parse_sdp_anc(path):
         return None
     return {"port": int(m.group(1)), "pt": int(m.group(2)), "mcast": c.group(1)}
 
-def _anc_session(idx, info):
+def _anc_session(idx, info, iface=IFACE):
     """Session RX ANC st40 → /dev/shm/{hn}_anc_{idx} (meta+udw sérialisés par mtl_rx)."""
-    return {"kind": "data", "role": "rx",
+    return {"kind": "data", "role": "rx", "iface": iface,
             "mcast": info["mcast"], "udp_port": info["port"], "payload_type": info["pt"],
             "ring": 8, "hdr": HDR,
             "targets": [{"idx": idx, "shm": "/dev/shm/{}_anc_{}".format(HOSTNAME, idx),
@@ -974,9 +1050,9 @@ def _derive_anc_shm(video_shm):
     m = re.match(r"^(.*)_(\d+)$", (video_shm or "").strip())
     return "{}_anc_{}".format(m.group(1), m.group(2)) if m else None
 
-def _anc_tx_session(idx, t, shm_in):
+def _anc_tx_session(idx, t, shm_in, iface=IFACE):
     """Session TX ANC st40 : ré-émet le shm ANC d'entrée (passthrough) vers la dest ANC du slot."""
-    return {"kind": "data", "role": "tx",
+    return {"kind": "data", "role": "tx", "iface": iface,
             "mcast": t["anc_mcast"], "udp_port": t["anc_port"], "payload_type": t.get("anc_pt", 97),
             "fps": t.get("fps") or FPS, "ring": 8, "hdr": HDR,
             "targets": [{"idx": idx, "shm": shm_in, "stats": "/tmp/mtl_anctx{}.json".format(idx)}]}
@@ -1015,6 +1091,7 @@ _tx = [{"enabled": False, "mcast": None, "udp_port": 0, "pt": 96,
         "anc_cable_shm": None,                     # shm ANC CÂBLÉ (indépendant de la vidéo)
         "anc_mcast": None, "anc_port": 0, "anc_pt": 97,
         "anc_mcast2": None, "anc_port2": 0,  # leg1 ANC (SMPTE 2022-7)
+        "iface": None,      # épinglage de port (multi-NIC) ; None = répartition auto
         "lat_ms": None}     # âge du signal depuis la capture originale (ts_ns header SHM)
        for _ in range(N_TX)]
 _tx_lock = threading.Lock()
@@ -1092,12 +1169,14 @@ def _xdp_off():
     INDISPENSABLE entre deux lancements de mtl_rx : même un arrêt gracieux ne détache pas toujours
     le XDP (mtl_uninit incomplet, MtlManager qui ne peut pas remplacer un dispatcher existant) →
     la mtl_init suivante échoue en boucle (`native xdp dev init fail -5`). On repart d'une interface
-    propre. Coût : refaute ptp4l ~15 s (auto-recovery), acceptable au (re)lancement."""
-    try:
-        subprocess.run(["ip", "link", "set", IFACE, "xdp", "off"],
-                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=5)
-    except Exception as e:
-        print("xdp off échoué:", e, flush=True)
+    propre. Coût : refaute ptp4l ~15 s (auto-recovery), acceptable au (re)lancement.
+    Multi-NIC : purge CHAQUE PF média (sinon une 2ᵉ NIC garde un XDP résiduel → init en boucle)."""
+    for nic in IFACES:
+        try:
+            subprocess.run(["ip", "link", "set", nic, "xdp", "off"],
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=5)
+        except Exception as e:
+            print("xdp off échoué ({}):".format(nic), e, flush=True)
 
 
 def _flush_ntuple():
@@ -1106,18 +1185,19 @@ def _flush_ntuple():
     sur le MATÉRIEL (elles survivent au conteneur) ; la création d'un nouveau flow pour le même
     5-tuple échoue alors (« socket add flow fail » → init_hw fail -5) → session muette sans retry.
     On repart d'une table de flow propre — mtl_init réinstalle les règles voulues. Sûr : l'interface
-    (PF E810) est dédiée à MTL sur ce nœud."""
-    try:
-        out = subprocess.run(["ethtool", "-n", IFACE], capture_output=True, text=True, timeout=5).stdout
-        ids = re.findall(r"Filter:\s*(\d+)", out)
-        for rid in ids:
-            subprocess.run(["ethtool", "-N", IFACE, "delete", rid],
-                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=5)
-        if ids:
-            print("ntuple purge: {} règle(s) résiduelle(s) supprimée(s) avant mtl_init".format(len(ids)),
-                  flush=True)
-    except Exception as e:
-        print("ntuple purge échouée:", e, flush=True)
+    (PF E810) est dédiée à MTL sur ce nœud. Multi-NIC : purge CHAQUE PF média."""
+    for nic in IFACES:
+        try:
+            out = subprocess.run(["ethtool", "-n", nic], capture_output=True, text=True, timeout=5).stdout
+            ids = re.findall(r"Filter:\s*(\d+)", out)
+            for rid in ids:
+                subprocess.run(["ethtool", "-N", nic, "delete", rid],
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=5)
+            if ids:
+                print("ntuple purge ({}): {} règle(s) résiduelle(s) supprimée(s) avant mtl_init".format(
+                    nic, len(ids)), flush=True)
+        except Exception as e:
+            print("ntuple purge échouée ({}):".format(nic), e, flush=True)
 
 
 # Multicast PTP (SMPTE 2059-2 / IEEE 1588) : Announce/Sync/Delay sur 224.0.1.129, P2P delay sur
@@ -1145,17 +1225,19 @@ def _steer_ptp_to_kernel_queue():
     RX média intacte à 50 fps après `ethtool -X equal 1`.) Réappliqué une fois après le mtl_init du
     daemon (par sécurité, au cas où l'init toucherait la table). Best-effort."""
     def _apply(tag):
-        try:
-            rc = subprocess.run(["ethtool", "-X", IFACE, "equal", str(PTP_KERNEL_QUEUE + 1)],
-                                stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, timeout=5)
-            if rc.returncode == 0:
-                print("PTP coexistence ({}): RSS restreint à la queue {} (noyau/ptp4l) ; "
-                      "média via fdir libmtl (≥1)".format(tag, PTP_KERNEL_QUEUE), flush=True)
-            else:
-                print("RSS restrict ({}) échoué: {}".format(tag, (rc.stderr or b'').decode()[:150]),
-                      flush=True)
-        except Exception as e:
-            print("RSS restrict ({}) échoué: {}".format(tag, e), flush=True)
+        # Multi-NIC : restreindre RSS sur CHAQUE PF média (chacune peut porter du PTP en coexistence).
+        for nic in IFACES:
+            try:
+                rc = subprocess.run(["ethtool", "-X", nic, "equal", str(PTP_KERNEL_QUEUE + 1)],
+                                    stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, timeout=5)
+                if rc.returncode == 0:
+                    print("PTP coexistence ({} {}): RSS restreint à la queue {} (noyau/ptp4l) ; "
+                          "média via fdir libmtl (≥1)".format(tag, nic, PTP_KERNEL_QUEUE), flush=True)
+                else:
+                    print("RSS restrict ({} {}) échoué: {}".format(
+                        tag, nic, (rc.stderr or b'').decode()[:150]), flush=True)
+            except Exception as e:
+                print("RSS restrict ({} {}) échoué: {}".format(tag, nic, e), flush=True)
     _apply("launch")
     threading.Timer(5.0, _apply, args=("post-init",)).start()   # après le mtl_init du daemon
 
@@ -1189,14 +1271,15 @@ def _video_target(idx):
             "ident_file": _ident_file(idx)}
 
 
-def _video_session(info, idxs):
+def _video_session(info, idxs, iface=IFACE):
     """Une session = un flux réseau décodé UNE fois (un flow RX), fan-out vers tous les slots
     `idxs` qui demandent cette même source (mcast:port). Évite le conflit AF_XDP « même 5-tuple,
-    2 files RX » : un seul flow, recopie interne par mtl_rx vers chaque cible."""
+    2 files RX » : un seul flow, recopie interne par mtl_rx vers chaque cible. `iface` = NIC qui
+    porte physiquement ce mcast (multi-NIC ; tous les idxs d'un groupe = même réseau)."""
     # Ordre de champ : pas porté par le SDP 2110-20 → défaut par résolution (1080i=TFF, 576i=BFF),
     # même règle que le helper orchestrateur. mtl_rx s'en sert pour la parité du merge RX.
     fo = "bff" if 0 < int(info.get("height") or 0) <= 576 else "tff"
-    return {"kind": "video",
+    return {"kind": "video", "iface": iface,
             "mcast": info["mcast"], "udp_port": info["port"], "payload_type": info["pt"],
             "width": info["width"], "height": info["height"], "fps": info["fps"],
             "interlaced": bool(info.get("interlaced")), "field_order": fo, "bit_depth": BIT_DEPTH,
@@ -1204,7 +1287,7 @@ def _video_session(info, idxs):
             "targets": [_video_target(i) for i in idxs]}
 
 
-def _tx_session(idx, t):
+def _tx_session(idx, t, iface=IFACE):
     """Une session TX = lit le shm d'entrée câblé (t['shm_in'], au format du producteur) et émet en
     2110-20 vers t['mcast']:t['udp_port']. Le format (w/h/bd/ring) est celui du shm consommé.
     Le câblage fournit le NOM du shm (ex. 'mtl_0') → on préfixe /dev/shm/ (le RX écrit en chemin
@@ -1218,7 +1301,7 @@ def _tx_session(idx, t):
     _fps = float(t["fps"] or 25)
     if t.get("scan") == "i" and _fps > 30:
         _fps /= 2.0
-    return {"kind": "video", "role": "tx",
+    return {"kind": "video", "role": "tx", "iface": iface,
             "mcast": t["mcast"], "udp_port": t["udp_port"], "payload_type": t["pt"],
             "width": t["w"], "height": t["h"], "fps": _fps,
             # Passthrough du balayage : on ré-émet en entrelacé si la source câblée l'est.
@@ -1434,18 +1517,34 @@ def _write_config(sessions):
     `MTL_RX_QUEUE_HEADROOM`/`MTL_TX_QUEUE_HEADROOM` (env, défaut 0) pré-réservent des files pour
     ajouter audio/ANC à chaud SANS réinit mtl (compromis capacité ↔ souplesse dynamique)."""
     global _rx_queues_alloc, _tx_queues_alloc
-    # RX = toute session non explicitement TX (la session vidéo RX n'a pas de clé 'role' ;
-    # audio/ANC RX portent role='rx' ; TX portent role='tx').
-    n_rx = sum(1 for s in sessions if s.get("role") != "tx")
-    n_tx = sum(1 for s in sessions if s.get("role") == "tx")
     hr_rx = max(0, int(os.environ.get("MTL_RX_QUEUE_HEADROOM") or 0))
     hr_tx = max(0, int(os.environ.get("MTL_TX_QUEUE_HEADROOM") or 0))
-    _rx_queues_alloc = max(1, n_rx + hr_rx)
-    _tx_queues_alloc = max(1, n_tx + hr_tx)
+    # Files PAR NIC : multi-NIC = chaque PF a son budget de files AF-XDP indépendant (48/E810). On
+    # compte les sessions par iface (RX = non-'tx' : vidéo sans 'role', audio/ANC role='rx'). Une
+    # session sans clé `iface` (config legacy) compte sur la NIC primaire. Le headroom (pré-réserve
+    # pour ajouter à chaud sans réinit mtl) est PAR PORT (orchestrateur l'a déjà divisé par le nombre
+    # de ports auto), appliqué à CHAQUE port candidat à la répartition auto (= _auto_ports).
+    rx_per, tx_per = {}, {}
+    for s in sessions:
+        nic = s.get("iface") or IFACE
+        d = tx_per if s.get("role") == "tx" else rx_per
+        d[nic] = d.get(nic, 0) + 1
+    ports = []
+    for i, nic in enumerate(IFACES):
+        _hr = nic in _auto_ports          # headroom seulement sur les ports recevant l'auto-répartition
+        ports.append({"iface": nic, "sip": SIPS[i] if i < len(SIPS) else "",
+                      "rx_queues": max(1, rx_per.get(nic, 0) + (hr_rx if _hr else 0)),
+                      "tx_queues": max(1, tx_per.get(nic, 0) + (hr_tx if _hr else 0))})
+    # Totaux (exposés :8080 xdp.allocated + réservation au lancement du daemon).
+    _rx_queues_alloc = sum(p["rx_queues"] for p in ports)
+    _tx_queues_alloc = sum(p["tx_queues"] for p in ports)
     with open(_CONFIG_PATH, "w") as f:
-        json.dump({"pmd": "af_xdp", "iface": IFACE, "lcores": LCORES, "sip": SIP,
-                   "quota_mbs": QUOTA_MBS,
-                   "rx_queues": _rx_queues_alloc, "tx_queues": _tx_queues_alloc,
+        # `ports` = source de vérité (mtl_rx le lit en priorité). iface/sip/rx_queues/tx_queues
+        # scalaires = repli rétro-compat (1ʳᵉ NIC) pour un mtl_rx antérieur au multi-port.
+        json.dump({"pmd": "af_xdp", "lcores": LCORES, "quota_mbs": QUOTA_MBS,
+                   "ports": ports,
+                   "iface": IFACE, "sip": SIP,
+                   "rx_queues": ports[0]["rx_queues"], "tx_queues": ports[0]["tx_queues"],
                    "sessions": sessions}, f)
 
 
@@ -1639,7 +1738,7 @@ def _manager_loop():
             if sdp and not _ctl[idx]["gen"]:                # GÉN forcé → reste en simu
                 key = (sdp["mcast"], sdp["port"])
                 groups.setdefault(key, {"info": sdp, "idxs": []})["idxs"].append(idx)
-        sessions = [_video_session(g["info"], g["idxs"]) for g in groups.values()]
+        sessions = [_video_session(g["info"], g["idxs"], _rx_iface(g["idxs"][0])) for g in groups.values()]
         active = set(t["idx"] for s in sessions if s["kind"] == "video" for t in s["targets"])
         for idx in range(N_VIDEO):
             _live[idx] = idx in active
@@ -1657,14 +1756,14 @@ def _manager_loop():
                 gen_on = bool(_sim_tone[idx]["enabled"]) if idx < len(_sim_tone) else False
             _audio_live[idx] = bool(ainfo) and not gen_on
             if ainfo and not gen_on:
-                sessions.append(_audio_session(idx, ainfo))
+                sessions.append(_audio_session(idx, ainfo, _rx_iface(idx)))
 
         # Sessions RX ANC (2110-40) : SDP smpte291 actif → écrit /dev/shm/{hn}_anc_{idx} + timecode.
         for idx in range(N_ANC):
             dpath = "{}/nmos_recv_anc_{}.sdp".format(SDP_DIR, idx)
             dinfo = _parse_sdp_anc(dpath) if os.path.exists(dpath) else None
             if dinfo:
-                sessions.append(_anc_session(idx, dinfo))
+                sessions.append(_anc_session(idx, dinfo, _rx_iface(idx)))
 
         # Sessions TX : un slot émet s'il est activé, a une destination et un shm d'entrée câblé.
         # Plafonné à ACTIVE_TX_C (budget de queues partagé RX+TX) — les slots provisionnés au-delà
@@ -1673,7 +1772,7 @@ def _manager_loop():
             for i in range(min(N_TX, ACTIVE_TX_C)):
                 t = _tx[i]
                 if t["enabled"] and t["mcast"] and t["udp_port"] and t["shm_in"]:
-                    sessions.append(_tx_session(i, t))
+                    sessions.append(_tx_session(i, t, _tx_iface(i, t.get("iface"))))
                 # TX audio : priorité TONALITÉ (gen autonome) > mire/repli (GEN vidéo) > câblé.
                 # NON câblé et sans tonalité ⇒ pas de session (silence).
                 _acable = t.get("audio_cable_shm") or []
@@ -1688,13 +1787,13 @@ def _manager_loop():
                     if t["enabled"] and ashm:
                         if not ashm.startswith("/"):
                             ashm = "/dev/shm/" + ashm
-                        sessions.append(_audio_tx_session(i * 2 + ai, acfg, ashm))
+                        sessions.append(_audio_tx_session(i * 2 + ai, acfg, ashm, _tx_iface(i, t.get("iface"))))
                 # TX ANC : câblage INDÉPENDANT (anc_cable_shm). NON câblé ⇒ pas de session.
                 dshm = t.get("anc_cable_shm")
                 if t["enabled"] and t.get("anc_mcast") and t.get("anc_port") and dshm:
                     if not dshm.startswith("/"):
                         dshm = "/dev/shm/" + dshm
-                    sessions.append(_anc_tx_session(i, t, dshm))
+                    sessions.append(_anc_tx_session(i, t, dshm, _tx_iface(i, t.get("iface"))))
 
         # 1) config : réécrit dès qu'il change → le daemon réconcilie à chaud (aucune relance/faute PTP)
         sig = json.dumps(sessions, sort_keys=True)

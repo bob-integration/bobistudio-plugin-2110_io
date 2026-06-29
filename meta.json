@@ -1,7 +1,19 @@
 {
-  "version": "0.29.13",
-  "date": "2026-06-28",
+  "version": "0.31.0",
+  "date": "2026-06-29",
   "changes": {
+    "Multi-ports : RÉPARTITION AUTO des sessions + épinglage de port par slot (REBUILD, 0.31.0)": [
+      "Le socle multi-port (0.30.0) déclarait les NIC mais envoyait toutes les sessions sur la NIC primaire. Désormais le moteur RÉPARTIT AUTOMATIQUEMENT ses sessions entre les ports d'un MÊME réseau (modulo slot : stable, équilibré, sans flapping) — c'est le vrai levier du multi-NIC : dépasser le budget ~16 RX/NIC. Un slot peut être ÉPINGLÉ sur un port précis à la demande.",
+      "Réseau-conscient : on ne répartit qu'entre ports d'un même réseau (node_interfaces.media_network_id) — en RX (AF-XDP/IGMP) une session ne reçoit que sur le port qui a rejoint le groupe. La répartition auto vise les ports du réseau PRIMAIRE ; les slots inter-réseaux se règlent par épinglage.",
+      "À CHAUD : l'épinglage est poussé au contrôleur (RX via :8081/pin, TX via push_tx_slots/iface) → reconcile déplace la session sur la nouvelle NIC sans redéploiement ni faute PTP. Persisté (params.rx_pins/tx_pins) → survit au redéploiement.",
+      "UI : sélecteur de port « Auto / ens1f0 / ens2f0 » par slot RX et TX dans la carte Sources, affiché seulement si le nœud a ≥2 ports média. Le détail NMOS expose les ports du nœud + le port effectif/épinglé par slot. Orchestrateur : env PORT_NETS/PRIMARY_NET/RX_PINS/TX_PINS + headroom de files divisé par le nombre de ports. REBUILD IMAGE bobi-mtl REQUIS (controller.py)."
+    ],
+    "Multi-interfaces 2110 : moteur MULTI-PORT (socle multi-NIC, 2022-7 prévu) (REBUILD, 0.30.0)": [
+      "Besoin : un nœud peut porter plusieurs NIC média 2110 sur des RÉSEAUX distincts (pas seulement la redondance 2022-7). Jusqu'ici le moteur était mono-port (un mtl_init = un PF) de bout en bout.",
+      "mtl_rx.c : mtl_init déclare désormais N ports (tableau config `ports:[{iface,sip,rx_queues,tx_queues}]`, MTL_PORT_MAX), une table g_ports résout chaque session vers SA NIC par nom d'iface. struct sess conçue pour 2 legs (num_leg) : le socle n'émet que 1 leg (mono-NIC par session) ; le chemin MTL_SESSION_PORT_R (red/blue 2022-7) est en place et compilé mais non activé. compute_sig inclut l'iface → un re-tag réseau recrée la session sur la bonne NIC, device/XDP intacts (pas de faute PTP). iface inconnue → stats `unknown_iface`.",
+      "controller.py : IFACES/SIPS (CSV), config émet `ports[]` avec budget de files PAR NIC, tag `iface` par session (maps RX/TX_IFACE_MAP, défaut NIC primaire), purge XDP/ntuple + steering PTP bouclés sur chaque PF média.",
+      "Orchestrateur : _build_run_cmd déclare toutes les NIC media2110 (node_interfaces) via IFACES/SIPS (n'émis que si ≥2 NIC → nœud mono-NIC strictement inchangé) ; ensure_media_ips pose l'IPv4 de chaque PF média. SOCLE : pas de map d'assignation par-slot → toutes les sessions sur la NIC primaire (iso-comportement) ; l'UI d'assignation par-slot + la 2022-7 (émission iface2/mcast2) sont les incréments suivants. REBUILD IMAGE bobi-mtl REQUIS."
+    ],
     "Générateur audio : PRÉCÉDENCE sur la source réelle (écrase le RX 2110-30) (REBUILD, 0.29.13)": [
       "Symptôme : activer le générateur de tonalité sur un slot qui reçoit un audio 2110-30 réel ne changeait rien — on continuait de voir la source d'origine moduler (le générateur restait en veille).",
       "Cause : depuis 0.29.12, le générateur n'écrivait que si AUCUN audio réel n'était reçu (_audio_live). Sur un slot avec audio réel abonné, il ne prenait jamais la main.",
