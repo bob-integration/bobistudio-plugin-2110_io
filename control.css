@@ -132,3 +132,11 @@
                   background:#fff; box-shadow:0 0 0 1px rgba(0,0,0,.5); }
 .nic-model-lbl { font-size:0.76em; color:var(--text-muted); margin:2px 0 1px; }
 .nic-shared   { color:#e8a33d; }
+
+/* Sélecteur de PORT (NIC) par slot — multi-NIC (épinglage / Auto). Compact, discret. */
+.port-wrap { display:inline-flex; align-items:center; margin-right:6px; }
+.port-sel  { font-size:0.74em; padding:1px 4px; border-radius:4px;
+             background:var(--bg-input,var(--bg)); color:var(--text); border:1px solid var(--border);
+             max-width:160px; }
+.port-sel:disabled { opacity:.5; }
+.ens-title .port-sel { margin-left:8px; }
