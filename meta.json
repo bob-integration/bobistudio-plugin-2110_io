@@ -1,7 +1,17 @@
 {
-  "version": "0.31.0",
+  "version": "0.33.0",
   "date": "2026-06-29",
   "changes": {
+    "RX vidéo : plus de mire par défaut (symétrie audio) + badge générateur honnête (REBUILD, 0.33.0)": [
+      "Un slot RX vidéo NON abonné générait une mire SMPTE par défaut (souvent au mauvais format, 1280×720 tant qu'aucun SDP), sans que l'UI n'indique le générateur comme actif → confusion (l'audio, lui, ne génère rien par défaut, plus clair).",
+      "_simu_loop ne génère désormais la mire QUE si le générateur est explicitement actif (_ctl[idx].gen), exactement comme la tonalité audio gate sur _sim_tone.enabled. Slot non abonné + générateur off → RIEN écrit dans le shm (mode 'idle'), l'aval affiche 'NO SIGNAL'. Le générateur reste activable par slot (overrides le flux réel, comme avant).",
+      "UI honnête : le badge GÉN vidéo reflète l'état LIVE du moteur (mode='simu' sur :8080) et non plus la config — il s'allume seulement quand une mire tourne réellement, et affiche son format réel. Côté moteur : controller.py seul (REBUILD bobi-mtl) ; côté orchestrateur : receivers_detail expose mode/generating, control.js dérive le badge du live."
+    ],
+    "Stats PAR PORT physique : débit/files/lien ventilés par NIC + agrégat honnête (REBUILD, 0.32.0)": [
+      "Jusqu'ici la tuile NIC du moteur ne mesurait le débit (`nic.rx_gbps`/`tx_gbps`) que sur le 1ᵉʳ port (IFACE) tout en l'affichant comme la stat du moteur entier → chiffre partiel et trompeur dès qu'un moteur est multi-port.",
+      "Le bloc `nic` expose désormais `ports[]` : un descripteur par NIC média {iface, sip, rx_gbps, tx_gbps, port_capacity_gbps, link_up, rx_queues, tx_queues, primary}. Débit mesuré par port via ethtool -S (inclut AF-XDP zero-copy) avec un cache de delta PAR INTERFACE (`_bw_last[iface]`, sinon deux ports écrasaient mutuellement leur référence). Files RX/TX = dernière allocation du config (`_ports_alloc`), lien via operstate.",
+      "L'agrégat `nic.rx_gbps`/`tx_gbps` devient la SOMME des ports (l'UI peut enfin afficher un « global » honnête + le détail par NIC). Mono-NIC : `ports` à une entrée = IFACE → strictement iso-comportement. Pas de rebuild côté data plane (mtl_rx.c inchangé) mais controller.py modifié → REBUILD IMAGE bobi-mtl REQUIS."
+    ],
     "Multi-ports : RÉPARTITION AUTO des sessions + épinglage de port par slot (REBUILD, 0.31.0)": [
       "Le socle multi-port (0.30.0) déclarait les NIC mais envoyait toutes les sessions sur la NIC primaire. Désormais le moteur RÉPARTIT AUTOMATIQUEMENT ses sessions entre les ports d'un MÊME réseau (modulo slot : stable, équilibré, sans flapping) — c'est le vrai levier du multi-NIC : dépasser le budget ~16 RX/NIC. Un slot peut être ÉPINGLÉ sur un port précis à la demande.",
       "Réseau-conscient : on ne répartit qu'entre ports d'un même réseau (node_interfaces.media_network_id) — en RX (AF-XDP/IGMP) une session ne reçoit que sur le port qui a rejoint le groupe. La répartition auto vise les ports du réseau PRIMAIRE ; les slots inter-réseaux se règlent par épinglage.",

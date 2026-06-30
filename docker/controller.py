@@ -92,14 +92,15 @@ def _nic_hw_queues(iface):
 
 def _nic_bps(iface):
     """Débit RX/TX via ethtool -S (compteurs matériels, inclut AF_XDP zero-copy).
-    sysfs statistics/tx_bytes ne compte PAS le trafic AF_XDP → toujours 0 pour MTL."""
-    global _bw_last
+    sysfs statistics/tx_bytes ne compte PAS le trafic AF_XDP → toujours 0 pour MTL.
+    Cache PAR INTERFACE (`_bw_last[iface]`) : multi-NIC = un état de delta par port,
+    sinon les compteurs de deux ports écrasent mutuellement leur référence → débits faux."""
     now = time.monotonic()
     try:
         cap = int(open(f"/sys/class/net/{iface}/speed").read().strip()) / 1000
     except Exception:
         cap = 100.0
-    last = _bw_last
+    last = _bw_last.get(iface)
     # Cache : évite d'appeler ethtool à chaque requête :8080 (coût ~3 ms)
     if last and now < last.get("t", 0) + 0.5:
         return last.get("rx_gbps"), last.get("tx_gbps"), cap
@@ -112,10 +113,10 @@ def _nic_bps(iface):
         rx = _stat("rx_bytes")
         tx = _stat("tx_bytes")
     except Exception:
-        _bw_last = {"rx": None, "tx": None, "t": now, "rx_gbps": None, "tx_gbps": None}
+        _bw_last[iface] = {"rx": None, "tx": None, "t": now, "rx_gbps": None, "tx_gbps": None}
         return None, None, cap
     if rx is None or tx is None:
-        _bw_last = {"rx": None, "tx": None, "t": now, "rx_gbps": None, "tx_gbps": None}
+        _bw_last[iface] = {"rx": None, "tx": None, "t": now, "rx_gbps": None, "tx_gbps": None}
         return None, None, cap
     rx_gbps = tx_gbps = None
     if last and last.get("rx") is not None and now > last.get("t", 0) + 0.5:
@@ -123,8 +124,18 @@ def _nic_bps(iface):
         if dt > 0:
             rx_gbps = round((rx - last["rx"]) * 8 / dt / 1e9, 2)
             tx_gbps = round((tx - last["tx"]) * 8 / dt / 1e9, 2)
-    _bw_last = {"rx": rx, "tx": tx, "t": now, "rx_gbps": rx_gbps, "tx_gbps": tx_gbps}
+    _bw_last[iface] = {"rx": rx, "tx": tx, "t": now, "rx_gbps": rx_gbps, "tx_gbps": tx_gbps}
     return rx_gbps, tx_gbps, cap
+
+
+def _nic_link(iface):
+    """État/vitesse du lien d'un port : operstate ('up'/'down') + speed Mb/s (sysfs)."""
+    up = None
+    try:
+        up = open(f"/sys/class/net/{iface}/operstate").read().strip() == "up"
+    except Exception:
+        pass
+    return up
 
 
 def _cgroup_cpu_usec():
@@ -551,14 +562,32 @@ class MetricsHandler(BaseHTTPRequestHandler):
                     senders.append({"tx_idx": i, "idx": i, "essence": "anc",
                                     "sdp": _anc_sdp(i, t),
                                     "inputs_latency_ms": inputs_lat})
-        rx_gbps, tx_gbps, port_cap = _nic_bps(IFACE)
         model_label, aggregate_gbps = _nic_model(IFACE)
         hw_q = _nic_hw_queues(IFACE)
+        # Stats PAR PORT physique (multi-NIC). Débit mesuré par iface (ethtool -S, cache par port) ;
+        # files RX/TX = dernière allocation du config (`_ports_alloc`). L'agrégat NIC (`rx_gbps`/
+        # `tx_gbps`) devient la SOMME des ports — la tuile « globale » de l'UI cessait sinon de
+        # refléter le moteur (elle ne montrait que le 1ᵉʳ port). Repli mono-NIC : une entrée = IFACE.
+        _qmap = {p["iface"]: p for p in _ports_alloc}
+        nic_ports = []
+        for _if in IFACES:
+            _rxg, _txg, _cap = _nic_bps(_if)
+            _q = _qmap.get(_if, {})
+            nic_ports.append({"iface": _if, "sip": _q.get("sip", ""),
+                              "rx_gbps": _rxg, "tx_gbps": _txg,
+                              "port_capacity_gbps": _cap, "link_up": _nic_link(_if),
+                              "rx_queues": _q.get("rx_queues"), "tx_queues": _q.get("tx_queues"),
+                              "primary": _if in _auto_ports})
+        port_cap = nic_ports[0]["port_capacity_gbps"] if nic_ports else 100.0
+        def _sum_gbps(key):
+            vals = [p[key] for p in nic_ports if p[key] is not None]
+            return round(sum(vals), 2) if vals else None
         payload = {"fps": top_fps, "receivers": recs, "senders": senders,
-                   "nic": {"rx_gbps": rx_gbps, "tx_gbps": tx_gbps,
+                   "nic": {"rx_gbps": _sum_gbps("rx_gbps"), "tx_gbps": _sum_gbps("tx_gbps"),
                             "port_capacity_gbps": port_cap,
                             "aggregate_gbps": aggregate_gbps,
-                            "model": model_label},
+                            "model": model_label,
+                            "ports": nic_ports},
                    "xdp": {"allocated":           _rx_queues_alloc + _tx_queues_alloc,
                             "reserved":            _rx_queues_reserved + _tx_queues_reserved,
                             "active":              _xdp_sessions_active,
@@ -1504,6 +1533,7 @@ def _read_stats_raw(stats_path):
 
 _rx_queues_alloc = 0   # dernières files RX/TX demandées au daemon (exposé via :8080 xdp.allocated)
 _tx_queues_alloc = 0
+_ports_alloc = []      # dernier `ports` du config (iface/sip/rx_queues/tx_queues PAR NIC) — :8080 nic.ports
 
 
 def _write_config(sessions):
@@ -1516,7 +1546,7 @@ def _write_config(sessions):
     même en vidéo-seule. Maintenant : exact → une RX vidéo-seule peut monter jusqu'aux ~48 files HW.
     `MTL_RX_QUEUE_HEADROOM`/`MTL_TX_QUEUE_HEADROOM` (env, défaut 0) pré-réservent des files pour
     ajouter audio/ANC à chaud SANS réinit mtl (compromis capacité ↔ souplesse dynamique)."""
-    global _rx_queues_alloc, _tx_queues_alloc
+    global _rx_queues_alloc, _tx_queues_alloc, _ports_alloc
     hr_rx = max(0, int(os.environ.get("MTL_RX_QUEUE_HEADROOM") or 0))
     hr_tx = max(0, int(os.environ.get("MTL_TX_QUEUE_HEADROOM") or 0))
     # Files PAR NIC : multi-NIC = chaque PF a son budget de files AF-XDP indépendant (48/E810). On
@@ -1538,6 +1568,7 @@ def _write_config(sessions):
     # Totaux (exposés :8080 xdp.allocated + réservation au lancement du daemon).
     _rx_queues_alloc = sum(p["rx_queues"] for p in ports)
     _tx_queues_alloc = sum(p["tx_queues"] for p in ports)
+    _ports_alloc = ports   # mémorisé pour ventiler les stats par port sur :8080 (nic.ports)
     with open(_CONFIG_PATH, "w") as f:
         # `ports` = source de vérité (mtl_rx le lit en priorité). iface/sip/rx_queues/tx_queues
         # scalaires = repli rétro-compat (1ʳᵉ NIC) pour un mtl_rx antérieur au multi-port.
@@ -1835,28 +1866,40 @@ def _simu_loop(idx):
             except Exception: pass
         writer = None; sim_res = None
     while True:
-        if _live[idx] or not _HAS_MXL:
+        with _ctl_lock:
+            gen_on = bool(_ctl[idx]["gen"])
+        # On NE génère la mire QUE si le générateur est explicitement actif (gen) et le slot non live.
+        # Symétrie avec l'audio (_simu_audio_loop gate sur _sim_tone.enabled) : un slot non abonné
+        # SANS générateur n'écrit RIEN dans le shm (mode "idle"), au lieu d'une mire noire/barres
+        # parasite à un format par défaut trompeur.
+        if _live[idx] or not gen_on or not _HAS_MXL:
             if writer is not None:
                 _close()
-            if not _HAS_MXL and not _live[idx]:
-                time.sleep(0.5); continue
-            d = _read_stats_raw("/tmp/mtl_v{}.json".format(idx))
-            with metrics_lock:
-                # Échec de création de session RX (budget lcores…) : mtl_rx écrit {error} dans le stats.
-                # On le remonte (mode="error" + rx_error) au lieu de prétendre « mtl » à tort.
-                if d and d.get("error"):
-                    metrics[idx]["mode"] = "error"
-                    metrics[idx]["rx_error"] = d.get("error")
+            if _live[idx]:
+                d = _read_stats_raw("/tmp/mtl_v{}.json".format(idx))
+                with metrics_lock:
+                    # Échec de création de session RX (budget lcores…) : mtl_rx écrit {error} dans le
+                    # stats. On le remonte (mode="error" + rx_error) au lieu de prétendre « mtl » à tort.
+                    if d and d.get("error"):
+                        metrics[idx]["mode"] = "error"
+                        metrics[idx]["rx_error"] = d.get("error")
+                        metrics[idx]["fps"] = 0.0
+                        metrics[idx]["rx_latency_ms"] = None
+                    else:
+                        metrics[idx]["mode"] = "mtl"
+                        metrics[idx].pop("rx_error", None)
+                        if d:
+                            metrics[idx]["fps"] = float(d.get("fps", 0.0))
+                            metrics[idx]["frame_index"] = int(d.get("frame_index", 0))
+                            # Latence de réception (segment A = capture média → écriture shm), en ms.
+                            metrics[idx]["rx_latency_ms"] = d.get("rx_latency_ms")
+            else:
+                # Non abonné ET générateur off (ou MXL indispo) → rien généré (cf. symétrie audio).
+                with metrics_lock:
+                    metrics[idx]["mode"] = "idle"
+                    metrics[idx].pop("rx_error", None)
                     metrics[idx]["fps"] = 0.0
                     metrics[idx]["rx_latency_ms"] = None
-                else:
-                    metrics[idx]["mode"] = "mtl"
-                    metrics[idx].pop("rx_error", None)
-                    if d:
-                        metrics[idx]["fps"] = float(d.get("fps", 0.0))
-                        metrics[idx]["frame_index"] = int(d.get("frame_index", 0))
-                        # Latence de réception (segment A = capture média → écriture shm), en ms.
-                        metrics[idx]["rx_latency_ms"] = d.get("rx_latency_ms")
             time.sleep(0.5)
             continue
         w, h = _slot_res[idx]

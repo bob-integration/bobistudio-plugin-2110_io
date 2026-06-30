@@ -65,11 +65,12 @@ window.MXLPlugins["2110_io"] = {
         ? `<span class="badge" style="background:var(--status-running-bg); color:var(--status-running-fg)">subscribed</span>`
         : `<span class="badge" style="background:var(--border-soft); color:var(--text-muted)">idle</span>`;
     }
-    function genTooltip(r, isAudio){
+    function genTooltip(r, isAudio, genOn){
       const g = r.gen || {};
+      const on = (genOn != null) ? genOn : (isAudio ? r.simulated : r.generating);
       const hint = `<div style="margin-top:7px; padding-top:6px; border-top:1px solid var(--border-soft);
-          color:${r.simulated ? '#e8a33d' : 'var(--text-muted)'}; font-size:0.92em">
-          👆 Cliquer pour ${r.simulated ? 'désactiver' : 'activer'} le générateur</div>`;
+          color:${on ? '#e8a33d' : 'var(--text-muted)'}; font-size:0.92em">
+          👆 Cliquer pour ${on ? 'désactiver' : 'activer'} le générateur</div>`;
       if (isAudio) {
         const freq  = (g.freq != null) ? `${g.freq} Hz` : '—';
         const level = (g.level_db != null) ? `${g.level_db} dBFS` : '—';
@@ -142,11 +143,14 @@ window.MXLPlugins["2110_io"] = {
       const _genPat = (r.gen && r.gen.pattern) || 'bars';
       const _patOpts = Object.entries(VIDEO_PATTERNS).map(([k,v]) =>
         `<option value="${k}"${k===_genPat?' selected':''}>${esc(v)}</option>`).join('');
+      // VIDÉO : le badge GÉN reflète l'état LIVE du moteur (mire réellement émise, mode='simu') —
+      // honnête, ≠ config. AUDIO : inchangé (config `simulated`, déjà clair). Le clic toggle le gen.
+      const _genOn = isAudio ? !!r.simulated : !!r.generating;
       const genIcon = isAnc ? '<span class="gen-wrap"></span>' : `<span class="gen-wrap">
-          <span class="gen-badge ${r.simulated ? 'on' : 'off'}" role="button" tabindex="0"
-                data-essence="${ess}" data-idx="${r.idx}" data-enable="${r.simulated ? '0' : '1'}">GÉN</span>
-          ${(!isAudio && r.simulated) ? `<span class="gen-pat-wrap"><select class="gen-pat-sel" data-essence="video" data-idx="${r.idx}">${_patOpts}</select></span>` : ''}
-          ${genTooltip(r, isAudio)}
+          <span class="gen-badge ${_genOn ? 'on' : 'off'}" role="button" tabindex="0"
+                data-essence="${ess}" data-idx="${r.idx}" data-enable="${_genOn ? '0' : '1'}">GÉN</span>
+          ${(!isAudio && _genOn) ? `<span class="gen-pat-wrap"><select class="gen-pat-sel" data-essence="video" data-idx="${r.idx}">${_patOpts}</select></span>` : ''}
+          ${genTooltip(r, isAudio, _genOn)}
         </span>`;
       // IDENT : incrustation 3 lignes (nom/source/format) — slots vidéo uniquement.
       // IDENT : badge marche/arrêt + petit rotatif compact pour la taille du texte
@@ -207,7 +211,14 @@ window.MXLPlugins["2110_io"] = {
             }
             return `<span style="color:${col}" title="${tip}">${esc(txt)}</span>`;
           })()
-        : `<span title="format vidéo">${fmtVideoFormat(r)}</span>`;
+        : (() => {
+            // VIDÉO : ni abonné (IS-05) ni générateur actif → pas de signal. On n'affiche PAS un
+            // format par défaut trompeur (le moteur ne génère plus rien par défaut, cf. _simu_loop).
+            if (!r.active && !r.generating) {
+              return `<span style="color:var(--status-stopped-fg)" title="Slot non abonné — aucun flux ni générateur (sortie vide)">non abonnée</span>`;
+            }
+            return `<span title="format vidéo${r.generating ? ' (mire générée)' : ''}">${fmtVideoFormat(r)}</span>`;
+          })();
       const rowCls = isAnc ? 'flow-anc' : isAudio ? 'flow-audio' : 'flow-video';
       return `<div class="flow-row ${rowCls}">
         <span class="flow-tag ${isAnc ? 'd' : isAudio ? 'a' : 'v'}">${tag}</span>
@@ -302,7 +313,63 @@ window.MXLPlugins["2110_io"] = {
       return `<div class="nic-model-lbl">${esc(model)}${shared}</div>`;
     }
 
+    // Couleur stable d'un réseau média (pastille red/blue de la bande de ports + badges de slot).
+    function _netColor(network) {
+      const s = String(network || '·');
+      let h = 0;
+      for (let i = 0; i < s.length; i++) h = (h * 31 + s.charCodeAt(i)) & 0xffffff;
+      return `hsl(${h % 360},62%,55%)`;
+    }
+    // Chip de port (côté RX) : nom + réseau + barre de charge RX (mesurée/estimée) + files/flux.
+    function _portChip(p) {
+      const col   = _netColor(p.network);
+      const cap   = p.port_capacity_gbps || 100;
+      const val   = p.rx_gbps != null ? p.rx_gbps : p.rx_estimated_gbps;
+      const isEst = p.rx_gbps == null && p.rx_estimated_gbps != null;
+      const pct   = val != null ? Math.min(100, Math.round(val / cap * 100)) : 0;
+      const bcol  = pct > 80 ? 'var(--status-stopped-fg,#f87171)' : pct > 60 ? '#e8a33d' : 'var(--status-running-fg,#22c55e)';
+      const down  = p.link_up === false;
+      return `<div class="io2110-portchip${down ? ' down' : ''}" style="border-left-color:${col}">
+        <div class="pc-top"><span class="pc-name" style="color:${col}">${esc(p.iface)}</span>
+          ${p.primary ? '<span class="pc-prim">PRIM</span>' : ''}
+          <span class="pc-net">${esc(p.network || '')}</span>
+          ${down ? '<span class="pc-down" title="Lien physique down">⚠ lien</span>' : ''}</div>
+        <div class="pc-load"><span class="pc-loadval${isEst ? ' est' : ''}">${
+          val != null ? (isEst ? '~' : '') + val.toFixed(1) + ' / ' + cap + ' G' : '—'}</span>
+          <div class="pc-track"><div class="pc-fill" style="width:${pct}%;background:${bcol}"></div></div></div>
+        <div class="pc-meta">${p.rx_flow_count != null ? p.rx_flow_count + ' flux' : ''}${
+          p.rx_queues != null ? ' · ' + p.rx_queues + ' files' : ''}</div>
+      </div>`;
+    }
+    // Bande de ports + bouton « Par NIC ». Mono-port (<2 ports) → '' (UI agrégée inchangée).
+    function _nicPortStrip(ports) {
+      if (!ports || ports.length < 2) return '';
+      const strip = ports.map(_portChip).join('');
+      const detail = _nicOpen ? `<div class="io2110-portdetail">${
+        ports.map(p => {
+          const col = _netColor(p.network);
+          const cap = p.port_capacity_gbps || 100;
+          const rxv = p.rx_gbps != null ? p.rx_gbps : p.rx_estimated_gbps;
+          const lines = [
+            p.network ? `Réseau : ${esc(p.network)}` : '',
+            rxv != null ? `RX : ${(p.rx_gbps == null ? '~' : '') + rxv.toFixed(1)} / ${cap} G` : '',
+            p.rx_flow_count != null ? `Flux RX : ${p.rx_flow_count}` : '',
+            (p.rx_queues != null || p.tx_queues != null) ? `Files XDP : ${(p.rx_queues || 0)} RX · ${(p.tx_queues || 0)} TX` : '',
+            `Lien : ${p.link_up === false ? '⚠ down' : (p.link_up ? 'up' : '—')}`,
+          ].filter(Boolean);
+          return `<div class="io2110-portcard" style="border-left-color:${col}">
+            <h5><span style="color:${col}">${esc(p.iface)}</span>${p.primary ? '<span class="pc-prim">PRIM</span>' : ''}</h5>
+            ${lines.map(l => `<div class="pc-meta">${l}</div>`).join('')}</div>`;
+        }).join('')}</div>` : '';
+      return `<div class="io2110-nicbar"><div class="io2110-portstrip">${strip}</div>
+        <button class="io2110-nictoggle${_nicOpen ? ' on' : ''}"
+          title="Afficher / masquer le détail par port physique">${_nicOpen ? '▾' : '▸'} Par NIC</button>
+        </div>${detail}`;
+    }
+
     let _cachedEnsembles = [];
+    let _nicOpen          = false;  // multi-NIC : détail « Par NIC » déplié (état local de la carte)
+    let _lastNicPorts     = [];     // dernier nic_ports reçu (pour reconstruire la bande au toggle)
     let _cachedMeta      = '';
     let _cachedTxHtml    = '';
     let _cachedVideoCount = 0;  // capacité totale déployée
@@ -410,7 +477,7 @@ window.MXLPlugins["2110_io"] = {
         <button class="io2110-addflow" data-ess="audio" data-att="">+ Audio</button>
         <button class="io2110-addflow" data-ess="anc" data-att="">+ ANC</button>
       </div>`;
-      body.innerHTML = _cachedMeta + inner + indepAdd + moreBtn + delBtn + _cachedTxHtml;
+      body.innerHTML = _cachedMeta + _nicPortStrip(_lastNicPorts) + inner + indepAdd + moreBtn + delBtn + _cachedTxHtml;
       // Ajout granulaire de flux (rattaché si data-att, sinon indépendant).
       body.querySelectorAll('.io2110-addflow').forEach(b => b.onclick = async () => {
         b.disabled = true;
@@ -512,6 +579,7 @@ window.MXLPlugins["2110_io"] = {
           <div class="nic-bar-track"><div class="nic-bar-fill" style="width:${_xdpUsedPct}%;background:${_xdpColU}"></div></div>
         </div>`;
       }
+      _lastNicPorts = (c && c.nic_ports) || [];   // mémorisé pour reconstruire la bande au toggle (sans refetch)
       _cachedMeta = `<div class="meta rx-meta">IP : ${esc((c && c.ip) || '—')} — ${recvs.length} / ${_cachedVideoCount} sources · ${activeCount} abonné${activeCount > 1 ? 's' : ''}</div>${_nicH}${_nicRxBar}${_nicXdpBar}`;
       _cachedTxHtml    = renderTXSection(cs && cs.senders);
       _renderBody();
@@ -632,6 +700,13 @@ window.MXLPlugins["2110_io"] = {
         toast('Échec du changement de mire : ' + err.message, 'error');
       }
     }
+    // Délégation : toggle « Par NIC » — déplie/replie le détail des ports (sans refetch).
+    function onNicToggle(e){
+      const btn = e.target.closest('.io2110-nictoggle');
+      if (!btn || !body.contains(btn)) return;
+      _nicOpen = !_nicOpen;
+      _renderBody();
+    }
     // Délégation : changement de PORT (NIC) d'un slot — épinglage / retour à l'auto (multi-NIC).
     async function onPortChange(e){
       const sel = e.target.closest('.port-sel');
@@ -720,6 +795,7 @@ window.MXLPlugins["2110_io"] = {
     body.addEventListener('click', onClick);
     body.addEventListener('click', onClickIdent);
     body.addEventListener('click', onClickSdp);
+    body.addEventListener('click', onNicToggle);
     body.addEventListener('change', onPatternChange);
     body.addEventListener('change', onPortChange);
     body.addEventListener('pointerdown', onKnobDown);
