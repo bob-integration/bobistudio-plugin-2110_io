@@ -1,7 +1,12 @@
 {
-  "version": "0.33.0",
-  "date": "2026-06-29",
+  "version": "0.34.0",
+  "date": "2026-06-30",
   "changes": {
+    "Files AF-XDP actives PAR PORT (nic.ports[].active + hw_max_combined) (REBUILD, 0.34.0)": [
+      "nic.ports[] expose désormais `active` = sessions AF-XDP LIVE sur ce port (groupage des sessions par iface, mis à jour avec _xdp_sessions_active) + `hw_max_combined` = budget HW de files de CE port (ethtool -l par port).",
+      "Le moteur est le SEUL à pouvoir compter le live par port exactement : une session libmtl = une file MÊME en fan-out (1 multicast reçu par N slots = 1 session). Compter les flux côté orchestrateur sur-compterait. Permet la barre XDP par NIC (live/planifié/réservé/libre) en données réelles, pas approximées.",
+      "Le réservé par port (rx_queues+tx_queues) et le plafond par port étaient déjà connus ; il ne manquait que le live par port. REBUILD IMAGE bobi-mtl REQUIS (controller.py)."
+    ],
     "RX vidéo : plus de mire par défaut (symétrie audio) + badge générateur honnête (REBUILD, 0.33.0)": [
       "Un slot RX vidéo NON abonné générait une mire SMPTE par défaut (souvent au mauvais format, 1280×720 tant qu'aucun SDP), sans que l'UI n'indique le générateur comme actif → confusion (l'audio, lui, ne génère rien par défaut, plus clair).",
       "_simu_loop ne génère désormais la mire QUE si le générateur est explicitement actif (_ctl[idx].gen), exactement comme la tonalité audio gate sur _sim_tone.enabled. Slot non abonné + générateur off → RIEN écrit dans le shm (mode 'idle'), l'aval affiche 'NO SIGNAL'. Le générateur reste activable par slot (overrides le flux réel, comme avant).",

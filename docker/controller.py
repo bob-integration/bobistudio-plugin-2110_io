@@ -49,6 +49,10 @@ _cpu_last_usec = None
 _cpu_last_time = None
 _bw_last = {}
 _xdp_sessions_active = 0
+# Sessions AF-XDP actives PAR PORT physique ({iface: count}). Le moteur est le SEUL à savoir le vrai
+# compte par port : une session libmtl = une file, MÊME en fan-out (1 multicast → N slots = 1 session).
+# Compter les flux côté orchestrateur sur-compterait. Mis à jour avec _xdp_sessions_active.
+_xdp_active_per_iface = {}
 # Files RÉSERVÉES au dernier mtl_init (rx_queues/tx_queues passés au lancement). Distinct de
 # `_rx/_tx_queues_alloc` qui suit la DEMANDE courante (recalculée à chaque _write_config) : le daemon
 # ne relit PAS rx_queues après mtl_init → la réservation est FIGÉE jusqu'au prochain (re)lancement.
@@ -573,10 +577,14 @@ class MetricsHandler(BaseHTTPRequestHandler):
         for _if in IFACES:
             _rxg, _txg, _cap = _nic_bps(_if)
             _q = _qmap.get(_if, {})
+            _hwq = _nic_hw_queues(_if) if _if != IFACE else hw_q   # budget HW de files de CE port
             nic_ports.append({"iface": _if, "sip": _q.get("sip", ""),
                               "rx_gbps": _rxg, "tx_gbps": _txg,
                               "port_capacity_gbps": _cap, "link_up": _nic_link(_if),
                               "rx_queues": _q.get("rx_queues"), "tx_queues": _q.get("tx_queues"),
+                              # Sessions AF-XDP LIVE sur ce port (exact, fan-out compris) + plafond HW du port.
+                              "active": _xdp_active_per_iface.get(_if, 0),
+                              "hw_max_combined": (_hwq["max"] if _hwq else None),
                               "primary": _if in _auto_ports})
         port_cap = nic_ports[0]["port_capacity_gbps"] if nic_ports else 100.0
         def _sum_gbps(key):
@@ -1756,7 +1764,7 @@ def _manager_loop():
     config. Le daemon mtl_rx — lancé UNE fois et MAINTENU en vie (mtl_init à vie) — réconcilie les
     sessions à chaud : plus de kill/relance, ptp4l ne faute qu'au 1er lancement. On ne relance QUE
     si le daemon meurt (crash), avec backoff + purge XDP."""
-    global _mtl_proc, _cur_sig, _fail_streak, _xdp_sessions_active
+    global _mtl_proc, _cur_sig, _fail_streak, _xdp_sessions_active, _xdp_active_per_iface
     while True:
         groups = {}        # (mcast, port) → {"info": sdp, "idxs": [..]} — fan-out même-source
         for idx in range(N_VIDEO):
@@ -1833,6 +1841,11 @@ def _manager_loop():
                 _write_config(sessions)
             _cur_sig = sig
             _xdp_sessions_active = len(sessions)
+            _api = {}
+            for _s in sessions:
+                _ifc = _s.get("iface") or IFACE
+                _api[_ifc] = _api.get(_ifc, 0) + 1
+            _xdp_active_per_iface = _api
             print("mtl_rx config: {} session(s)".format(len(sessions)), flush=True)
 
         # 2) cycle de vie : lancé 1× au 1er besoin, maintenu en vie ; relancé seulement s'il a crashé

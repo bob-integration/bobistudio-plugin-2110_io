@@ -309,8 +309,10 @@ window.MXLPlugins["2110_io"] = {
 
     function _nicHeader(model, aggregateGbps) {
       if (!model) return '';
-      const shared = aggregateGbps <= 100 ? ' · <span class="nic-shared">agrégé 100G</span>' : '';
-      return `<div class="nic-model-lbl">${esc(model)}${shared}</div>`;
+      // Agrégat = somme des vitesses de lien réelles des ports de la carte (ex. 4×10 = 40G).
+      const agg = (aggregateGbps > 0)
+        ? ` · <span class="nic-shared">agrégé ${aggregateGbps}G</span>` : '';
+      return `<div class="nic-model-lbl">${esc(model)}${agg}</div>`;
     }
 
     // Couleur stable d'un réseau média (pastille red/blue de la bande de ports + badges de slot).
@@ -341,7 +343,20 @@ window.MXLPlugins["2110_io"] = {
           p.rx_queues != null ? ' · ' + p.rx_queues + ' files' : ''}</div>
       </div>`;
     }
-    // Bande de ports + bouton « Par NIC ». Mono-port (<2 ports) → '' (UI agrégée inchangée).
+    // Badge état PTP d'un port (SLAVE/MASTER/PASSIVE/LISTENING/FAULTY…) — couleur par état.
+    function _ptpBadge(state){
+      if (!state) return '';
+      const M = {SLAVE:['SLAVE','var(--status-running-fg,#22c55e)'], MASTER:['MASTER','#60a5fa'],
+        GRAND_MASTER:['GRAND MASTER','#60a5fa'], PRE_MASTER:['PRE-MASTER','#60a5fa'],
+        PASSIVE:['PASSIVE','var(--text-muted)'], LISTENING:['LISTENING','#e8a33d'],
+        UNCALIBRATED:['UNCAL','#e8a33d'], FAULTY:['FAULTY','var(--status-stopped-fg,#f87171)'],
+        DISABLED:['DISABLED','var(--text-muted)'], INITIALIZING:['INIT','var(--text-muted)']};
+      const [lbl,c] = M[state] || [state, 'var(--text-muted)'];
+      return `<span class="pc-ptp" style="color:${c};border-color:${c}" title="État PTP du port : ${esc(state)}">⏱ ${lbl}</span>`;
+    }
+    // Bande de ports + bouton « Par NIC ». Mono-port (<2 ports) → '' (UI agrégée inchangée). Le détail
+    // déplié montre PAR PORT, en barres PLEINE LARGEUR : débit RX + Queues XDP multi-segments
+    // (live/planifié/réservé/libre + repère plafond, comme la globale) sur le budget du PORT + état PTP.
     function _nicPortStrip(ports) {
       if (!ports || ports.length < 2) return '';
       const strip = ports.map(_portChip).join('');
@@ -349,17 +364,16 @@ window.MXLPlugins["2110_io"] = {
         ports.map(p => {
           const col = _netColor(p.network);
           const cap = p.port_capacity_gbps || 100;
-          const rxv = p.rx_gbps != null ? p.rx_gbps : p.rx_estimated_gbps;
-          const lines = [
-            p.network ? `Réseau : ${esc(p.network)}` : '',
-            rxv != null ? `RX : ${(p.rx_gbps == null ? '~' : '') + rxv.toFixed(1)} / ${cap} G` : '',
-            p.rx_flow_count != null ? `Flux RX : ${p.rx_flow_count}` : '',
-            (p.rx_queues != null || p.tx_queues != null) ? `Files XDP : ${(p.rx_queues || 0)} RX · ${(p.tx_queues || 0)} TX` : '',
-            `Lien : ${p.link_up === false ? '⚠ down' : (p.link_up ? 'up' : '—')}`,
-          ].filter(Boolean);
+          const rxBar = _nicBar(p.rx_gbps, p.rx_estimated_gbps, cap, 'RX');
+          const xdpBar = (p.xdp_hw && p.xdp_reserved != null)
+            ? _xdpBar(p.xdp_active || 0, p.xdp_planned, p.xdp_reserved, p.xdp_hw)
+            : '';
+          const flows = p.rx_flow_count != null ? `<span class="pc-meta">Flux RX : ${p.rx_flow_count}</span>` : '';
           return `<div class="io2110-portcard" style="border-left-color:${col}">
-            <h5><span style="color:${col}">${esc(p.iface)}</span>${p.primary ? '<span class="pc-prim">PRIM</span>' : ''}</h5>
-            ${lines.map(l => `<div class="pc-meta">${l}</div>`).join('')}</div>`;
+            <h5><span style="color:${col}">${esc(p.iface)}</span>${p.primary ? '<span class="pc-prim">PRIM</span>' : ''}
+              ${p.network ? `<span class="pc-net">${esc(p.network)}</span>` : ''}${_ptpBadge(p.ptp_state)}
+              <span class="pc-meta" style="margin-left:auto">${p.link_up === false ? '⚠ lien down' : (p.link_up ? 'lien up' : '')}</span></h5>
+            ${rxBar}${xdpBar}${flows}</div>`;
         }).join('')}</div>` : '';
       return `<div class="io2110-nicbar"><div class="io2110-portstrip">${strip}</div>
         <button class="io2110-nictoggle${_nicOpen ? ' on' : ''}"
@@ -399,7 +413,7 @@ window.MXLPlugins["2110_io"] = {
     // Barre « Queues XDP » multi-segments (B2+). active=sessions LIVE, planned=flux provisionnés (≥active),
     // reserved=plafond mtl_init, hw=files NIC. PLEIN=live · HACHURÉ=planifié (réagit aux ajouts) · PÂLE
     // ancré au marqueur (mangé de droite→gauche)=réservé libre · TRAIT=plafond à chaud. Tout en % des HW.
-    function _xdpBar(active, planned, reserved, hw){
+    function _xdpBar(active, planned, reserved, hw, scope){
       active   = Math.max(0, active || 0);
       planned  = Math.max(active, planned || active);
       reserved = Math.max(0, reserved || 0);
@@ -415,9 +429,9 @@ window.MXLPlugins["2110_io"] = {
       const ovrL = Math.max(aPct, rPct), ovrW = Math.max(0, planPct - ovrL);   // planifié au-delà (ambre)
       const freeL = pct(Math.min(Math.max(active, planned), reserved));
       const freeW = Math.max(0, rPct - freeL);
-      const txt = overQ
+      const txt = (overQ
         ? `${active} live · +${pend} planifié dont ${overQ} > réservé (${reserved}) → redéploiement`
-        : `${active} live · +${pend} planifié · ${freeQ} libre / ${hw} files`;
+        : `${active} live · +${pend} planifié · ${freeQ} libre / ${hw} files`) + (scope || '');
       return `<div class="nic-bar-wrap">
         <span class="nic-bar-lbl">Queues XDP</span>
         <span class="nic-bar-val" style="color:${overQ ? '#e8a33d' : col}">${txt}</span>
@@ -550,19 +564,26 @@ window.MXLPlugins["2110_io"] = {
       const _nicPortCap = (c && c.nic_port_capacity_gbps) || 100;
       const _nicAgg     = (c && c.nic_aggregate_gbps)     || 100;
       const _nicH   = _nicHeader((c && c.nic_model) || '', _nicAgg);
+      // Barre RX AGRÉGÉE : nic_rx_gbps = somme de tous les ports → dénominateur = agrégat de la
+      // carte (somme des vitesses, ex. 40G), PAS la capacité d'un seul port (10G). Le détail par
+      // port (chacun vs sa propre capacité) est dans la bande « Par NIC ».
       const _nicRxBar = _nicBar(
         (c && c.nic_rx_gbps != null) ? c.nic_rx_gbps : null,
         (c && c.nic_rx_estimated_gbps != null) ? c.nic_rx_estimated_gbps : null,
-        _nicPortCap, 'RX');
+        _nicAgg, 'RX');
       const _xdpAlloc    = c && c.xdp_allocated;
       const _xdpAct      = (c && c.xdp_active) ?? 0;
       const _xdpReserved = c && c.xdp_reserved;
       const _xdpPlanned  = (c && c.xdp_planned) ?? _xdpAct;
-      const _xdpHwMax    = c && c.xdp_hw_max_combined;
+      // active/reserved/planned = sommes sur TOUS les ports → on agrège aussi le budget HW (× nb de
+      // ports), le moteur ne reportant que celui d'un port. Barre cohérente « toutes NIC ».
+      const _nPorts      = ((c && c.nic_ports) || []).length;
+      const _xdpHwMax    = (_nPorts > 1 && c && c.xdp_hw_max_combined) ? c.xdp_hw_max_combined * _nPorts : (c && c.xdp_hw_max_combined);
+      const _xdpScope    = _nPorts > 1 ? ' · toutes NIC' : '';
       const _hasB2 = (_xdpReserved != null) && (_xdpHwMax != null) && _xdpHwMax > 0;
       let _nicXdpBar = '';
       if (_hasB2) {
-        _nicXdpBar = _xdpBar(_xdpAct, _xdpPlanned, _xdpReserved, _xdpHwMax);
+        _nicXdpBar = _xdpBar(_xdpAct, _xdpPlanned, _xdpReserved, _xdpHwMax, _xdpScope);
       } else if (_xdpAlloc != null) {
         // Repli image pré-A2 (pas de `reserved`) : ancien rendu allocated/HW.
         const _xdpDen     = _xdpHwMax || _xdpAlloc;
