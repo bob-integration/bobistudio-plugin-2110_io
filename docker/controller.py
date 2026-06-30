@@ -59,6 +59,18 @@ _xdp_active_per_iface = {}
 # C'est le « plafond à chaud » : au-delà, créer une session échoue tant qu'on n'a pas relancé.
 _rx_queues_reserved = 0
 _tx_queues_reserved = 0
+# Réservation PAR PORT figée au dernier mtl_init (liste de {iface,rx_queues,tx_queues}). Sert à
+# détecter, dans la boucle de réconciliation, qu'un port a besoin de PLUS de files que ce que le
+# daemon a réservé au lancement → relance ciblée (cf. _ports_need_relaunch). Sans ça, les sessions
+# ajoutées à chaud au-delà du budget gelé se créent mais n'obtiennent aucune file XDP → 0 fps.
+_ports_reserved = []
+# Headroom de files PAR PORT auto : marge pré-réservée à CHAQUE (re)lancement pour absorber des
+# ajouts à chaud (audio/ANC/récepteurs) SANS relance. Compromis capacité↔souplesse — le HW E810
+# offre 96 combined/port, la marge est quasi gratuite. Surchargeable par env (0 = comportement
+# strict d'avant). Au-delà du headroom, la boucle relance le daemon (debounce) pour ne jamais
+# rester muet (le bug historique : plafond figé ~8 = 2 files/port × 4 ports).
+_DEF_RX_HEADROOM = 4
+_DEF_TX_HEADROOM = 2
 # subsystem_device → (label, aggregate_gbps)  — source: Intel product brief + sysfs
 _E810_MODELS = {
     "0x0002": ("E810-CQDA2", 100),   # E810-C for QSFP 2-port, 1 controller (node-1 confirmé)
@@ -1108,6 +1120,8 @@ _audio_live = [False] * N_AUDIO   # slot audio idx servi par mtl_rx (SDP 2110-30
                                   # de la vidéo : un slot peut avoir la vidéo live SANS audio reçu.
 _last_launch = 0.0            # horodatage du dernier (re)lancement de mtl_rx
 _fail_streak = 0             # échecs rapides consécutifs (backoff)
+_sig_changed_at = 0.0        # horodatage du dernier changement de config (debounce de relance budget)
+_RELAUNCH_SETTLE_S = 3.0     # délai de stabilité config avant relance pour cause de budget de files
 
 # ─── Slots TX (émetteurs) — poussés par l'orchestrateur via :8081/tx ──────────
 # Chaque slot TX = une destination (mcast/port) + un shm d'ENTRÉE câblé (+ son format). Le manager
@@ -1555,8 +1569,12 @@ def _write_config(sessions):
     `MTL_RX_QUEUE_HEADROOM`/`MTL_TX_QUEUE_HEADROOM` (env, défaut 0) pré-réservent des files pour
     ajouter audio/ANC à chaud SANS réinit mtl (compromis capacité ↔ souplesse dynamique)."""
     global _rx_queues_alloc, _tx_queues_alloc, _ports_alloc
-    hr_rx = max(0, int(os.environ.get("MTL_RX_QUEUE_HEADROOM") or 0))
-    hr_tx = max(0, int(os.environ.get("MTL_TX_QUEUE_HEADROOM") or 0))
+    # Défaut = headroom non nul (cf. _DEF_*_HEADROOM) pour absorber les ajouts à chaud sans relance ;
+    # une valeur d'env explicite (même 0) prime.
+    _env_rx = os.environ.get("MTL_RX_QUEUE_HEADROOM")
+    _env_tx = os.environ.get("MTL_TX_QUEUE_HEADROOM")
+    hr_rx = max(0, int(_env_rx)) if _env_rx not in (None, "") else _DEF_RX_HEADROOM
+    hr_tx = max(0, int(_env_tx)) if _env_tx not in (None, "") else _DEF_TX_HEADROOM
     # Files PAR NIC : multi-NIC = chaque PF a son budget de files AF-XDP indépendant (48/E810). On
     # compte les sessions par iface (RX = non-'tx' : vidéo sans 'role', audio/ANC role='rx'). Une
     # session sans clé `iface` (config legacy) compte sur la NIC primaire. Le headroom (pré-réserve
@@ -1592,15 +1610,29 @@ def _launch_mtl():
     lancement (ou après un crash / `docker rm -f`) une instance précédente a pu laisser un programme
     XDP accroché (`native xdp dev init fail -5`) ET/OU des règles fdir sur le matériel (« socket add
     flow fail » → session muette). On repart d'une interface propre."""
-    global _mtl_proc, _last_launch, _rx_queues_reserved, _tx_queues_reserved
+    global _mtl_proc, _last_launch, _rx_queues_reserved, _tx_queues_reserved, _ports_reserved
+    # Si un daemon est ENCORE VIVANT (relance pour cause de budget de files, PAS un crash), il faut le
+    # TERMINER d'abord — sinon deux mtl_rx se disputent la même NIC/XDP (queues TX fatales « not dpdk
+    # user pmd », RX muet). Sur le chemin crash, poll() != None → ce bloc est un no-op.
+    if _mtl_proc is not None and _mtl_proc.poll() is None:
+        try:
+            _mtl_proc.terminate()
+            try:
+                _mtl_proc.wait(timeout=8)
+            except Exception:
+                _mtl_proc.kill(); _mtl_proc.wait(timeout=5)
+        except Exception as _e:
+            print("mtl_rx: arrêt du daemon précédent: {}".format(_e), flush=True)
+        time.sleep(0.5)   # laisse le noyau détacher le programme XDP du daemon sortant
     _xdp_off()
     _flush_ntuple()
     _mtl_proc = subprocess.Popen([MTL_RX, "--config", _CONFIG_PATH])
     _last_launch = time.time()
     # Fige la réservation effective = ce que le config porte À CET INSTANT (lu par mtl_init au boot du
-    # daemon). _write_config a déjà posé _rx/_tx_queues_alloc juste avant dans la boucle du manager.
+    # daemon). _write_config a déjà posé _rx/_tx_queues_alloc + _ports_alloc juste avant dans la boucle.
     _rx_queues_reserved = _rx_queues_alloc
     _tx_queues_reserved = _tx_queues_alloc
+    _ports_reserved = [dict(p) for p in _ports_alloc]   # réservation PAR PORT figée (détection de croissance)
     print("mtl_rx daemon (re)lancé", flush=True)
     # APRÈS le flush ntuple : PTP vers la queue noyau via RESTRICTION RSS (ethtool -N est incompatible
     # avec le flow-steering AF-XDP de libmtl) — sinon les Announce PTP sont avalés par les queues XSK.
@@ -1759,12 +1791,31 @@ def _update_tx_ident(idx):
         print("tx ident file err:", e, flush=True)
 
 
+def _ports_need_relaunch():
+    """True si un port demande (alloc) PLUS de files RX/TX que ce que le daemon a réservé au dernier
+    mtl_init (_ports_reserved). mtl_init ne relit pas rx/tx_queues à chaud → au-delà de la réserve,
+    les sessions se créent mais n'obtiennent aucune file XDP (0 fps). On relance alors le daemon pour
+    réserver le nouveau budget. Le headroom (_DEF_*_HEADROOM) espace ces relances ; le debounce de la
+    boucle les regroupe quand l'orchestrateur abonne plusieurs récepteurs en rafale."""
+    if not _ports_reserved:
+        return False
+    res = {p["iface"]: p for p in _ports_reserved}
+    for p in _ports_alloc:
+        r = res.get(p["iface"])
+        # Port nouvellement apparu, ou besoin RX/TX au-delà du réservé → relance.
+        if r is None or p["rx_queues"] > r["rx_queues"] or p["tx_queues"] > r["tx_queues"]:
+            return True
+    return False
+
+
 def _manager_loop():
     """Calcule l'ensemble RX voulu (SDP actifs, groupés par source pour le fan-out) et RÉÉCRIT le
     config. Le daemon mtl_rx — lancé UNE fois et MAINTENU en vie (mtl_init à vie) — réconcilie les
-    sessions à chaud : plus de kill/relance, ptp4l ne faute qu'au 1er lancement. On ne relance QUE
-    si le daemon meurt (crash), avec backoff + purge XDP."""
-    global _mtl_proc, _cur_sig, _fail_streak, _xdp_sessions_active, _xdp_active_per_iface
+    sessions à chaud : plus de kill/relance, ptp4l ne faute qu'au 1er lancement. On relance si le
+    daemon meurt (crash, backoff + purge XDP) OU si la demande de files dépasse la réserve gelée du
+    dernier mtl_init (sinon plafond muet ~8 = 2 files/port × 4 ports) — relance DEBOUNCÉE (config
+    stable depuis _RELAUNCH_SETTLE_S) pour regrouper une rafale d'abonnements en une seule réinit."""
+    global _mtl_proc, _cur_sig, _fail_streak, _xdp_sessions_active, _xdp_active_per_iface, _sig_changed_at
     while True:
         groups = {}        # (mcast, port) → {"info": sdp, "idxs": [..]} — fan-out même-source
         for idx in range(N_VIDEO):
@@ -1840,6 +1891,7 @@ def _manager_loop():
             with _mtl_lock:
                 _write_config(sessions)
             _cur_sig = sig
+            _sig_changed_at = time.time()
             _xdp_sessions_active = len(sessions)
             _api = {}
             for _s in sessions:
@@ -1848,11 +1900,22 @@ def _manager_loop():
             _xdp_active_per_iface = _api
             print("mtl_rx config: {} session(s)".format(len(sessions)), flush=True)
 
-        # 2) cycle de vie : lancé 1× au 1er besoin, maintenu en vie ; relancé seulement s'il a crashé
+        # 2) cycle de vie : lancé 1× au 1er besoin, maintenu en vie ; relancé si crash OU si la demande
+        #    de files dépasse la réserve gelée du dernier mtl_init (debounce : config stable depuis
+        #    _RELAUNCH_SETTLE_S pour regrouper une rafale d'abonnements en UNE seule réinit).
         dead = (_mtl_proc is not None and _mtl_proc.poll() is not None)
+        need_budget = (_mtl_proc is not None and not dead
+                       and _ports_need_relaunch()
+                       and (time.time() - _sig_changed_at) >= _RELAUNCH_SETTLE_S)
         with _mtl_lock:
             if _mtl_proc is None and sessions:
                 _launch_mtl()                               # 1er lancement (mtl_init → 1 seule faute PTP)
+            elif need_budget and sessions:
+                print("mtl_rx: demande de files > réserve ({} rx / {} tx alloc vs {} / {} réservé) → "
+                      "relance pour réserver le nouveau budget".format(
+                          _rx_queues_alloc, _tx_queues_alloc,
+                          _rx_queues_reserved, _tx_queues_reserved), flush=True)
+                _launch_mtl()                               # réinit pour étendre la réserve de files
             elif dead and sessions:
                 if (time.time() - _last_launch) < 6:
                     _fail_streak = min(_fail_streak + 1, 6)

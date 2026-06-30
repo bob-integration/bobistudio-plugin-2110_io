@@ -1,7 +1,20 @@
 {
-  "version": "0.34.0",
+  "version": "0.34.3",
   "date": "2026-06-30",
   "changes": {
+    "Registre de sessions mtl_rx 16 → 128 : le TX n'est plus éjecté par les RX (REBUILD, 0.34.3)": [
+      "2ᵉ plafond caché : `MAX_SESS=16` dans mtl_rx.c. Une session libmtl = un (mcast,port) distinct (les RX même-source sont fan-outés en UNE session). 16 sources RX distinctes remplissaient PILE le registre → les sessions TX (traitées après les RX dans la passe de réconciliation) étaient rejetées avec « mtl_rx: registre plein, session ignorée » → sortie TX entièrement muette (fps null, 0 paquet), SANS erreur visible côté contrôleur.",
+      "FIX : MAX_SESS porté à 128 (couvre 40+ entrées distinctes + audio/ANC + slots TX, large marge). `reg` est un tableau statique (BSS, ~18 Kio/session) → coût mémoire négligeable. C'était la cause du 'TX loopback à 0 après restart' : sans rapport avec la réserve de files RX (0.34.1/0.34.2), c'est l'arrivée à 16 RX qui saturait le registre. REBUILD IMAGE bobi-mtl (mtl_rx.c)."
+    ],
+    "Relance budget de files : TERMINER l'ancien daemon avant d'en relancer un (REBUILD, 0.34.2)": [
+      "La relance « budget » de 0.34.1 (quand la demande de files dépasse la réserve) appelait _launch_mtl SANS tuer le daemon mtl_rx encore vivant → DEUX mtl_rx se disputaient la même NIC/XDP : queues TX fatales (« st20_tx_queue_fatal_error: not dpdk user pmd » + video_trs_burst_fail hang 1000 ms) et RX entièrement muet. Le chemin crash n'était pas touché (le process était déjà mort).",
+      "FIX : _launch_mtl termine d'abord tout daemon ENCORE VIVANT (terminate→wait→kill, + court délai pour que le noyau détache le programme XDP du daemon sortant) avant de purger le XDP/ntuple et de relancer. Sur le chemin crash (poll()!=None) ce bloc est un no-op. La relance budget en place devient ainsi aussi propre qu'une recréation de conteneur."
+    ],
+    "Plafond de files figé levé : relance auto quand la demande dépasse la réserve du mtl_init (REBUILD, 0.34.1)": [
+      "BUG : le daemon mtl ne relit PAS rx/tx_queues après le mtl_init → la réservation de files AF-XDP était FIGÉE à l'instant du lancement (quand peu de sessions existaient). Les récepteurs ajoutés à chaud au-delà de ce budget gelé se créaient en mode 'mtl' mais n'obtenaient AUCUNE file XDP → 0 fps. Symptôme observé : plafond muet ~8 récepteurs (= 2 files/port × 4 ports E810), le reste abonné mais à 0 fps.",
+      "FIX : la boucle de réconciliation relance désormais le daemon quand un port demande PLUS de files RX/TX que ce qu'il a réservé au dernier mtl_init (_ports_need_relaunch compare _ports_alloc à _ports_reserved figé au lancement). Relance DEBOUNCÉE (config stable depuis _RELAUNCH_SETTLE_S=3 s) pour regrouper une rafale d'abonnements en UNE seule réinit (une seule faute PTP).",
+      "Headroom de files par défaut non nul (_DEF_RX_HEADROOM=4, _DEF_TX_HEADROOM=2 par port auto) pour absorber les ajouts à chaud SANS relance dans la marge (HW E810 = 96 combined/port, la marge est quasi gratuite). MTL_RX/TX_QUEUE_HEADROOM (env) prime si défini (0 = comportement strict d'avant). controller.py seul → REBUILD IMAGE bobi-mtl REQUIS."
+    ],
     "Files AF-XDP actives PAR PORT (nic.ports[].active + hw_max_combined) (REBUILD, 0.34.0)": [
       "nic.ports[] expose désormais `active` = sessions AF-XDP LIVE sur ce port (groupage des sessions par iface, mis à jour avec _xdp_sessions_active) + `hw_max_combined` = budget HW de files de CE port (ethtool -l par port).",
       "Le moteur est le SEUL à pouvoir compter le live par port exactement : une session libmtl = une file MÊME en fan-out (1 multicast reçu par N slots = 1 session). Compter les flux côté orchestrateur sur-compterait. Permet la barre XDP par NIC (live/planifié/réservé/libre) en données réelles, pas approximées.",

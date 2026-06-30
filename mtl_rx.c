@@ -47,7 +47,13 @@
 #include <openssl/sha.h>
 
 #define MAX_FB    64
-#define MAX_SESS  16
+/* Registre de sessions libmtl (RX + TX, toutes essences). Une session = un (mcast,port) distinct
+ * (les RX même-source sont fan-outés en UNE session à N cibles, cf. MAX_TG). DOIT couvrir le pire
+ * cas ACTIF : N RX vidéo distincts + audio/ANC RX + slots TX. À 16 il était PILE rempli par 16 RX
+ * vidéo → les sessions TX (traitées après) étaient rejetées (« registre plein ») → sortie TX muette.
+ * `reg` est statique (BSS) ⇒ ~18 Kio/sess, l'agrandir est quasi gratuit. 128 couvre 40+ entrées
+ * distinctes + audio + TX avec marge. */
+#define MAX_SESS  128
 #define MAX_TG    16   /* cibles (shm de sortie) par session : fan-out même-source → N slots */
 
 /* ── ANC / ST 2110-40 (data) ── un slot shm ANC sérialise un frame st40 (meta + udw). */
