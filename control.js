@@ -15,6 +15,26 @@ window.MXLPlugins["2110_io"] = {
     const body = el.querySelector('.rx-body') || el;
     const toast = (ctx && ctx.toast) || (()=>{});
 
+    // Toute action moteur DISRUPTIVE (relance mtl_init / recréation → coupure de TOUS les flux) est
+    // bloquée par le serveur (HTTP 409 + needs_confirm + reason). On confirme explicitement puis on
+    // ré-émet avec confirm:true. Les ops à chaud passent normalement (jamais de 409). Retourne la
+    // Response (ou null si l'utilisateur annule la confirmation).
+    const mtlMutate = async (url, payload) => {
+      payload = payload || {};
+      let r = await fetch(url, {method:'POST', headers:{'Content-Type':'application/json'},
+                                body: JSON.stringify(payload)});
+      if (r.status === 409) {
+        const j = await r.json().catch(()=>({}));
+        if (j && j.needs_confirm) {
+          if (!confirm((j.reason || 'Cette opération coupera brièvement TOUS les flux du moteur.')
+                       + '\n\nContinuer ?')) return null;
+          r = await fetch(url, {method:'POST', headers:{'Content-Type':'application/json'},
+                                body: JSON.stringify(Object.assign({}, payload, {confirm:true}))});
+        }
+      }
+      return r;
+    };
+
     const esc = s => String(s == null ? '' : s).replace(/[&<>"']/g, c => ({
       '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'
     }[c]));
@@ -485,22 +505,37 @@ window.MXLPlugins["2110_io"] = {
       const delBtn = ensVideoCount > 0
         ? `<button class="io2110-more-btn io2110-del-rx">− Retirer la dernière source</button>`
         : '';
+      // Remède famine : ≥1 source abonnée mais sans flux (rx_stalled) → bouton de réalignement des
+      // files (redéploiement du moteur). Disruptif → passe par mtlMutate (confirmation serveur).
+      const _anyStalled = recvs.some(r => r.rx_stalled);
+      const realignBtn = _anyStalled
+        ? `<button class="io2110-more-btn io2110-realign" title="Une ou plusieurs sources sont abonnées mais ne reçoivent aucun flux. Redéployer le moteur réaligne les files (coupure brève de TOUS les flux).">⟳ Redéployer pour réaligner les files</button>`
+        : '';
       // Création d'un flux INDÉPENDANT (audio/ANC sans vidéo d'attache).
       const indepAdd = `<div class="io2110-flowctrls io2110-indepadd">
         <span class="meta">Indépendant :</span>
         <button class="io2110-addflow" data-ess="audio" data-att="">+ Audio</button>
         <button class="io2110-addflow" data-ess="anc" data-att="">+ ANC</button>
       </div>`;
-      body.innerHTML = _cachedMeta + _nicPortStrip(_lastNicPorts) + inner + indepAdd + moreBtn + delBtn + _cachedTxHtml;
+      body.innerHTML = _cachedMeta + _nicPortStrip(_lastNicPorts) + inner + indepAdd + moreBtn + delBtn + realignBtn + _cachedTxHtml;
+      const realignEl = body.querySelector('.io2110-realign');
+      if (realignEl) {
+        realignEl.onclick = async () => {
+          realignEl.disabled = true;
+          try {
+            const r = await mtlMutate(`/api/mtl/${vmid}/realign`, {});
+            if (r && !r.ok) { const j = await r.json().catch(()=>({})); toast(j.error || 'Erreur réalignement', 'error'); }
+          } catch(e) { toast('Erreur réseau', 'error'); }
+          await refresh();
+        };
+      }
       // Ajout granulaire de flux (rattaché si data-att, sinon indépendant).
       body.querySelectorAll('.io2110-addflow').forEach(b => b.onclick = async () => {
         b.disabled = true;
         try {
-          const r = await fetch(`/api/mtl/${vmid}/flows/add`, {
-            method: 'POST', headers: {'Content-Type': 'application/json'},
-            body: JSON.stringify({role: 'rx', essence: b.dataset.ess, attached_to: b.dataset.att || null}),
-          });
-          if (!r.ok) { const j = await r.json().catch(()=>({})); toast(j.error || 'Erreur ajout flux', 'error'); }
+          const r = await mtlMutate(`/api/mtl/${vmid}/flows/add`,
+            {role: 'rx', essence: b.dataset.ess, attached_to: b.dataset.att || null});
+          if (r && !r.ok) { const j = await r.json().catch(()=>({})); toast(j.error || 'Erreur ajout flux', 'error'); }
         } catch(e) { toast('Erreur réseau', 'error'); }
         await refresh();
       });
@@ -523,11 +558,8 @@ window.MXLPlugins["2110_io"] = {
         moreEl.onclick = async () => {
           moreEl.disabled = true;
           try {
-            const r = await fetch(`/api/mtl/${vmid}/activate`, {
-              method: 'POST', headers: {'Content-Type': 'application/json'},
-              body: JSON.stringify({kind: 'rx'}),
-            });
-            if (!r.ok) { const j = await r.json().catch(()=>({})); toast(j.error || 'Erreur activation RX', 'error'); }
+            const r = await mtlMutate(`/api/mtl/${vmid}/activate`, {kind: 'rx'});
+            if (r && !r.ok) { const j = await r.json().catch(()=>({})); toast(j.error || 'Erreur activation RX', 'error'); }
           } catch(e) { toast('Erreur réseau', 'error'); }
           await refresh();
         };
@@ -575,10 +607,10 @@ window.MXLPlugins["2110_io"] = {
       const _xdpAct      = (c && c.xdp_active) ?? 0;
       const _xdpReserved = c && c.xdp_reserved;
       const _xdpPlanned  = (c && c.xdp_planned) ?? _xdpAct;
-      // active/reserved/planned = sommes sur TOUS les ports → on agrège aussi le budget HW (× nb de
-      // ports), le moteur ne reportant que celui d'un port. Barre cohérente « toutes NIC ».
+      // active/reserved/planned ET le budget HW sont désormais des SOMMES 4 ports fournies par le
+      // backend (xdp_hw_max_combined agrégé) — plus de rustine × _nPorts ici. Barre « toutes NIC ».
       const _nPorts      = ((c && c.nic_ports) || []).length;
-      const _xdpHwMax    = (_nPorts > 1 && c && c.xdp_hw_max_combined) ? c.xdp_hw_max_combined * _nPorts : (c && c.xdp_hw_max_combined);
+      const _xdpHwMax    = c && c.xdp_hw_max_combined;
       const _xdpScope    = _nPorts > 1 ? ' · toutes NIC' : '';
       const _hasB2 = (_xdpReserved != null) && (_xdpHwMax != null) && _xdpHwMax > 0;
       let _nicXdpBar = '';
