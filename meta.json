@@ -1,7 +1,12 @@
 {
-  "version": "0.34.3",
+  "version": "0.34.4",
   "date": "2026-06-30",
   "changes": {
+    "Plus de relance (ni gel aval) à chaque ajout de récepteur : réserve = budget ACTIF (REBUILD, 0.34.4)": [
+      "BUG de 0.34.1-0.34.3 : _ports_need_relaunch comparait la réserve+headroom (_ports_alloc) à la réserve+headroom figée (_ports_reserved) → le headroom s'ANNULAIT des deux côtés → toute hausse de demande au-delà du nombre de sessions au boot relançait le daemon. Or une relance = teardown de TOUS les flux RX → les multiviews aval GÈLENT (et certaines ne se reconnectent pas seules → recâblage manuel). Donc chaque récepteur ajouté pouvait geler les murs.",
+      "FIX : on suit la DEMANDE réelle par port (_ports_demand, sans headroom) et on la compare à la RÉSERVE (avec headroom + plancher). Le headroom crée enfin une vraie marge.",
+      "Plancher de réserve par port auto = budget ACTIF configuré (ACTIVE_RX_COUNT / ACTIVE_TX_COUNT réparti sur les ports auto). Le daemon réserve dès le 1er mtl_init de quoi tenir tout le budget actif → s'abonner jusqu'à ACTIVE_RX ne déclenche PLUS AUCUNE relance → les flux RX existants ne sont jamais coupés → pas de gel des consommateurs. La relance reste un filet (demande > budget). Coût : ~9,7 Mio d'UMEM par file réservée, négligeable devant la RAM du nœud. controller.py seul → REBUILD IMAGE bobi-mtl."
+    ],
     "Registre de sessions mtl_rx 16 → 128 : le TX n'est plus éjecté par les RX (REBUILD, 0.34.3)": [
       "2ᵉ plafond caché : `MAX_SESS=16` dans mtl_rx.c. Une session libmtl = un (mcast,port) distinct (les RX même-source sont fan-outés en UNE session). 16 sources RX distinctes remplissaient PILE le registre → les sessions TX (traitées après les RX dans la passe de réconciliation) étaient rejetées avec « mtl_rx: registre plein, session ignorée » → sortie TX entièrement muette (fps null, 0 paquet), SANS erreur visible côté contrôleur.",
       "FIX : MAX_SESS porté à 128 (couvre 40+ entrées distinctes + audio/ANC + slots TX, large marge). `reg` est un tableau statique (BSS, ~18 Kio/session) → coût mémoire négligeable. C'était la cause du 'TX loopback à 0 après restart' : sans rapport avec la réserve de files RX (0.34.1/0.34.2), c'est l'arrivée à 16 RX qui saturait le registre. REBUILD IMAGE bobi-mtl (mtl_rx.c)."

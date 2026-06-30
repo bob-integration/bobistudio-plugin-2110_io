@@ -64,6 +64,12 @@ _tx_queues_reserved = 0
 # daemon a réservé au lancement → relance ciblée (cf. _ports_need_relaunch). Sans ça, les sessions
 # ajoutées à chaud au-delà du budget gelé se créent mais n'obtiennent aucune file XDP → 0 fps.
 _ports_reserved = []
+# Demande RÉELLE par port (sessions effectives, SANS headroom ni plancher) — sert à décider la
+# relance : on compare la demande réelle à la RÉSERVE (qui, elle, inclut headroom + plancher).
+# Indispensable pour que le headroom crée une VRAIE marge : sinon (headroom des deux côtés de la
+# comparaison) il s'annule et toute hausse de demande au-delà du boot relancerait le daemon →
+# teardown des flux RX → gel des consommateurs aval (multiviews).
+_ports_demand = []
 # Headroom de files PAR PORT auto : marge pré-réservée à CHAQUE (re)lancement pour absorber des
 # ajouts à chaud (audio/ANC/récepteurs) SANS relance. Compromis capacité↔souplesse — le HW E810
 # offre 96 combined/port, la marge est quasi gratuite. Surchargeable par env (0 = comportement
@@ -1568,13 +1574,22 @@ def _write_config(sessions):
     même en vidéo-seule. Maintenant : exact → une RX vidéo-seule peut monter jusqu'aux ~48 files HW.
     `MTL_RX_QUEUE_HEADROOM`/`MTL_TX_QUEUE_HEADROOM` (env, défaut 0) pré-réservent des files pour
     ajouter audio/ANC à chaud SANS réinit mtl (compromis capacité ↔ souplesse dynamique)."""
-    global _rx_queues_alloc, _tx_queues_alloc, _ports_alloc
+    global _rx_queues_alloc, _tx_queues_alloc, _ports_alloc, _ports_demand
     # Défaut = headroom non nul (cf. _DEF_*_HEADROOM) pour absorber les ajouts à chaud sans relance ;
     # une valeur d'env explicite (même 0) prime.
     _env_rx = os.environ.get("MTL_RX_QUEUE_HEADROOM")
     _env_tx = os.environ.get("MTL_TX_QUEUE_HEADROOM")
     hr_rx = max(0, int(_env_rx)) if _env_rx not in (None, "") else _DEF_RX_HEADROOM
     hr_tx = max(0, int(_env_tx)) if _env_tx not in (None, "") else _DEF_TX_HEADROOM
+    # Plancher de réserve PAR PORT auto = budget ACTIF configuré (ACTIVE_RX / ACTIVE_TX_C) réparti sur
+    # les ports auto. On réserve dès le 1er mtl_init de quoi tenir TOUT le budget actif → s'abonner
+    # jusqu'à ACTIVE_RX ne déclenche AUCUNE relance (donc aucun teardown des flux RX → pas de gel des
+    # multiviews aval). Le daemon ne relance que si la demande dépasse ce plancher+headroom (cas
+    # anormal / dépassement du budget). 1 file XDP ≈ 9,7 Mio d'UMEM — réserver le budget actif est
+    # peu coûteux devant la RAM du nœud, et bien plus sûr que relancer à chaque ajout.
+    _n_auto = max(1, len(_auto_ports))
+    floor_rx = (ACTIVE_RX + _n_auto - 1) // _n_auto if ACTIVE_RX > 0 else 0
+    floor_tx = (ACTIVE_TX_C + _n_auto - 1) // _n_auto if ACTIVE_TX_C > 0 else 0
     # Files PAR NIC : multi-NIC = chaque PF a son budget de files AF-XDP indépendant (48/E810). On
     # compte les sessions par iface (RX = non-'tx' : vidéo sans 'role', audio/ANC role='rx'). Une
     # session sans clé `iface` (config legacy) compte sur la NIC primaire. Le headroom (pré-réserve
@@ -1585,16 +1600,22 @@ def _write_config(sessions):
         nic = s.get("iface") or IFACE
         d = tx_per if s.get("role") == "tx" else rx_per
         d[nic] = d.get(nic, 0) + 1
-    ports = []
+    ports = []     # RÉSERVE écrite au daemon = max(demande, plancher actif) + headroom (ports auto)
+    demand = []    # DEMANDE réelle (sessions effectives) — base de la décision de relance
     for i, nic in enumerate(IFACES):
-        _hr = nic in _auto_ports          # headroom seulement sur les ports recevant l'auto-répartition
+        _hr = nic in _auto_ports          # plancher + headroom seulement sur les ports d'auto-répartition
+        d_rx = rx_per.get(nic, 0)
+        d_tx = tx_per.get(nic, 0)
+        rq = (max(d_rx, floor_rx) + hr_rx) if _hr else d_rx
+        tq = (max(d_tx, floor_tx) + hr_tx) if _hr else d_tx
         ports.append({"iface": nic, "sip": SIPS[i] if i < len(SIPS) else "",
-                      "rx_queues": max(1, rx_per.get(nic, 0) + (hr_rx if _hr else 0)),
-                      "tx_queues": max(1, tx_per.get(nic, 0) + (hr_tx if _hr else 0))})
+                      "rx_queues": max(1, rq), "tx_queues": max(1, tq)})
+        demand.append({"iface": nic, "rx_queues": d_rx, "tx_queues": d_tx})
     # Totaux (exposés :8080 xdp.allocated + réservation au lancement du daemon).
     _rx_queues_alloc = sum(p["rx_queues"] for p in ports)
     _tx_queues_alloc = sum(p["tx_queues"] for p in ports)
-    _ports_alloc = ports   # mémorisé pour ventiler les stats par port sur :8080 (nic.ports)
+    _ports_alloc = ports     # réservation par port (stats :8080 nic.ports + figée au lancement)
+    _ports_demand = demand   # demande réelle par port (décision de relance vs _ports_reserved)
     with open(_CONFIG_PATH, "w") as f:
         # `ports` = source de vérité (mtl_rx le lit en priorité). iface/sip/rx_queues/tx_queues
         # scalaires = repli rétro-compat (1ʳᵉ NIC) pour un mtl_rx antérieur au multi-port.
@@ -1792,17 +1813,21 @@ def _update_tx_ident(idx):
 
 
 def _ports_need_relaunch():
-    """True si un port demande (alloc) PLUS de files RX/TX que ce que le daemon a réservé au dernier
-    mtl_init (_ports_reserved). mtl_init ne relit pas rx/tx_queues à chaud → au-delà de la réserve,
-    les sessions se créent mais n'obtiennent aucune file XDP (0 fps). On relance alors le daemon pour
-    réserver le nouveau budget. Le headroom (_DEF_*_HEADROOM) espace ces relances ; le debounce de la
-    boucle les regroupe quand l'orchestrateur abonne plusieurs récepteurs en rafale."""
+    """True si la DEMANDE RÉELLE d'un port (_ports_demand : sessions effectives) dépasse ce que le
+    daemon a RÉSERVÉ au dernier mtl_init (_ports_reserved = max(demande, plancher actif) + headroom).
+    mtl_init ne relit pas rx/tx_queues à chaud → au-delà de la réserve, une session se crée mais
+    n'obtient aucune file XDP (0 fps) ; on relance alors pour étendre la réserve.
+
+    On compare la DEMANDE (sans headroom) à la RÉSERVE (avec headroom + plancher) — sinon le headroom,
+    présent des deux côtés, s'annulerait et toute hausse de demande au-delà du boot relancerait le
+    daemon (teardown des flux RX → gel des consommateurs). Avec le plancher dimensionné au budget
+    ACTIF, s'abonner jusqu'à ACTIVE_RX ne franchit jamais la réserve → aucune relance en usage normal."""
     if not _ports_reserved:
         return False
     res = {p["iface"]: p for p in _ports_reserved}
-    for p in _ports_alloc:
+    for p in _ports_demand:
         r = res.get(p["iface"])
-        # Port nouvellement apparu, ou besoin RX/TX au-delà du réservé → relance.
+        # Port nouvellement apparu, ou demande RX/TX réelle au-delà de la réserve figée → relance.
         if r is None or p["rx_queues"] > r["rx_queues"] or p["tx_queues"] > r["tx_queues"]:
             return True
     return False
