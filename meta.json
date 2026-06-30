@@ -1,7 +1,11 @@
 {
-  "version": "0.34.4",
+  "version": "0.34.5",
   "date": "2026-06-30",
   "changes": {
+    "Réserve de files PAR INTERFACE pilotée par l'opérateur (env PORT_RESERVE) (REBUILD, 0.34.5)": [
+      "Le moteur lit un nouvel env PORT_RESERVE (JSON {iface:{rx,tx,hr}}) = réserve de files AF-XDP par interface réglée dans Réglages → Réseau (table node_interfaces, colonnes rx_reserve/tx_reserve/queue_margin, plafonnée au budget de files de la carte). _write_config l'utilise comme PLANCHER de réserve par port (override du plancher auto basé sur ACTIVE_RX). Absent ou clé non réglée → plancher par défaut (rétro-compat 0.34.4 stricte).",
+      "Côté orchestrateur (docker_driver) : PORT_RESERVE est construit depuis les interfaces media2110 du nœud, ET _auto_lcores dimensionne désormais les lcores sur max(usage actif, capacité réservée) — sinon on saturerait les cœurs (no available lcore) avant les files lors d'un ajout à chaud. La capacité « à chaud » (sans ré-init ni gel des multiviews) devient ainsi explicitement choisie par carte. controller.py seul → REBUILD IMAGE bobi-mtl."
+    ],
     "Plus de relance (ni gel aval) à chaque ajout de récepteur : réserve = budget ACTIF (REBUILD, 0.34.4)": [
       "BUG de 0.34.1-0.34.3 : _ports_need_relaunch comparait la réserve+headroom (_ports_alloc) à la réserve+headroom figée (_ports_reserved) → le headroom s'ANNULAIT des deux côtés → toute hausse de demande au-delà du nombre de sessions au boot relançait le daemon. Or une relance = teardown de TOUS les flux RX → les multiviews aval GÈLENT (et certaines ne se reconnectent pas seules → recâblage manuel). Donc chaque récepteur ajouté pouvait geler les murs.",
       "FIX : on suit la DEMANDE réelle par port (_ports_demand, sans headroom) et on la compare à la RÉSERVE (avec headroom + plancher). Le headroom crée enfin une vraie marge.",

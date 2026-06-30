@@ -270,6 +270,27 @@ def _parse_iface_map(envname):
 RX_PINS = _parse_iface_map("RX_PINS")   # {slot: ifname} ; mutable à chaud (:8081/pin)
 _pins_lock = threading.Lock()
 
+def _parse_port_reserve():
+    """PORT_RESERVE (env JSON {iface:{rx,tx,hr}}) = réserve de files par interface réglée par
+    l'opérateur (node_interfaces → Réglages Réseau). Sert de PLANCHER de réserve par port dans
+    _write_config (capacité « à chaud » prévisible). Clés absentes → plancher par défaut du moteur.
+    Restreint aux IFACES connues. Vide → comportement par défaut (rétro-compat)."""
+    out = {}
+    try:
+        m = json.loads(os.environ.get("PORT_RESERVE") or "{}")
+        for k, v in (m or {}).items():
+            if k in IFACES and isinstance(v, dict):
+                e = {}
+                for kk in ("rx", "tx", "hr"):
+                    if v.get(kk) is not None:
+                        e[kk] = max(0, int(v[kk]))
+                if e:
+                    out[k] = e
+    except Exception as _e:
+        print("PORT_RESERVE invalide, ignoré: {}".format(_e), flush=True)
+    return out
+PORT_RESERVE = _parse_port_reserve()
+
 def _auto_iface(idx):
     """Port auto pour un slot non épinglé : modulo stable sur les ports du réseau primaire."""
     return _auto_ports[int(idx) % len(_auto_ports)] if _auto_ports else IFACE
@@ -1600,14 +1621,21 @@ def _write_config(sessions):
         nic = s.get("iface") or IFACE
         d = tx_per if s.get("role") == "tx" else rx_per
         d[nic] = d.get(nic, 0) + 1
-    ports = []     # RÉSERVE écrite au daemon = max(demande, plancher actif) + headroom (ports auto)
+    ports = []     # RÉSERVE écrite au daemon = max(demande, plancher) + marge
     demand = []    # DEMANDE réelle (sessions effectives) — base de la décision de relance
     for i, nic in enumerate(IFACES):
-        _hr = nic in _auto_ports          # plancher + headroom seulement sur les ports d'auto-répartition
+        _hr = nic in _auto_ports          # plancher auto seulement sur les ports d'auto-répartition
         d_rx = rx_per.get(nic, 0)
         d_tx = tx_per.get(nic, 0)
-        rq = (max(d_rx, floor_rx) + hr_rx) if _hr else d_rx
-        tq = (max(d_tx, floor_tx) + hr_tx) if _hr else d_tx
+        # Plancher/marge : override OPÉRATEUR par interface (PORT_RESERVE, réglé Réglages → Réseau)
+        # si présent, sinon plancher AUTO (budget actif réparti, ports auto uniquement).
+        _ov = PORT_RESERVE.get(nic) or {}
+        fl_rx = _ov["rx"] if "rx" in _ov else (floor_rx if _hr else 0)
+        fl_tx = _ov["tx"] if "tx" in _ov else (floor_tx if _hr else 0)
+        mg_rx = _ov["hr"] if "hr" in _ov else (hr_rx if _hr else 0)
+        mg_tx = hr_tx if _hr else 0
+        rq = max(d_rx, fl_rx) + mg_rx
+        tq = max(d_tx, fl_tx) + mg_tx
         ports.append({"iface": nic, "sip": SIPS[i] if i < len(SIPS) else "",
                       "rx_queues": max(1, rq), "tx_queues": max(1, tq)})
         demand.append({"iface": nic, "rx_queues": d_rx, "tx_queues": d_tx})
