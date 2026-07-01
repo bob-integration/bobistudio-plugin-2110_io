@@ -402,6 +402,7 @@ window.MXLPlugins["2110_io"] = {
     }
 
     let _cachedEnsembles = [];
+    let _cachedRecvs      = [];  // dernier recvs reçu (refresh) — lu par _renderBody (fonction sœur)
     let _nicOpen          = false;  // multi-NIC : détail « Par NIC » déplié (état local de la carte)
     let _lastNicPorts     = [];     // dernier nic_ports reçu (pour reconstruire la bande au toggle)
     let _cachedMeta      = '';
@@ -507,7 +508,7 @@ window.MXLPlugins["2110_io"] = {
         : '';
       // Remède famine : ≥1 source abonnée mais sans flux (rx_stalled) → bouton de réalignement des
       // files (redéploiement du moteur). Disruptif → passe par mtlMutate (confirmation serveur).
-      const _anyStalled = recvs.some(r => r.rx_stalled);
+      const _anyStalled = _cachedRecvs.some(r => r.rx_stalled);
       const realignBtn = _anyStalled
         ? `<button class="io2110-more-btn io2110-realign" title="Une ou plusieurs sources sont abonnées mais ne reçoivent aucun flux. Redéployer le moteur réaligne les files (coupure brève de TOUS les flux).">⟳ Redéployer pour réaligner les files</button>`
         : '';
@@ -588,6 +589,7 @@ window.MXLPlugins["2110_io"] = {
             cs = (cd && cd.length) ? cd[0] : null; }
       catch(e){ cs = null; }
       const recvs = (c && c.receivers) || [];
+      _cachedRecvs = recvs;
       _nodePorts = (c && c.ports) || [];
       const activeCount = recvs.filter(x => x.active).length;
       _cachedVideoCount = (c && c.video_count) || recvs.length;

@@ -33,9 +33,11 @@ def before_deploy(params, context):
     éviter le conflit de flow sur la même 5-uplet. Le shm d'entrée (tx{i}_shm) vient du câblage."""
     params = normalize_receiver_params(params, settings=context.get("settings"))
     vmid = int(context.get("vmid", 0))
+    node_id = context.get("node_id")
     n_tx = int(params.get("tx_count") or 0)
     nv   = int(params.get("video_count") or 0)
     from app import io2110_flows as _iof
+    from app.allocations import allocate_multicast_for, _egress_iface
     # active_rx_count / active_tx_count : fenêtre de visibilité NMOS. POSÉS D'ABORD (avant de dériver
     # les flux) car la dérivation legacy s'appuie dessus. setdefault → préservés au re-déploiement.
     params.setdefault("active_rx_count", min(8, nv))
@@ -62,8 +64,6 @@ def before_deploy(params, context):
     while len(slots) < n_tx:
         slots.append({})
     for i, t in enumerate(slots[:n_tx]):
-        t.setdefault("multicast_ip", f"239.10.30.{(vmid + i) % 254 + 1}")
-        t.setdefault("dest_port", 5000)
         t.setdefault("payload_type", 96)
         # Format GÉN par slot : défaut = format du moteur ; un override (page Destinations) est
         # préservé (setdefault). Ne sert qu'au générateur/mire : un slot CÂBLÉ suit sa source
@@ -81,6 +81,19 @@ def before_deploy(params, context):
             sess_fps = float(params.get("fps") or 25)
             if sess_fps > 0 and float(t.get("fps") or 0) > sess_fps * 1.5:
                 t["fps"] = sess_fps
+        # Adresse/port du leg0 : allouée par le résolveur centralisé (règles réseau/interface si
+        # posées, sinon pool global historique) — RÉSOLU UNE FOIS le port physique d'égression du
+        # slot (ifn/netid), réutilisé pour vidéo + tous ses audios/ANC (même NIC de sortie).
+        ifn, netid = _egress_iface(node_id, params, i, leg=0)
+        fmt_v = {"scan": t.get("scan"), "width": t.get("width"), "height": t.get("height"), "fps": t.get("fps")}
+        if not t.get("multicast_ip"):
+            ip, prt = allocate_multicast_for(node_id, ifn, media_network_id=netid,
+                                             essence="video", leg=0, port=5000, fmt=fmt_v,
+                                             owner_ref=f"tx:{vmid}:{i}:video:leg0")
+            if ip:
+                t["multicast_ip"], t["dest_port"] = ip, prt
+            else:
+                t.setdefault("dest_port", 5000)
         # Audios du slot = flux audio ATTACHÉS (tx_flows), N quelconque (plus de cap à 2). Les
         # mcast/port sont alloués par idx FLAT de flux → uniques même au-delà de 2 audios/slot.
         # Un slot vidéo-seul (0 flux audio attaché) n'a aucune destination audio. Les slots SANS
@@ -91,26 +104,48 @@ def before_deploy(params, context):
             audios = []
             for ai, aidx in enumerate(aud_idxs):
                 a = dict(existing[ai]) if ai < len(existing) else {}
-                a.setdefault("multicast_ip", f"239.10.{40 + (aidx % 8)}.{(vmid * 2 + aidx) % 254 + 1}")
-                a.setdefault("dest_port", 5004 + aidx * 2)
+                if not a.get("multicast_ip"):
+                    ipa, pa = allocate_multicast_for(node_id, ifn, media_network_id=netid, essence="audio",
+                                                     leg=0, port=5004 + aidx * 2, fmt={"channels": 8},
+                                                     owner_ref=f"tx:{vmid}:{i}:audio:{aidx}:leg0")
+                    if ipa:
+                        a["multicast_ip"], a["dest_port"] = ipa, pa
                 # Générateur de tonalité par sous-flux audio — défaut OFF, 1 kHz / -18 dBFS.
                 a.setdefault("tone", {"enabled": False, "freq": 1000, "level_db": -18.0,
                                       "active": [True] * 8, "rupted": [False] * 8})
                 audios.append(a)
             t["audios"] = audios
-        # ANC TX (1 flux par slot) : plage 239.10.50.x
-        t.setdefault("anc_multicast_ip", f"239.10.50.{(vmid + i) % 254 + 1}")
-        t.setdefault("anc_dest_port", 5008 + i * 2)
-        # SMPTE 2022-7 — leg1 auto-allouée une seule fois (setdefault : ne pas écraser)
+        # ANC TX (1 flux par slot)
+        if not t.get("anc_multicast_ip"):
+            ipd, pd = allocate_multicast_for(node_id, ifn, media_network_id=netid, essence="anc",
+                                             leg=0, port=5008 + i * 2,
+                                             owner_ref=f"tx:{vmid}:{i}:anc:leg0")
+            if ipd:
+                t["anc_multicast_ip"], t["anc_dest_port"] = ipd, pd
+        # SMPTE 2022-7 — leg1 auto-alloué une seule fois (guard explicite : ne pas écraser), sur
+        # l'interface PAIRÉE (red/blue) du leg0 si déclarée, même format que le leg0.
         if params.get("smpte_2022_7"):
-            t.setdefault("multicast_ip_leg1", f"239.10.130.{(vmid + i) % 254 + 1}")
-            t.setdefault("dest_port_leg1", t.get("dest_port") or 5000)
+            ifn1, netid1 = _egress_iface(node_id, params, i, leg=1)
+            if not t.get("multicast_ip_leg1"):
+                ip1, p1 = allocate_multicast_for(node_id, ifn1, media_network_id=netid1, essence="video",
+                                                 leg=1, port=t.get("dest_port") or 5000, fmt=fmt_v,
+                                                 owner_ref=f"tx:{vmid}:{i}:video:leg1")
+                if ip1:
+                    t["multicast_ip_leg1"], t["dest_port_leg1"] = ip1, p1
             for ai, a in enumerate(t.get("audios") or []):
                 aidx = aud_idxs[ai] if ai < len(aud_idxs) else ai
-                a.setdefault("multicast_ip_leg1", f"239.10.{140 + (aidx % 8)}.{(vmid * 2 + aidx) % 254 + 1}")
-                a.setdefault("dest_port_leg1", a.get("dest_port") or 5004)
-            t.setdefault("anc_multicast_ip_leg1", f"239.10.150.{(vmid + i) % 254 + 1}")
-            t.setdefault("anc_dest_port_leg1", t.get("anc_dest_port") or 5008)
+                if not a.get("multicast_ip_leg1"):
+                    ipa1, pa1 = allocate_multicast_for(node_id, ifn1, media_network_id=netid1, essence="audio",
+                                                       leg=1, port=a.get("dest_port") or 5004, fmt={"channels": 8},
+                                                       owner_ref=f"tx:{vmid}:{i}:audio:{aidx}:leg1")
+                    if ipa1:
+                        a["multicast_ip_leg1"], a["dest_port_leg1"] = ipa1, pa1
+            if not t.get("anc_multicast_ip_leg1"):
+                ipd1, pd1 = allocate_multicast_for(node_id, ifn1, media_network_id=netid1, essence="anc",
+                                                   leg=1, port=t.get("anc_dest_port") or 5008,
+                                                   owner_ref=f"tx:{vmid}:{i}:anc:leg1")
+                if ipd1:
+                    t["anc_multicast_ip_leg1"], t["anc_dest_port_leg1"] = ipd1, pd1
     params["tx_slots"] = slots[:n_tx]
     # Pool d'entrées audio TX (capacité contrôleur) : ≥ legacy (n_tx × défaut) ET ≥ plus haut idx de
     # flux audio + 1 (réserve les slots pour le hot-add). tx_audio_count = repeat du manifeste.
