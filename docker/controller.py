@@ -19,7 +19,7 @@
 #
 # Ce fichier est exécuté tel quel dans le conteneur (pas de str.format) → accolades normales.
 
-import json, mmap, os, re, signal, struct, subprocess, threading, time
+import json, mmap, os, re, signal, struct, subprocess, threading, time, zlib
 import numpy as np
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
@@ -1095,6 +1095,7 @@ def _audio_tx_session(idx, acfg, shm_in, iface=IFACE):
     """Session TX audio st30 : émet le shm audio d'entrée (BE passthrough) vers la dest audio."""
     return {"kind": "audio", "role": "tx", "iface": iface,
             "mcast": acfg["mcast"], "udp_port": acfg["port"], "payload_type": acfg.get("pt", 97),
+            "ssrc": _ssrc("{}:tx:a:{}".format(HOSTNAME, idx)),
             "channels": A_CHANNELS, "ptime": A_PTIME_DEF, "ring": A_RING, "hdr": HDR,
             "targets": [{"idx": idx, "shm": shm_in, "stats": "/tmp/mtl_atx{}.json".format(idx)}]}
 
@@ -1130,6 +1131,7 @@ def _anc_tx_session(idx, t, shm_in, iface=IFACE):
     """Session TX ANC st40 : ré-émet le shm ANC d'entrée (passthrough) vers la dest ANC du slot."""
     return {"kind": "data", "role": "tx", "iface": iface,
             "mcast": t["anc_mcast"], "udp_port": t["anc_port"], "payload_type": t.get("anc_pt", 97),
+            "ssrc": _ssrc("{}:tx:anc:{}".format(HOSTNAME, idx)),
             "fps": t.get("fps") or FPS, "ring": 8, "hdr": HDR,
             "targets": [{"idx": idx, "shm": shm_in, "stats": "/tmp/mtl_anctx{}.json".format(idx)}]}
 
@@ -1381,6 +1383,7 @@ def _tx_session(idx, t, iface=IFACE):
         _fps /= 2.0
     return {"kind": "video", "role": "tx", "iface": iface,
             "mcast": t["mcast"], "udp_port": t["udp_port"], "payload_type": t["pt"],
+            "ssrc": _ssrc("{}:tx:v:{}".format(HOSTNAME, idx)),
             "width": t["w"], "height": t["h"], "fps": _fps,
             # Passthrough du balayage : on ré-émet en entrelacé si la source câblée l'est.
             "interlaced": (t.get("scan") == "i"), "field_order": t.get("field_order") or "tff",
@@ -1389,6 +1392,26 @@ def _tx_session(idx, t, iface=IFACE):
             # le fichier n'existe que quand l'IDENT est actif (mtl_rx libère le patch sinon).
             "targets": [{"idx": idx, "shm": shm, "stats": "/tmp/mtl_tx{}.json".format(idx),
                          "ident_file": _tx_ident_file(idx)}]}
+
+
+_SDP_ORIGIN_ID = int(time.time())   # o= sess-id : fixe pour la durée du process (identifie CETTE
+                                     # instance moteur), jamais 0 — RFC4566 attend un identifiant
+                                     # de session réellement unique, certains récepteurs (Blackmagic)
+                                     # s'appuient dessus pour détecter un SDP re-servi vs neuf.
+
+def _sdp_origin():
+    """Ligne o= : sess-id fixe au process (unicité de session), sess-version = horodatage courant
+    (signale un SDP fraîchement (re)généré à chaque fetch, cf. RFC4566 §5.2)."""
+    return "{} {}".format(_SDP_ORIGIN_ID, int(time.time()))
+
+
+def _ssrc(label):
+    """SSRC RFC3550 stable (dérivé du label, ex. 'HOST:tx:v:0') pour un slot TX. Fixe (≠0) afin que
+    le SDP annoncé (a=ssrc) et le SSRC réellement émis par mtl_rx matchent — certains récepteurs
+    (ex. Blackmagic) valident les paquets RTP entrants contre le a=ssrc du SDP et rejettent le flux
+    si le SDP n'en porte pas (libmtl tire alors un SSRC aléatoire par session, invérifiable a priori).
+    Masqué à 31 bits : json-c (mtl_rx) lit ce champ en int signé côté parsing du config."""
+    return zlib.crc32(label.encode()) & 0x7fffffff
 
 
 _FR = {25.0: "25", 50.0: "50", 24.0: "24", 30.0: "30", 60.0: "60", 100.0: "100", 120.0: "120",
@@ -1412,37 +1435,48 @@ def _tx_sdp(i, t):
     if interlaced and _fps > 30:
         _fps /= 2.0
     fr    = _fps_str(_fps)
+    # TCS/RANGE : optionnels selon ST 2110-20 mais plusieurs récepteurs Blackmagic refusent de
+    # locker un flux dont le SDP ne les déclare pas explicitement (repli implicite ambigu côté
+    # device). Valeurs par défaut de la norme (SDR / NARROW) déclarées en toutes lettres.
     fmtp  = ("sampling=YCbCr-4:2:2; width={w}; height={h}; exactframerate={fr}; depth=10; "
-             "{scan}colorimetry=BT709; PM=2110GPM; SSN=ST2110-20:2017; TP=2110TPN;").format(
+             "{scan}TCS=SDR; colorimetry=BT709; RANGE=NARROW; "
+             "PM=2110GPM; SSN=ST2110-20:2017; TP=2110TPN;").format(
              w=w, h=h, fr=fr, scan=scan)
     dual = bool(t.get("mcast2") and t.get("udp_port2"))
+    # SSRC fixe (même valeur que ops.port.ssrc côté mtl_rx, cf. _tx_session) : certains récepteurs
+    # (Blackmagic) valident le SSRC des paquets RTP contre le a=ssrc annoncé et rejettent le flux
+    # si le SDP n'en porte pas.
+    ssrc = _ssrc("{}:tx:v:{}".format(HOSTNAME, i))
+    ssrc_line = "a=ssrc:{} cname:{}\r\n".format(ssrc, HOSTNAME)
     leg0 = (
         "m=video {port} RTP/AVP {pt}\r\n"
-        "c=IN IP4 {mcast}/64\r\n"
+        "c=IN IP4 {mcast}/255\r\n"
         "{mid}"
-        "a=source-filter: incl IN IP4 {mcast} {sip}\r\n"
+        "a=source-filter:incl IN IP4 {mcast} {sip}\r\n"
         "a=rtpmap:{pt} raw/90000\r\n"
         "a=fmtp:{pt} {fmtp}\r\n"
         "{refclk}"
         "a=mediaclk:direct=0\r\n"
+        "{ssrc}"
     ).format(port=int(t.get("udp_port") or 0), pt=pt, mcast=t.get("mcast") or "0.0.0.0",
-             sip=sip, fmtp=fmtp, refclk=_LOCALMAC_REFCLK,
+             sip=sip, fmtp=fmtp, refclk=_LOCALMAC_REFCLK, ssrc=ssrc_line,
              mid="a=mid:DUP-1\r\n" if dual else "")
     grp = "a=group:DUP DUP-1 DUP-2\r\n" if dual else ""
-    sdp = "v=0\r\no=- 0 0 IN IP4 {sip}\r\ns={hn} TX{i}\r\nt=0 0\r\n{grp}".format(
-          sip=sip, hn=HOSTNAME, i=i, grp=grp) + leg0
+    sdp = "v=0\r\no=- {origin} IN IP4 {sip}\r\ns={hn} TX{i}\r\nt=0 0\r\n{grp}".format(
+          origin=_sdp_origin(), sip=sip, hn=HOSTNAME, i=i, grp=grp) + leg0
     if dual:
         leg1 = (
             "m=video {port} RTP/AVP {pt}\r\n"
-            "c=IN IP4 {mcast}/64\r\n"
+            "c=IN IP4 {mcast}/255\r\n"
             "a=mid:DUP-2\r\n"
-            "a=source-filter: incl IN IP4 {mcast} {sip}\r\n"
+            "a=source-filter:incl IN IP4 {mcast} {sip}\r\n"
             "a=rtpmap:{pt} raw/90000\r\n"
             "a=fmtp:{pt} {fmtp}\r\n"
             "{refclk}"
             "a=mediaclk:direct=0\r\n"
+            "{ssrc}"
         ).format(port=int(t["udp_port2"]), pt=pt, mcast=t["mcast2"], sip=sip, fmtp=fmtp,
-                 refclk=_LOCALMAC_REFCLK)
+                 refclk=_LOCALMAC_REFCLK, ssrc=ssrc_line)
         sdp += leg1
     return sdp
 
@@ -1451,33 +1485,37 @@ def _anc_sdp(i, t):
     sip  = SIP or "0.0.0.0"
     pt   = int(t.get("anc_pt") or 97)
     dual = bool(t.get("anc_mcast2") and t.get("anc_port2"))
+    ssrc = _ssrc("{}:tx:anc:{}".format(HOSTNAME, i))
+    ssrc_line = "a=ssrc:{} cname:{}\r\n".format(ssrc, HOSTNAME)
     leg0 = (
         "m=video {port} RTP/AVP {pt}\r\n"
-        "c=IN IP4 {mcast}/64\r\n"
+        "c=IN IP4 {mcast}/255\r\n"
         "{mid}"
-        "a=source-filter: incl IN IP4 {mcast} {sip}\r\n"
+        "a=source-filter:incl IN IP4 {mcast} {sip}\r\n"
         "a=rtpmap:{pt} smpte291/90000\r\n"
         "a=fmtp:{pt} TP=2110TPN; SSN=ST2110-40:2018;\r\n"
         "{refclk}"
         "a=mediaclk:direct=0\r\n"
+        "{ssrc}"
     ).format(port=int(t.get("anc_port") or 0), pt=pt,
-             mcast=t.get("anc_mcast") or "0.0.0.0", sip=sip, refclk=_LOCALMAC_REFCLK,
+             mcast=t.get("anc_mcast") or "0.0.0.0", sip=sip, refclk=_LOCALMAC_REFCLK, ssrc=ssrc_line,
              mid="a=mid:DUP-1\r\n" if dual else "")
     grp = "a=group:DUP DUP-1 DUP-2\r\n" if dual else ""
-    sdp = "v=0\r\no=- 0 0 IN IP4 {sip}\r\ns={hn} TX{i} ANC\r\nt=0 0\r\n{grp}".format(
-          sip=sip, hn=HOSTNAME, i=i, grp=grp) + leg0
+    sdp = "v=0\r\no=- {origin} IN IP4 {sip}\r\ns={hn} TX{i} ANC\r\nt=0 0\r\n{grp}".format(
+          origin=_sdp_origin(), sip=sip, hn=HOSTNAME, i=i, grp=grp) + leg0
     if dual:
         leg1 = (
             "m=video {port} RTP/AVP {pt}\r\n"
-            "c=IN IP4 {mcast}/64\r\n"
+            "c=IN IP4 {mcast}/255\r\n"
             "a=mid:DUP-2\r\n"
-            "a=source-filter: incl IN IP4 {mcast} {sip}\r\n"
+            "a=source-filter:incl IN IP4 {mcast} {sip}\r\n"
             "a=rtpmap:{pt} smpte291/90000\r\n"
             "a=fmtp:{pt} TP=2110TPN; SSN=ST2110-40:2018;\r\n"
             "{refclk}"
             "a=mediaclk:direct=0\r\n"
+            "{ssrc}"
         ).format(port=int(t["anc_port2"]), pt=pt, mcast=t["anc_mcast2"], sip=sip,
-                 refclk=_LOCALMAC_REFCLK)
+                 refclk=_LOCALMAC_REFCLK, ssrc=ssrc_line)
         sdp += leg1
     return sdp
 
@@ -1489,22 +1527,25 @@ def _aud_sdp(i, ai, acfg):
     ptime = A_PTIME_DEF if A_PTIME_DEF in (0.125, 0.25, 1.0, 4.0) else 1.0
     ptime_s = ("%g" % ptime)
     dual = bool(acfg.get("mcast2") and acfg.get("port2"))
+    ssrc = _ssrc("{}:tx:a:{}".format(HOSTNAME, i * 2 + ai))
+    ssrc_line = "a=ssrc:{} cname:{}\r\n".format(ssrc, HOSTNAME)
     def _leg(mcast, port, mid):
         return (
             "m=audio {port} RTP/AVP {pt}\r\n"
-            "c=IN IP4 {mcast}/64\r\n"
+            "c=IN IP4 {mcast}/255\r\n"
             "{mid}"
-            "a=source-filter: incl IN IP4 {mcast} {sip}\r\n"
+            "a=source-filter:incl IN IP4 {mcast} {sip}\r\n"
             "a=rtpmap:{pt} L24/48000/{ch}\r\n"
             "a=fmtp:{pt} channel-order=SMPTE2110.(U{ch:02d})\r\n"
             "a=ptime:{ptime}\r\n"
             "{refclk}"
             "a=mediaclk:direct=0\r\n"
+            "{ssrc}"
         ).format(port=int(port or 0), pt=pt, mcast=mcast or "0.0.0.0", sip=sip,
-                 ch=A_CHANNELS, ptime=ptime_s, refclk=_LOCALMAC_REFCLK, mid=mid)
+                 ch=A_CHANNELS, ptime=ptime_s, refclk=_LOCALMAC_REFCLK, mid=mid, ssrc=ssrc_line)
     grp = "a=group:DUP DUP-1 DUP-2\r\n" if dual else ""
-    sdp = "v=0\r\no=- 0 0 IN IP4 {sip}\r\ns={hn} TX{i} AUDIO{ai}\r\nt=0 0\r\n{grp}".format(
-          sip=sip, hn=HOSTNAME, i=i, ai=ai, grp=grp)
+    sdp = "v=0\r\no=- {origin} IN IP4 {sip}\r\ns={hn} TX{i} AUDIO{ai}\r\nt=0 0\r\n{grp}".format(
+          origin=_sdp_origin(), sip=sip, hn=HOSTNAME, i=i, ai=ai, grp=grp)
     sdp += _leg(acfg.get("mcast"), acfg.get("port"), "a=mid:DUP-1\r\n" if dual else "")
     if dual:
         sdp += _leg(acfg.get("mcast2"), acfg.get("port2"), "a=mid:DUP-2\r\n")

@@ -215,6 +215,7 @@ struct sess {
   /* réseau */
   char mcast[64];
   int  udp_port, payload_type;
+  uint32_t ssrc;            /* TX seulement : RFC3550 SSRC annoncé en a=ssrc du SDP (0=aléatoire) */
   /* décodage (partagé par toutes les cibles) */
   size_t   slotsize;       /* vidéo: framesize ; audio: 1152 (1 chunk 1ms) */
   int      ring, hdr;
@@ -885,6 +886,7 @@ static int setup_video_tx(struct sess* s) {
     ops.port.udp_port[MTL_SESSION_PORT_R] = s->udp_port_r;
   }
   ops.port.payload_type = s->payload_type;
+  ops.port.ssrc = s->ssrc;   /* fixe (≠0) pour matcher le a=ssrc annoncé dans le SDP TX */
   /* CADENCE ENTRELACÉ (fix racine du peigne) : libmtl TX entrelacé avec fps=cadence TRAME (P25)
    * pace get_frame à la période TRAME (40 ms) → 1 champ/40 ms = 25 champs/s = MOITIÉ de 1080i50 →
    * le désentrelaceur récepteur peigne. On passe la cadence CHAMP (×2 → P50) : libmtl pace alors à
@@ -901,8 +903,8 @@ static int setup_video_tx(struct sess* s) {
 
   s->vth = st20p_tx_create(s->st, &ops);
   if (!s->vth) { fprintf(stderr, "mtl_rx: st20p_tx_create fail (video %s:%d)\n", s->mcast, s->udp_port); return -1; }
-  fprintf(stderr, "mtl_rx[video TX] %dx%d%s fps=%.2f pt=%d → %s:%d (in shm=%s bd%d ring%d)\n",
-          s->width, s->height, s->interlaced ? "i" : "p", s->fps, s->payload_type,
+  fprintf(stderr, "mtl_rx[video TX] %dx%d%s fps=%.2f pt=%d ssrc=%u → %s:%d (in shm=%s bd%d ring%d)\n",
+          s->width, s->height, s->interlaced ? "i" : "p", s->fps, s->payload_type, s->ssrc,
           s->mcast, s->udp_port, s->tg[0].shm_path, s->bit_depth, s->ring);
   return pthread_create(&s->thread, NULL, video_tx_thread, s) == 0 ? (s->started = 1, 0) : -1;
 }
@@ -1023,6 +1025,7 @@ static int setup_audio_tx(struct sess* s) {
     ops.port.udp_port[MTL_SESSION_PORT_R] = s->udp_port_r;
   }
   ops.port.payload_type = s->payload_type;
+  ops.port.ssrc = s->ssrc;   /* fixe (≠0) pour matcher le a=ssrc annoncé dans le SDP TX */
   ops.fmt = ST30_FMT_PCM24;
   ops.channel = (uint16_t)s->channels;
   ops.sampling = ST30_SAMPLING_48K;
@@ -1033,8 +1036,8 @@ static int setup_audio_tx(struct sess* s) {
 
   s->a_tx = st30p_tx_create(s->st, &ops);
   if (!s->a_tx) { fprintf(stderr, "mtl_rx: st30p_tx_create fail (audio %s:%d)\n", s->mcast, s->udp_port); return -1; }
-  fprintf(stderr, "mtl_rx[audio TX] %dch L24/48k pt=%d → %s:%d (in shm=%s)\n",
-          s->channels, s->payload_type, s->mcast, s->udp_port, s->tg[0].shm_path);
+  fprintf(stderr, "mtl_rx[audio TX] %dch L24/48k pt=%d ssrc=%u → %s:%d (in shm=%s)\n",
+          s->channels, s->payload_type, s->ssrc, s->mcast, s->udp_port, s->tg[0].shm_path);
   return pthread_create(&s->thread, NULL, audio_tx_thread, s) == 0 ? (s->started = 1, 0) : -1;
 }
 
@@ -1190,6 +1193,7 @@ static int setup_data_tx(struct sess* s) {
     ops.port.udp_port[MTL_SESSION_PORT_R] = s->udp_port_r;
   }
   ops.port.payload_type = s->payload_type;
+  ops.port.ssrc = s->ssrc;   /* fixe (≠0) pour matcher le a=ssrc annoncé dans le SDP TX */
   ops.fps = to_st_fps(s->fps);
   ops.interlaced = false;
   ops.framebuff_cnt = 4;
@@ -1198,8 +1202,8 @@ static int setup_data_tx(struct sess* s) {
 
   s->d_tx = st40p_tx_create(s->st, &ops);
   if (!s->d_tx) { fprintf(stderr, "mtl_rx: st40p_tx_create fail (data %s:%d)\n", s->mcast, s->udp_port); return -1; }
-  fprintf(stderr, "mtl_rx[data TX] ANC fps=%.2f pt=%d → %s:%d (in shm=%s)\n",
-          s->fps, s->payload_type, s->mcast, s->udp_port, s->tg[0].shm_path);
+  fprintf(stderr, "mtl_rx[data TX] ANC fps=%.2f pt=%d ssrc=%u → %s:%d (in shm=%s)\n",
+          s->fps, s->payload_type, s->ssrc, s->mcast, s->udp_port, s->tg[0].shm_path);
   return pthread_create(&s->thread, NULL, data_tx_thread, s) == 0 ? (s->started = 1, 0) : -1;
 }
 
@@ -1241,6 +1245,7 @@ static int parse_session_into(struct json_object* j, struct sess* s) {
   s->role = !strcmp(jstr(j,"role","rx"), "tx") ? ROLE_TX : ROLE_RX;
   snprintf(s->mcast,sizeof(s->mcast),"%s",jstr(j,"mcast",""));
   s->udp_port=jint(j,"udp_port",0); s->payload_type=jint(j,"payload_type",96);
+  s->ssrc=(uint32_t)jint(j,"ssrc",0);   /* TX : 0=aléatoire (défaut libmtl), sinon fixe (borné 31 bits côté générateur) */
   s->ring=jint(j,"ring", s->kind==K_AUDIO?100:8); s->hdr=jint(j,"hdr",64);
   /* multi-NIC : `iface` (leg primaire) → portname résolu (vide = iface inconnu, détecté au create).
    * `iface` absent → port 0 (mono-NIC). 2022-7 : `iface2`/`mcast2`/`udp_port2` = 2ᵉ leg (red/blue). */
@@ -1284,8 +1289,8 @@ static int parse_session_into(struct json_object* j, struct sess* s) {
  * on en recrée une (flow RX recyclé, device/XDP intacts ⇒ pas de faute PTP). */
 static void compute_sig(struct sess* s) {
   int n = snprintf(s->sig, sizeof(s->sig),
-                   "%d|%d|%s|%d|%d|%dx%d|%.2f|i%d|f%d|bd%d|r%d|ch%d|ap%.3f|if%s|if2%s|mc2%s|p2%d|",
-                   s->role, s->kind, s->mcast, s->udp_port, s->payload_type,
+                   "%d|%d|%s|%d|%d|%u|%dx%d|%.2f|i%d|f%d|bd%d|r%d|ch%d|ap%.3f|if%s|if2%s|mc2%s|p2%d|",
+                   s->role, s->kind, s->mcast, s->udp_port, s->payload_type, s->ssrc,
                    s->width, s->height, s->fps, s->interlaced, s->tff, s->bit_depth, s->ring,
                    s->channels, s->a_ptime, s->iface, s->iface_r, s->mcast_r, s->udp_port_r);
   for (int ti = 0; ti < s->ntg && n > 0 && n < (int)sizeof(s->sig); ti++)
