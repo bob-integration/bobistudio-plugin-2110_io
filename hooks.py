@@ -37,7 +37,7 @@ def before_deploy(params, context):
     n_tx = int(params.get("tx_count") or 0)
     nv   = int(params.get("video_count") or 0)
     from app import io2110_flows as _iof
-    from app.allocations import allocate_multicast_for, _egress_iface
+    from app.allocations import allocate_multicast_for, _egress_iface, port_default_for
     # active_rx_count / active_tx_count : fenêtre de visibilité NMOS. POSÉS D'ABORD (avant de dériver
     # les flux) car la dérivation legacy s'appuie dessus. setdefault → préservés au re-déploiement.
     params.setdefault("active_rx_count", min(8, nv))
@@ -86,19 +86,23 @@ def before_deploy(params, context):
         # slot (ifn/netid), réutilisé pour vidéo + tous ses audios/ANC (même NIC de sortie).
         ifn, netid = _egress_iface(node_id, params, i, leg=0)
         fmt_v = {"scan": t.get("scan"), "width": t.get("width"), "height": t.get("height"), "fps": t.get("fps")}
+        # Port de BASE par essence (2110-20/30/40) : celui de la règle réseau/interface applicable si
+        # elle en pose un, sinon le repli historique — l'écart par slot/index s'applique par-dessus.
+        _port_v = port_default_for(node_id, ifn, netid, "video", 0, fmt_v, 5000)
         if not t.get("multicast_ip"):
             ip, prt = allocate_multicast_for(node_id, ifn, media_network_id=netid,
-                                             essence="video", leg=0, port=5000, fmt=fmt_v,
+                                             essence="video", leg=0, port=_port_v, fmt=fmt_v,
                                              owner_ref=f"tx:{vmid}:{i}:video:leg0")
             if ip:
                 t["multicast_ip"], t["dest_port"] = ip, prt
             else:
-                t.setdefault("dest_port", 5000)
+                t.setdefault("dest_port", _port_v)
         # Audios du slot = flux audio ATTACHÉS (tx_flows), N quelconque (plus de cap à 2). Les
         # mcast/port sont alloués par idx FLAT de flux → uniques même au-delà de 2 audios/slot.
         # Un slot vidéo-seul (0 flux audio attaché) n'a aucune destination audio. Les slots SANS
         # flux vidéo (pool inactif) ne sont pas touchés ici (activation = ajout de flux, route /flows).
         aud_idxs = _iof.tx_slot_audio_idxs(tx_flows, i)
+        _port_a = port_default_for(node_id, ifn, netid, "audio", 0, {"channels": 8}, 5004)
         if aud_idxs or any(f["essence"] == "video" and f["idx"] == i for f in tx_flows):
             existing = t.get("audios") or []
             audios = []
@@ -106,7 +110,7 @@ def before_deploy(params, context):
                 a = dict(existing[ai]) if ai < len(existing) else {}
                 if not a.get("multicast_ip"):
                     ipa, pa = allocate_multicast_for(node_id, ifn, media_network_id=netid, essence="audio",
-                                                     leg=0, port=5004 + aidx * 2, fmt={"channels": 8},
+                                                     leg=0, port=_port_a + aidx * 2, fmt={"channels": 8},
                                                      owner_ref=f"tx:{vmid}:{i}:audio:{aidx}:leg0")
                     if ipa:
                         a["multicast_ip"], a["dest_port"] = ipa, pa
@@ -117,8 +121,9 @@ def before_deploy(params, context):
             t["audios"] = audios
         # ANC TX (1 flux par slot)
         if not t.get("anc_multicast_ip"):
+            _port_d = port_default_for(node_id, ifn, netid, "anc", 0, None, 5008)
             ipd, pd = allocate_multicast_for(node_id, ifn, media_network_id=netid, essence="anc",
-                                             leg=0, port=5008 + i * 2,
+                                             leg=0, port=_port_d + i * 2,
                                              owner_ref=f"tx:{vmid}:{i}:anc:leg0")
             if ipd:
                 t["anc_multicast_ip"], t["anc_dest_port"] = ipd, pd

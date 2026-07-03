@@ -786,6 +786,35 @@ window.MXLPlugins["2110_io"] = {
 
     // ── SDP : ouverture de la modale d'affichage / abonnement manuel ──────────
     function _closeSdpModal(){ const m = document.getElementById('rx-sdp-modal'); if (m) m.remove(); }
+    // Certains devices 2110 (ex. convertisseurs SDI→IP) exposent une vraie API NMOS IS-04/05 mais
+    // n'émettent rien tant qu'on ne PATCH pas leur sender (master_enable) — l'abonnement RX ici est
+    // manuel (SDP collé, pas de registry commun) donc ce PATCH ne part jamais tout seul de façon
+    // fiable (mDNS/découverte peu fiables sur ce matériel). Bouton = déclenchement à la demande.
+    async function _activateRemoteSender(essence, idx, btn){
+        const st = document.getElementById('rx-sdp-status');
+        const prevText = btn.textContent;
+        btn.disabled = true; btn.textContent = 'Activation…';
+        try {
+            const resp = await fetch(`/api/nmos/receivers/${vmid}/${idx}/activate_sender`, {
+                method: 'POST', headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({ essence }),
+            });
+            const j = await resp.json().catch(()=>({}));
+            if (st) {
+                if (j.ok) {
+                    st.textContent = j.already_active ? 'Sender distant déjà actif' : 'Sender distant activé (IS-05)';
+                    st.style.color = 'var(--status-running-fg)';
+                } else {
+                    st.textContent = '✕ ' + (j.error || 'échec');
+                    st.style.color = 'var(--status-stopped-fg)';
+                }
+            }
+        } catch(err) {
+            if (st){ st.textContent = '✕ ' + err.message; st.style.color = 'var(--status-stopped-fg)'; }
+        } finally {
+            btn.disabled = false; btn.textContent = prevText;
+        }
+    }
     async function _sdpApply(essence, idx, enable){
         const ta  = document.getElementById('rx-sdp-ta');
         const st  = document.getElementById('rx-sdp-status');
@@ -830,6 +859,7 @@ window.MXLPlugins["2110_io"] = {
                 <div style="display:flex; gap:8px; align-items:center; margin-top:12px; justify-content:flex-end">
                     <span id="rx-sdp-status" style="margin-right:auto; font-size:0.85em"></span>
                     <button class="btn" id="rx-sdp-close">Fermer</button>
+                    <button class="btn" id="rx-sdp-activate" title="Force le PATCH master_enable:true sur le sender NMOS distant correspondant à ce SDP (matériel qui ne s'active pas tout seul)">Activer IS-05 (sender distant)</button>
                     <button class="btn btn-red" id="rx-sdp-unsub">Se désabonner</button>
                     <button class="btn btn-green" id="rx-sdp-apply">Appliquer</button>
                 </div>
@@ -839,6 +869,7 @@ window.MXLPlugins["2110_io"] = {
         document.getElementById('rx-sdp-close').addEventListener('click', _closeSdpModal);
         document.getElementById('rx-sdp-apply').addEventListener('click', () => _sdpApply(essence, idx, true));
         document.getElementById('rx-sdp-unsub').addEventListener('click', () => _sdpApply(essence, idx, false));
+        document.getElementById('rx-sdp-activate').addEventListener('click', e => _activateRemoteSender(essence, idx, e.currentTarget));
         document.getElementById('rx-sdp-ta').focus();
     }
     function onClickSdp(e){
