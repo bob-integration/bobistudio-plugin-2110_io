@@ -322,6 +322,18 @@ IFACE_MAC = _detect_iface_mac(IFACE)
 # le ts-refclk:ptp traçable du grandmaster du nœud, lu via SSH pmc (services/nmos + app/ptp).
 _LOCALMAC_REFCLK = "a=ts-refclk:localmac={}\r\n".format(IFACE_MAC) if IFACE_MAC else ""
 
+# a=source-filter (SSM) dans les SDP TX — désactivable (SDP_SOURCE_FILTER=0). Bonne pratique
+# 2110 sur un fabric SSM-capable (défaut ON), mais sur un switch L2 en IGMP snooping pur le
+# join SSM (S,G) du receiver est enregistré sans jamais être forwardé → 0 Mbps silencieux ;
+# dans ce cas l'omettre fait retomber les receivers sur un join (*,G) qui, lui, est livré.
+SDP_SOURCE_FILTER = str(os.environ.get("SDP_SOURCE_FILTER") or "1").lower() not in ("0", "false", "off")
+
+def _sf_line(mcast, sip):
+    """Ligne a=source-filter d'une section média, ou '' si désactivée (fabric non-SSM)."""
+    if not SDP_SOURCE_FILTER:
+        return ""
+    return "a=source-filter:incl IN IP4 {} {}\r\n".format(mcast or "0.0.0.0", sip or "0.0.0.0")
+
 # ─── Layout shm (simu) — RÉSOLUTION DYNAMIQUE ───────────────────────
 # La simu (GÉN ou fallback sans SDP) doit suivre la résolution du flux LIVE (lue du SDP) pour
 # que le shm garde la MÊME taille que mtl_rx → les consommateurs ne cassent pas au basculement
@@ -1452,14 +1464,15 @@ def _tx_sdp(i, t):
         "m=video {port} RTP/AVP {pt}\r\n"
         "c=IN IP4 {mcast}/255\r\n"
         "{mid}"
-        "a=source-filter:incl IN IP4 {mcast} {sip}\r\n"
+        "{sfilter}"
         "a=rtpmap:{pt} raw/90000\r\n"
         "a=fmtp:{pt} {fmtp}\r\n"
         "{refclk}"
         "a=mediaclk:direct=0\r\n"
         "{ssrc}"
     ).format(port=int(t.get("udp_port") or 0), pt=pt, mcast=t.get("mcast") or "0.0.0.0",
-             sip=sip, fmtp=fmtp, refclk=_LOCALMAC_REFCLK, ssrc=ssrc_line,
+             sfilter=_sf_line(t.get("mcast"), sip),
+             fmtp=fmtp, refclk=_LOCALMAC_REFCLK, ssrc=ssrc_line,
              mid="a=mid:DUP-1\r\n" if dual else "")
     grp = "a=group:DUP DUP-1 DUP-2\r\n" if dual else ""
     sdp = "v=0\r\no=- {origin} IN IP4 {sip}\r\ns={hn} TX{i}\r\nt=0 0\r\n{grp}".format(
@@ -1469,13 +1482,14 @@ def _tx_sdp(i, t):
             "m=video {port} RTP/AVP {pt}\r\n"
             "c=IN IP4 {mcast}/255\r\n"
             "a=mid:DUP-2\r\n"
-            "a=source-filter:incl IN IP4 {mcast} {sip}\r\n"
+            "{sfilter}"
             "a=rtpmap:{pt} raw/90000\r\n"
             "a=fmtp:{pt} {fmtp}\r\n"
             "{refclk}"
             "a=mediaclk:direct=0\r\n"
             "{ssrc}"
-        ).format(port=int(t["udp_port2"]), pt=pt, mcast=t["mcast2"], sip=sip, fmtp=fmtp,
+        ).format(port=int(t["udp_port2"]), pt=pt, mcast=t["mcast2"],
+                 sfilter=_sf_line(t["mcast2"], sip), fmtp=fmtp,
                  refclk=_LOCALMAC_REFCLK, ssrc=ssrc_line)
         sdp += leg1
     return sdp
@@ -1491,14 +1505,16 @@ def _anc_sdp(i, t):
         "m=video {port} RTP/AVP {pt}\r\n"
         "c=IN IP4 {mcast}/255\r\n"
         "{mid}"
-        "a=source-filter:incl IN IP4 {mcast} {sip}\r\n"
+        "{sfilter}"
         "a=rtpmap:{pt} smpte291/90000\r\n"
         "a=fmtp:{pt} TP=2110TPN; SSN=ST2110-40:2018;\r\n"
         "{refclk}"
         "a=mediaclk:direct=0\r\n"
         "{ssrc}"
     ).format(port=int(t.get("anc_port") or 0), pt=pt,
-             mcast=t.get("anc_mcast") or "0.0.0.0", sip=sip, refclk=_LOCALMAC_REFCLK, ssrc=ssrc_line,
+             mcast=t.get("anc_mcast") or "0.0.0.0",
+             sfilter=_sf_line(t.get("anc_mcast"), sip),
+             refclk=_LOCALMAC_REFCLK, ssrc=ssrc_line,
              mid="a=mid:DUP-1\r\n" if dual else "")
     grp = "a=group:DUP DUP-1 DUP-2\r\n" if dual else ""
     sdp = "v=0\r\no=- {origin} IN IP4 {sip}\r\ns={hn} TX{i} ANC\r\nt=0 0\r\n{grp}".format(
@@ -1508,13 +1524,14 @@ def _anc_sdp(i, t):
             "m=video {port} RTP/AVP {pt}\r\n"
             "c=IN IP4 {mcast}/255\r\n"
             "a=mid:DUP-2\r\n"
-            "a=source-filter:incl IN IP4 {mcast} {sip}\r\n"
+            "{sfilter}"
             "a=rtpmap:{pt} smpte291/90000\r\n"
             "a=fmtp:{pt} TP=2110TPN; SSN=ST2110-40:2018;\r\n"
             "{refclk}"
             "a=mediaclk:direct=0\r\n"
             "{ssrc}"
-        ).format(port=int(t["anc_port2"]), pt=pt, mcast=t["anc_mcast2"], sip=sip,
+        ).format(port=int(t["anc_port2"]), pt=pt, mcast=t["anc_mcast2"],
+                 sfilter=_sf_line(t["anc_mcast2"], sip),
                  refclk=_LOCALMAC_REFCLK, ssrc=ssrc_line)
         sdp += leg1
     return sdp
@@ -1534,14 +1551,15 @@ def _aud_sdp(i, ai, acfg):
             "m=audio {port} RTP/AVP {pt}\r\n"
             "c=IN IP4 {mcast}/255\r\n"
             "{mid}"
-            "a=source-filter:incl IN IP4 {mcast} {sip}\r\n"
+            "{sfilter}"
             "a=rtpmap:{pt} L24/48000/{ch}\r\n"
             "a=fmtp:{pt} channel-order=SMPTE2110.(U{ch:02d})\r\n"
             "a=ptime:{ptime}\r\n"
             "{refclk}"
             "a=mediaclk:direct=0\r\n"
             "{ssrc}"
-        ).format(port=int(port or 0), pt=pt, mcast=mcast or "0.0.0.0", sip=sip,
+        ).format(port=int(port or 0), pt=pt, mcast=mcast or "0.0.0.0",
+                 sfilter=_sf_line(mcast, sip),
                  ch=A_CHANNELS, ptime=ptime_s, refclk=_LOCALMAC_REFCLK, mid=mid, ssrc=ssrc_line)
     grp = "a=group:DUP DUP-1 DUP-2\r\n" if dual else ""
     sdp = "v=0\r\no=- {origin} IN IP4 {sip}\r\ns={hn} TX{i} AUDIO{ai}\r\nt=0 0\r\n{grp}".format(

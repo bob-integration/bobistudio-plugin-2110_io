@@ -1,7 +1,12 @@
 {
-  "version": "0.34.10",
-  "date": "2026-07-03",
+  "version": "0.35.0",
+  "date": "2026-07-04",
   "changes": {
+    "SDP TX : a=source-filter (SSM) désactivable — fabric L2 en IGMP snooping pur (diagnostic Horace, REBUILD image requis, 0.35.0)": [
+      "Sur un switch L2 sans PIM/NBM (IGMP snooping seul, ex. Nexus 93180YC-EX NX-OS 7.0(3)I6), la ligne `a=source-filter:incl` du SDP TX fait faire au récepteur un join IGMPv3 SSM (S,G) que le snooping enregistre mais ne forwarde JAMAIS → 0 Mbps silencieux (prouvé sur banc : retirer la ligne → join (*,G) → flux livré >2 Gbps). Activer PIM-SSM ne répare pas le cas intra-VLAN.",
+      "Nouvelle env SDP_SOURCE_FILTER (défaut 1 = comportement actuel, bonne pratique sur fabric SSM-capable) : à 0, la ligne est omise des 5 gabarits SDP (vidéo leg0/leg1, ANC leg0/leg1, audio). Plombée depuis le réglage orchestrateur `sdp_source_filter_2110` (Réglages → MXL, appliqué au redéploiement du moteur).",
+      "controller.py étant bâti dans l'image : REBUILD bobi-mtl + redéploiement du moteur requis."
+    ],
     "SDP TX : a=source-filter non conforme RFC4570 (espace en trop) + TTL c= aberrant (compat Blackmagic, pas de rebuild, 0.34.10)": [
       "Trouvé par comparaison directe avec un SDP tiers qui locke sur le Blackmagic (« SDI 4 ») alors que le nôtre échoue en silence (No Signal, aucune erreur) : `a=source-filter: incl IN IP4 …` — ESPACE après les deux-points. La grammaire ABNF de RFC 4570 est `\"a=source-filter:\" filter-mode SP filter-spec` : AUCUN espace n'est permis entre `:` et le filter-mode. Un parseur SDP strict (cohérent avec le comportement observé) peut rejeter/mal-interpréter la ligne → l'abonnement SSM échoue silencieusement, ce qui explique un SDP « accepté » sans erreur visible mais aucun paquet jamais délivré.",
       "Deuxième écart : `c=IN IP4 <mcast>/64` — le 3ᵉ champ de `c=` en multicast est le TTL (pas un masque), et `64` est le TTL par défaut d'un paquet UNICAST Linux (copier-coller erroné), alors que la convention 2110 courante (et le SDP de référence comparé) utilise 255.",
