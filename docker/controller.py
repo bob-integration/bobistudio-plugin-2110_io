@@ -19,7 +19,7 @@
 #
 # Ce fichier est exécuté tel quel dans le conteneur (pas de str.format) → accolades normales.
 
-import json, mmap, os, re, signal, struct, subprocess, threading, time, zlib
+import json, mmap, os, re, signal, ssl, struct, subprocess, threading, time, zlib
 import numpy as np
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
@@ -1023,10 +1023,51 @@ class ControlHandler(BaseHTTPRequestHandler):
     def log_message(self, *a): pass
 
 
+# ─── mTLS du contrat agent (:8081) ──────────────────────────────────
+# Matériel TLS bind-monté par l'orchestrateur au `docker run` (-v <hostdir>:/etc/bobi-tls:ro),
+# généré et signé par le CA du contrôleur (cf. app/ca.py côté orchestrateur). Convention
+# IDENTIQUE au chemin conteneur standard : /etc/bobi-tls/{cert,key,ca}.pem.
+#   cert+key présents        → :8081 en HTTPS (cert serveur signé CA)
+#   + ca.pem présent         → mTLS (CERT_REQUIRED : le client contrôleur doit présenter son cert)
+#   absents ou wrap en échec → HTTP clair (repli rétro-compat, jamais de crash)
+# Ce code est baké dans l'image (environnement isolé) : ssl stdlib uniquement, pas d'import app.ca.
+_TLS_DIR  = "/etc/bobi-tls"
+_TLS_CERT = os.path.join(_TLS_DIR, "cert.pem")
+_TLS_KEY  = os.path.join(_TLS_DIR, "key.pem")
+_TLS_CA   = os.path.join(_TLS_DIR, "ca.pem")
+
+def _agent_tls_context():
+    """Construit le SSLContext depuis /etc/bobi-tls/ si présent, sinon None (→ HTTP clair).
+    Toute erreur (cert illisible…) → None (repli, jamais de crash)."""
+    if not (os.path.exists(_TLS_CERT) and os.path.exists(_TLS_KEY)):
+        return None, "HTTP clair"
+    try:
+        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        ctx.load_cert_chain(certfile=_TLS_CERT, keyfile=_TLS_KEY)
+        if os.path.exists(_TLS_CA):
+            ctx.load_verify_locations(cafile=_TLS_CA)
+            ctx.verify_mode = ssl.CERT_REQUIRED
+            return ctx, "HTTPS/mTLS (client cert requis)"
+        return ctx, "HTTPS (pas de CA → client non vérifié)"
+    except Exception as e:
+        print(f"[8081] contexte TLS invalide ({e}) → repli HTTP clair", flush=True)
+        return None, "HTTP clair (repli après échec TLS)"
+
+def _serve_agent():
+    ctx, mode = _agent_tls_context()
+    srv = HTTPServer(("0.0.0.0", 8081), AgentHandler)
+    if ctx is not None:
+        try:
+            srv.socket = ctx.wrap_socket(srv.socket, server_side=True)
+        except Exception as e:
+            print(f"[8081] wrap TLS échoué ({e}) → repli HTTP clair", flush=True)
+            mode = "HTTP clair (repli après échec wrap)"
+    print(f"[8081] contrat agent servi en {mode}", flush=True)
+    srv.serve_forever()
+
 threading.Thread(target=lambda: HTTPServer(("0.0.0.0", 8080), MetricsHandler).serve_forever(),
                  daemon=True).start()
-threading.Thread(target=lambda: HTTPServer(("0.0.0.0", 8081), AgentHandler).serve_forever(),
-                 daemon=True).start()
+threading.Thread(target=_serve_agent, daemon=True).start()
 threading.Thread(target=lambda: HTTPServer(("0.0.0.0", 8082), ControlHandler).serve_forever(),
                  daemon=True).start()
 
