@@ -1,7 +1,12 @@
 {
-  "version": "0.35.0",
-  "date": "2026-07-04",
+  "version": "0.35.1",
+  "date": "2026-07-05",
   "changes": {
+    "Nommage Rx cohérent en base 1 — carte de contrôle + labels NMOS (orchestrateur seul, pas de rebuild, 0.35.1)": [
+      "Carte de contrôle (page Sources 2110) : le titre « Ensemble #n » devient « Rx #n », aligné sur les slots TX (« Slot TX #n »).",
+      "Labels NMOS (services/nmos) : les receivers passent de « host #r0/#ra0/#rd0 (essence) » (0-based) à « host Rx 1 (video|audio|anc) » ; les senders TX passent de « TX0 2110-20/-30/-40 » à « TX1 … » et les audios « #0 » à « #1 ». Base 1 partout, comme les group hints (déjà « TX 1 »/« host 1 »). Les descriptions de receivers et les alertes de subscription passent aussi en base 1.",
+      "Indices internes (recv_idx/tx_idx, keying UUID vmid+idx, API, logs) INCHANGÉS — les UUID NMOS ne bougent pas, seuls les libellés sont réécrits au prochain rebuild_model (les libellés figés par l'op — label_locked — sont préservés)."
+    ],
     "SDP TX : a=source-filter (SSM) désactivable — fabric L2 en IGMP snooping pur (diagnostic Horace, REBUILD image requis, 0.35.0)": [
       "Sur un switch L2 sans PIM/NBM (IGMP snooping seul, ex. Nexus 93180YC-EX NX-OS 7.0(3)I6), la ligne `a=source-filter:incl` du SDP TX fait faire au récepteur un join IGMPv3 SSM (S,G) que le snooping enregistre mais ne forwarde JAMAIS → 0 Mbps silencieux (prouvé sur banc : retirer la ligne → join (*,G) → flux livré >2 Gbps). Activer PIM-SSM ne répare pas le cas intra-VLAN.",
       "Nouvelle env SDP_SOURCE_FILTER (défaut 1 = comportement actuel, bonne pratique sur fabric SSM-capable) : à 0, la ligne est omise des 5 gabarits SDP (vidéo leg0/leg1, ANC leg0/leg1, audio). Plombée depuis le réglage orchestrateur `sdp_source_filter_2110` (Réglages → MXL, appliqué au redéploiement du moteur).",
