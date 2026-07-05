@@ -305,6 +305,52 @@ def _tx_iface(idx, pin=None):
     return pin if pin in IFACES else _auto_iface(idx)
 
 
+# ─── Garde-fou IP des ports (post-mortem Horace 2026-07) ──────────────────────────────
+# En AF-XDP, libmtl fige au mtl_init l'IP PRIMAIRE détectée de chaque port et joint les groupes
+# multicast par ADRESSE (ip_mreq.imr_interface, résolue par le noyau) : une IP média dupliquée ou
+# déplacée sur l'hôte fait partir les joins IGMP sur la MAUVAISE NIC → slot RX définitivement muet
+# alors que fdir/queue sont posés au bon endroit, et le gel survit aux réalignements (qui reposaient
+# l'IP fautive). Ce contrôle détecte les trois dérives (sip absent, sip non primaire, sip dupliqué)
+# et les expose sur :8080 (nic.ip_warnings) + stdout. Après correction sur l'hôte, un redéploiement
+# du moteur reste REQUIS : le daemon vivant garde le sip périmé figé en mémoire.
+_ip_warnings = []
+
+def _check_port_ips():
+    global _ip_warnings
+    try:
+        out = subprocess.run(["ip", "-4", "-o", "addr", "show"],
+                             capture_output=True, text=True, timeout=5).stdout
+    except Exception:
+        return
+    addrs = {}                                   # iface → [ip, …] (ordre noyau = primaire d'abord)
+    for ln in out.splitlines():
+        p = ln.split()
+        if len(p) >= 4 and p[2] == "inet":
+            addrs.setdefault(p[1], []).append(p[3].split("/")[0])
+    warns = []
+    for i, ifn in enumerate(IFACES):
+        sip = SIPS[i] if i < len(SIPS) else ""
+        if not sip:
+            continue
+        mine = addrs.get(ifn) or []
+        if sip not in mine:
+            warns.append("sip {} absent de {} — joins IGMP impossibles sur ce port".format(sip, ifn))
+        elif mine[0] != sip:
+            warns.append("{} : IP primaire {} ≠ sip {} — MTL joindra via {}".format(
+                ifn, mine[0], sip, mine[0]))
+        for other, ips in addrs.items():
+            if other != ifn and sip in ips:
+                warns.append("IP {} (sip de {}) DUPLIQUÉE sur {} — joins IGMP déroutés : "
+                             "purger l'IP puis redéployer le moteur".format(sip, ifn, other))
+    if warns != _ip_warnings:
+        for w in warns:
+            print("⚠ IP ports: " + w, flush=True)
+        if not warns and _ip_warnings:
+            print("IP ports: anomalies résolues (redéployer le moteur si le daemon tournait déjà)",
+                  flush=True)
+    _ip_warnings = warns
+
+
 def _detect_iface_mac(iface):
     """MAC de IFACE au format EUI-48 RFC 7273 (AA-BB-CC-DD-EE-FF) pour a=ts-refclk:localmac.
     Repli d'horloge quand PTP n'est pas dispo : un SDP sans ts-refclk est rejeté (500) par
@@ -646,7 +692,8 @@ class MetricsHandler(BaseHTTPRequestHandler):
                             "port_capacity_gbps": port_cap,
                             "aggregate_gbps": aggregate_gbps,
                             "model": model_label,
-                            "ports": nic_ports},
+                            "ports": nic_ports,
+                            "ip_warnings": _ip_warnings},
                    "xdp": {"allocated":           _rx_queues_alloc + _tx_queues_alloc,
                             "reserved":            _rx_queues_reserved + _tx_queues_reserved,
                             "active":              _xdp_sessions_active,
@@ -1205,6 +1252,22 @@ _fail_streak = 0             # échecs rapides consécutifs (backoff)
 _sig_changed_at = 0.0        # horodatage du dernier changement de config (debounce de relance budget)
 _RELAUNCH_SETTLE_S = 3.0     # délai de stabilité config avant relance pour cause de budget de files
 
+# ─── Watchdog RX auto-guérison (post-mortem Horace 2026-07) ────────────────────────────
+# Un groupe RX abonné dont AUCUNE image n'arrive (frame_index figé) pendant _WD_STALL_S est
+# « bounced » : sa session est omise du config le temps d'un cycle daemon (_WD_BOUNCE_S) puis
+# ré-émise → le daemon libère la session (leave IGMP + fdir put) et la recrée (nouvelle pose fdir,
+# nouveau join). Transforme les gels définitifs (« socket add flow fail » → init_hw -5 sans retry,
+# join parti sur la mauvaise NIC, règle fdir perdue) en trous de quelques secondes, et sert de
+# vérification post-subscribe : un abonnement qui n'accroche pas est retenté automatiquement.
+# Backoff exponentiel par groupe (source réellement absente → re-tentative au plus toutes les
+# _WD_MAX_S, le leave/join périodique est sans danger). MTL_RX_WATCHDOG_S=0 désactive.
+_WD_STALL_S  = float(os.environ.get("MTL_RX_WATCHDOG_S") or 15.0)
+_WD_BOUNCE_S = 2.0           # durée d'omission de la session (≫ période de poll du daemon)
+_WD_MAX_S    = 300.0         # plafond du backoff par groupe
+_WD_GRACE_S  = 20.0          # pas de bounce juste après un (re)lancement du daemon (mtl_init lent)
+_wd_state = {}               # (mcast,port) → état watchdog ; touché par le seul thread manager
+_ip_check_at = 0.0           # prochain contrôle périodique _check_port_ips (manager loop)
+
 # ─── Slots TX (émetteurs) — poussés par l'orchestrateur via :8081/tx ──────────
 # Chaque slot TX = une destination (mcast/port) + un shm d'ENTRÉE câblé (+ son format). Le manager
 # en fait une session role=tx dans le config ; mtl_rx lit le shm et émet en 2110-20. Un slot sans
@@ -1685,6 +1748,8 @@ _tx_queues_alloc = 0
 _ports_alloc = []      # dernier `ports` du config (iface/sip/rx_queues/tx_queues PAR NIC) — :8080 nic.ports
 
 
+_cfg_stamp = 0    # dernier mtime entier posé sur le config (strictement croissant, cf. fin de fn)
+
 def _write_config(sessions):
     """Écrit le config lu par le DAEMON mtl_rx : device params + sessions désirées. Le daemon détecte
     le changement de mtime et RÉCONCILIE à chaud — aucune relance.
@@ -1752,6 +1817,15 @@ def _write_config(sessions):
                    "iface": IFACE, "sip": SIP,
                    "rx_queues": ports[0]["rx_queues"], "tx_queues": ports[0]["tx_queues"],
                    "sessions": sessions}, f)
+    # mtime ENTIER strictement croissant : un mtl_rx antérieur au compare-nanosecondes détecte le
+    # changement sur (long)st_mtime — deux écritures dans la même seconde (rafale de commutations)
+    # étaient invisibles → daemon figé sur un état intermédiaire (vu au banc de churn Horace).
+    global _cfg_stamp
+    _cfg_stamp = max(int(time.time()), _cfg_stamp + 1)
+    try:
+        os.utime(_CONFIG_PATH, (_cfg_stamp, _cfg_stamp))
+    except Exception:
+        pass
 
 
 def _launch_mtl():
@@ -1775,6 +1849,7 @@ def _launch_mtl():
         time.sleep(0.5)   # laisse le noyau détacher le programme XDP du daemon sortant
     _xdp_off()
     _flush_ntuple()
+    _check_port_ips()   # les IP lues MAINTENANT par mtl_init sont figées à vie du daemon
     _mtl_proc = subprocess.Popen([MTL_RX, "--config", _CONFIG_PATH])
     _last_launch = time.time()
     # Fige la réservation effective = ce que le config porte À CET INSTANT (lu par mtl_init au boot du
@@ -1968,7 +2043,7 @@ def _manager_loop():
     daemon meurt (crash, backoff + purge XDP) OU si la demande de files dépasse la réserve gelée du
     dernier mtl_init (sinon plafond muet ~8 = 2 files/port × 4 ports) — relance DEBOUNCÉE (config
     stable depuis _RELAUNCH_SETTLE_S) pour regrouper une rafale d'abonnements en une seule réinit."""
-    global _mtl_proc, _cur_sig, _fail_streak, _xdp_sessions_active, _xdp_active_per_iface, _sig_changed_at
+    global _mtl_proc, _cur_sig, _fail_streak, _xdp_sessions_active, _xdp_active_per_iface, _sig_changed_at, _ip_check_at
     while True:
         groups = {}        # (mcast, port) → {"info": sdp, "idxs": [..]} — fan-out même-source
         for idx in range(N_VIDEO):
@@ -1981,6 +2056,56 @@ def _manager_loop():
             if sdp and not _ctl[idx]["gen"]:                # GÉN forcé → reste en simu
                 key = (sdp["mcast"], sdp["port"])
                 groups.setdefault(key, {"info": sdp, "idxs": []})["idxs"].append(idx)
+
+        # Watchdog RX : bounce des groupes abonnés qui ne reçoivent RIEN (cf. constantes _WD_*).
+        _wd_now = time.time()
+        if _WD_STALL_S > 0:
+            for _k in [k for k in _wd_state if k not in groups]:
+                del _wd_state[_k]                            # groupe désabonné → oubli
+            _wd_daemon_ok = (_mtl_proc is not None and _mtl_proc.poll() is None
+                             and (_wd_now - _last_launch) > _WD_GRACE_S)
+            for key, g in list(groups.items()):
+                # anchor = départ du timer de stall (abonnement / dernier bounce) ; prog = dernière
+                # VRAIE progression (frame_index avance). Le backoff ne se réarme que sur prog —
+                # réarmer sur anchor faisait retomber le délai à 15 s après chaque bounce (le
+                # groupe paraissait « frais ») → une source absente re-tentait toutes les 15 s
+                # au lieu de 30 s → 5 min.
+                st = _wd_state.setdefault(key, {"fi": {}, "anchor": {}, "prog": {},
+                                                "delay": _WD_STALL_S, "until": 0.0, "n": 0})
+                if _wd_now < st["until"]:                    # bounce en cours → session omise
+                    del groups[key]
+                    continue
+                # Suivi PAR SLOT (pas le max du groupe) : dans un groupe fan-out, une cible morte
+                # pendant que sa sœur reçoit serait invisible au max — vu au banc de churn (1/50).
+                for _i in [i for i in st["fi"] if i not in g["idxs"]]:
+                    for _d in ("fi", "anchor", "prog"):
+                        st[_d].pop(_i, None)                         # cible retirée du groupe
+                with metrics_lock:
+                    fis = {i: (metrics[i].get("frame_index") or 0) for i in g["idxs"]}
+                for i, fi in fis.items():
+                    if fi > 0 and fi != st["fi"].get(i):
+                        st["fi"][i] = fi
+                        st["anchor"][i] = st["prog"][i] = _wd_now    # cette cible avance
+                    elif i not in st["anchor"]:
+                        st["anchor"][i] = _wd_now                    # 1ʳᵉ vue de cette cible
+                stalled = [i for i in g["idxs"] if (_wd_now - st["anchor"][i]) >= st["delay"]]
+                if not stalled:
+                    if st["n"] and all((_wd_now - st["prog"].get(i, 0)) < _WD_STALL_S
+                                       for i in g["idxs"]):
+                        st["delay"] = _WD_STALL_S; st["n"] = 0       # vraie reprise → reset backoff
+                elif _wd_daemon_ok:
+                    worst = max(_wd_now - st["anchor"][i] for i in stalled)
+                    st["until"] = _wd_now + _WD_BOUNCE_S
+                    st["n"]    += 1
+                    st["delay"] = min(st["delay"] * 2, _WD_MAX_S)
+                    for i in stalled:
+                        st["anchor"][i] = _wd_now                    # repart pour un délai complet
+                    print("watchdog RX: {}:{} slot(s) {} sans image depuis {:.0f}s (groupe {}) → "
+                          "recréation de session (tentative #{}, prochain essai dans {:.0f}s)".format(
+                              key[0], key[1], stalled, worst, g["idxs"], st["n"], st["delay"]),
+                          flush=True)
+                    del groups[key]
+
         sessions = [_video_session(g["info"], g["idxs"], _rx_iface(g["idxs"][0])) for g in groups.values()]
         active = set(t["idx"] for s in sessions if s["kind"] == "video" for t in s["targets"])
         for idx in range(N_VIDEO):
@@ -2080,6 +2205,10 @@ def _manager_loop():
                 _launch_mtl()                               # relance après crash (purge XDP incluse)
             elif dead:
                 _mtl_proc = None                            # mort sans rien à servir → relance au besoin
+        # Contrôle périodique des IP de ports (dérive à chaud : IP retirée/dupliquée par l'hôte).
+        if time.time() >= _ip_check_at:
+            _ip_check_at = time.time() + 60.0
+            _check_port_ips()
         time.sleep(0.5)
 
 

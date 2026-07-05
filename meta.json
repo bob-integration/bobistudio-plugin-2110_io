@@ -1,7 +1,21 @@
 {
-  "version": "0.35.1",
+  "version": "0.35.4",
   "date": "2026-07-05",
   "changes": {
+    "Churn : le daemon ratait un config réécrit dans la même seconde + backoff watchdog (REBUILD image requis, 0.35.4)": [
+      "mtl_rx.c comparait (long)st_mtime (SECONDES) pour détecter un changement de config : en rafale de commutations, le contrôleur réécrit le config plusieurs fois dans la même seconde → la dernière écriture était invisible, le daemon restait figé sur un état intermédiaire jusqu'au changement suivant (vu au banc de churn : session créée 12 s en retard). Fix daemon : comparaison st_mtim complet (sec+nsec). Fix contrôleur (efficace même avec un vieux daemon) : _write_config pose un mtime ENTIER strictement croissant (os.utime).",
+      "Watchdog : le backoff se réarmait au bounce (le groupe paraissait « frais ») → une source absente re-tentait toutes les 15 s au lieu d'escalader 30 s → 5 min. Fix : ancre du timer (anchor) séparée de la vraie progression (prog) ; reset du backoff uniquement quand toutes les cibles progressent réellement."
+    ],
+    "Watchdog RX : suivi par SLOT (fix angle mort fan-out, REBUILD image requis, 0.35.3)": [
+      "Vu au banc de churn (1/50) : dans un groupe fan-out (même mcast:port, plusieurs cibles), une cible sans image pendant que sa sœur reçoit était invisible au watchdog 0.35.2 (frame_index max du groupe). Le suivi passe par slot : une cible figée au-delà du délai déclenche le bounce du groupe même si les autres avancent (2 s d'interruption pour la sœur saine, contre une cible morte définitivement).",
+      "Reset du backoff seulement quand TOUTES les cibles du groupe avancent."
+    ],
+    "Robustesse RX : watchdog auto-guérison + garde-fou IP des ports (post-mortem Horace, REBUILD image requis, 0.35.2)": [
+      "Cause racine des slots RX « figés pour toujours » identifiée sur Horace : une IP média dupliquée/résiduelle sur une autre NIC de l'hôte déroute les joins IGMP de libmtl (ip_mreq.imr_interface = IP du port, résolue par ADRESSE par le noyau) → le switch forwarde vers la mauvaise NIC pendant que fdir/queue attendent sur la bonne. Le daemon FIGE en plus l'IP détectée au mtl_init → après nettoyage de l'hôte, un redéploiement du moteur reste requis.",
+      "Watchdog RX auto-guérison (_manager_loop) : un groupe abonné dont frame_index n'avance pas pendant MTL_RX_WATCHDOG_S (défaut 15 s, 0 = off) est « bounced » — session omise du config 2 s puis ré-émise → le daemon la libère (leave IGMP + fdir put) et la recrée (nouveau join + nouvelle pose fdir). Backoff exponentiel par groupe (30 s → 5 min) : une source réellement absente ne fait pas flapper. Sert aussi de vérification post-subscribe : un abonnement qui n'accroche pas est retenté tout seul. Grâce de 20 s après (re)lancement du daemon.",
+      "Garde-fou IP des ports (_check_port_ips, au lancement du daemon + toutes les 60 s) : détecte sip absent de l'iface, sip non primaire (MTL joindrait via une autre IP) et sip dupliqué sur une autre NIC ; exposé sur :8080 nic.ip_warnings + stdout. Côté orchestrateur (metrics.py), alerte error à l'apparition et info à la résolution.",
+      "Orchestrateur (docker_driver.py) : ensure_media_ip/ensure_iface_ip purgent désormais l'IP de toute AUTRE interface avant de la poser (_purge_ip_elsewhere_cmd) — la classe de panne « IP résiduelle après reconfig » ne peut plus se reconstituer."
+    ],
     "Nommage Rx cohérent en base 1 — carte de contrôle + labels NMOS (orchestrateur seul, pas de rebuild, 0.35.1)": [
       "Carte de contrôle (page Sources 2110) : le titre « Ensemble #n » devient « Rx #n », aligné sur les slots TX (« Slot TX #n »).",
       "Labels NMOS (services/nmos) : les receivers passent de « host #r0/#ra0/#rd0 (essence) » (0-based) à « host Rx 1 (video|audio|anc) » ; les senders TX passent de « TX0 2110-20/-30/-40 » à « TX1 … » et les audios « #0 » à « #1 ». Base 1 partout, comme les group hints (déjà « TX 1 »/« host 1 »). Les descriptions de receivers et les alertes de subscription passent aussi en base 1.",

@@ -1558,16 +1558,21 @@ int main(int argc, char** argv) {
     fprintf(stderr, "mtl_rx: daemon up (%d port(s), rx_q[0]=%u tx_q[0]=%u) — réconciliation à chaud\n",
             g_nports, p.rx_queues_cnt[0], p.tx_queues_cnt[0]);
 
-    long cfg_mtime = 0; struct stat cst;
+    /* Détection de changement en NANOSECONDES (st_mtim complet) : en rafale de commutations le
+     * contrôleur réécrit le config plusieurs fois DANS LA MÊME SECONDE — comparer st_mtime seul
+     * (secondes) ratait la dernière écriture → daemon figé sur un état intermédiaire jusqu'au
+     * changement suivant (vu au banc de churn Horace : slot jamais monté pendant 12 s). */
+    struct timespec cfg_mt = {0, 0}; struct stat cst;
     reconcile(reg, config, st, portname);                 /* état initial */
-    if (stat(config, &cst) == 0) cfg_mtime = (long)cst.st_mtime;
+    if (stat(config, &cst) == 0) cfg_mt = cst.st_mtim;
     time_t last_t = time(NULL);
     while (!g_stop) {
       for (int z = 0; z < 5 && !g_stop; z++) usleep(100000);   /* ~0.5s, réactif au SIGTERM */
       if (g_stop) break;
       struct stat cs;
-      if (stat(config, &cs) == 0 && (long)cs.st_mtime != cfg_mtime) {
-        cfg_mtime = (long)cs.st_mtime;
+      if (stat(config, &cs) == 0 &&
+          (cs.st_mtim.tv_sec != cfg_mt.tv_sec || cs.st_mtim.tv_nsec != cfg_mt.tv_nsec)) {
+        cfg_mt = cs.st_mtim;
         reconcile(reg, config, st, portname);             /* config changé → converge à chaud */
       }
       time_t now = time(NULL); double dt = difftime(now, last_t);
