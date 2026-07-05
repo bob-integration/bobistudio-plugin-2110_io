@@ -1,7 +1,12 @@
 {
-  "version": "0.36.0",
+  "version": "0.37.0",
   "date": "2026-07-05",
   "changes": {
+    "Présence signal : détection noir / gel / silence embarquée (REBUILD image requis, 0.37.0)": [
+      "Nouveau sampler (thread, 2 s) : sur chaque slot RX live et chaque slot TX câblé, sonde le CONTENU des flux MXL — image noire (moyenne du plan Y sous-échantillonné, 16 lignes ≈ 60 Ko), image figée (crc identique à l'un des 2 précédents — champs entrelacés couverts — sur des grains qui avancent), silence audio (pics < -60 dBFS avec head_index qui avance). Le transport figé reste couvert par rx/tx_stalled : la sonde ne double pas.",
+      "Exposé :8080 : champ signal {black, frozen, silence} par entrée receivers[]/senders[] — l'orchestrateur (metrics.py) alerte à transition (warning à l'apparition, info au rétablissement, gate signal_alerts_enabled).",
+      "Réglages env : SIGNAL_SAMPLE_S / SIGNAL_HOLD_S / SIGNAL_BLACK_Y (0 = auto par bit_depth) / SIGNAL_SILENCE_DB / SIGNAL_SILENCE_S. SIGBUS intercepté (motif multiview) : purge et réouverture des readers si un producteur recrée son flux."
+    ],
     "SMPTE 2022-7 réellement hitless : dual-leg red/blue de bout en bout (REBUILD image requis, 0.36.0)": [
       "Le data plane émet/reçoit désormais VRAIMENT les 2 pattes : les sessions mtl_rx portent iface2/mcast2/udp_port2 (num_leg=2, MTL_SESSION_PORT_R — branches C déjà présentes, jamais alimentées). libmtl duplique les paquets RTP à l'identique sur les 2 ports (TX) et reconstruit sans coupure (RX). Avant : SDP dual annoncé mais leg1 silencieux.",
       "Contrôleur : PORT_PAIRS (env, dérivé de node_interfaces pair_group/pair_role) → _pair_iface() ; les 6 builders de session greffent le leg redondant via _leg2() ; parseurs SDP RX (vidéo/audio/ANC) lisent la 2ᵉ section m= (a=group:DUP) ; budget de files : une session dual-leg compte sur CHAQUE NIC.",

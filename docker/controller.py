@@ -641,6 +641,198 @@ def _read_tx_stats(idx):
 
 
 # ─── :8080 métriques (format get_metrics) ────────────────────────────
+# ─── Présence signal (audit A5) : noir / gel / silence ────────────────────────────────
+# Détection de CONTENU — l'existant (rx/tx_stalled, watchdog) ne couvre que le TRANSPORT
+# (frame_index/head figé) : une image noire ou figée dont les grains avancent est invisible.
+# Coût borné : SIGNAL_ROWS lignes du plan Y (≈60 Ko) par flux toutes les SIGNAL_SAMPLE_S —
+# négligeable devant la bande passante mémoire des nœuds (memory-bound). Exposé :8080
+# (`signal` par entrée receivers[]/senders[]) ; l'orchestrateur (metrics.py) alerte à transition.
+SIGNAL_SAMPLE_S   = float(os.environ.get("SIGNAL_SAMPLE_S") or 2.0)
+SIGNAL_HOLD_S     = float(os.environ.get("SIGNAL_HOLD_S") or 5.0)     # persistance noir/gel avant flag
+SIGNAL_BLACK_Y    = int(os.environ.get("SIGNAL_BLACK_Y") or 0)        # 0 = auto : (16+6) << (bd-8)
+SIGNAL_SILENCE_DB = float(os.environ.get("SIGNAL_SILENCE_DB") or -60.0)
+SIGNAL_SILENCE_S  = float(os.environ.get("SIGNAL_SILENCE_S") or 10.0)
+SIGNAL_ROWS       = 16                                                 # lignes Y échantillonnées
+
+_signal_rx = {}      # idx slot RX → {"black","frozen"[,"silence"]} — lu par MetricsHandler
+_signal_tx = {}      # idx slot TX → {"black","frozen"} (contenu du shm d'entrée câblé)
+_sig_lock  = threading.Lock()
+_sig_state = {}      # ("rx"|"tx", idx) → état interne {name, vr, ar, vidx, crcs, *_since, fmt}
+
+
+def _sig_close(st):
+    for k in ("vr", "ar"):
+        try:
+            if st.get(k) is not None:
+                st[k].close()
+        except Exception:
+            pass
+        st[k] = None
+
+
+def _sig_video_probe(st, name, now):
+    """Sonde noir/gel du flux MXL vidéo `name` → (black, frozen) ou None si illisible OU si
+    aucun grain neuf depuis le dernier passage (transport figé = déjà couvert par rx/tx_stalled,
+    on ne double pas l'alarme). Reader rouvert sur exception (flux recréé par le producteur —
+    motif multiview) ; garbage_collect pour se rattacher à la génération vivante."""
+    try:
+        r = st.get("vr")
+        if r is None:
+            r = bobimxl.Reader(_mxl(), name)
+            st["vr"] = r
+            st.pop("vidx", None); st.pop("crcs", None); st.pop("fmt", None)
+            st.pop("black_since", None); st.pop("frozen_since", None)
+        g = r.get_latest()
+        if g is None:
+            return None
+        gidx, _gi, view = g
+        prev_idx = st.get("vidx")
+        st["vidx"] = gidx
+        if prev_idx is None or gidx == prev_idx:
+            # 1er passage (pas de référence) ou aucun grain neuf → état contenu inconnu
+            st.pop("black_since", None); st.pop("frozen_since", None)
+            return None
+        fmt = st.get("fmt") or r.format()
+        if not fmt:
+            return None
+        st["fmt"] = fmt
+        w, h, bd = int(fmt["width"]), int(fmt["height"]), int(fmt.get("bit_depth") or 8)
+        dt = np.uint16 if bd > 8 else np.uint8
+        y = np.frombuffer(view, dtype=dt, count=w * h).reshape(h, w)
+        rows = np.ascontiguousarray(y[::max(1, h // SIGNAL_ROWS)])
+        mean = float(rows.mean())
+        crc = zlib.crc32(rows.tobytes())
+        thr = SIGNAL_BLACK_Y or ((16 + 6) << (bd - 8))    # noir nominal 16 (8 bits) + marge
+        if mean < thr:
+            st.setdefault("black_since", now)
+        else:
+            st.pop("black_since", None)
+        # Gel : crc identique à l'un des 2 précédents (2 : un flux ENTRELACÉ alterne les champs —
+        # comparer au seul dernier crc raterait un gel dont les 2 champs diffèrent) sur des grains
+        # QUI AVANCENT, pendant SIGNAL_HOLD_S.
+        crcs = st.get("crcs") or []
+        if crc in crcs:
+            st.setdefault("frozen_since", now)
+        else:
+            st.pop("frozen_since", None)
+        st["crcs"] = (crcs + [crc])[-2:]
+        return (("black_since" in st and now - st["black_since"] >= SIGNAL_HOLD_S),
+                ("frozen_since" in st and now - st["frozen_since"] >= SIGNAL_HOLD_S))
+    except Exception:
+        _sig_close(st)
+        try:
+            _mxl().garbage_collect()
+        except Exception:
+            pass
+        return None
+
+
+def _sig_audio_probe(st, name, now):
+    """Sonde silence du flux MXL audio `name` → bool ou None (illisible / head figé — l'absence
+    de flux est un problème de transport, déjà couvert). Fraîcheur via head_index (lastWriteTime
+    jamais bumpé par les writers audio, cf. multiview)."""
+    try:
+        ar = st.get("ar")
+        if ar is None:
+            ar = bobimxl.AudioReader(_mxl(), name)
+            st["ar"] = ar
+            st.pop("ahead", None); st.pop("sil_since", None)
+        head = int(ar.head_index())
+        prev = st.get("ahead")
+        st["ahead"] = head
+        if prev is None or head < 0 or head == prev:
+            st.pop("sil_since", None)
+            return None
+        r = ar.read_latest(48)          # dernier bloc (≤ 1 ms @48 kHz), float32 [-1,1]
+        if r is None or not r.size:
+            return None
+        peak_db = 20.0 * float(np.log10(max(float(np.max(np.abs(r))), 1e-6)))
+        if peak_db < SIGNAL_SILENCE_DB:
+            st.setdefault("sil_since", now)
+        else:
+            st.pop("sil_since", None)
+        return "sil_since" in st and now - st["sil_since"] >= SIGNAL_SILENCE_S
+    except Exception:
+        _sig_close(st)
+        try:
+            _mxl().garbage_collect()
+        except Exception:
+            pass
+        return None
+
+
+def _sig_drop(key):
+    st = _sig_state.pop(key, None)
+    if st:
+        _sig_close(st)
+
+
+_sig_bus = threading.Event()   # SIGBUS pendant une lecture MXL (flux recréé) → purge des readers
+
+
+def _signal_loop():
+    """Thread sampler : slots RX live (flux vidéo + audio associé) et slots TX câblés (contenu
+    du shm d'entrée). Publie _signal_rx/_signal_tx (consommés par MetricsHandler)."""
+    while True:
+        time.sleep(SIGNAL_SAMPLE_S)
+        now = time.monotonic()
+        if _sig_bus.is_set():          # SIGBUS vu (producteur a recréé un flux) → repartir à neuf
+            _sig_bus.clear()
+            for k in list(_sig_state):
+                _sig_drop(k)
+            try:
+                _mxl().garbage_collect()
+            except Exception:
+                pass
+        try:
+            for idx in range(N_VIDEO):
+                key = ("rx", idx)
+                if not _live[idx]:
+                    _sig_drop(key)
+                    with _sig_lock:
+                        _signal_rx.pop(idx, None)
+                    continue
+                st = _sig_state.setdefault(key, {})
+                vres = _sig_video_probe(st, "{}_{}".format(HOSTNAME, idx), now)
+                sres = None
+                if idx < N_AUDIO and _audio_live[idx]:
+                    sres = _sig_audio_probe(st, "{}_audio_{}".format(HOSTNAME, idx), now)
+                sig = {}
+                if vres is not None:
+                    sig["black"], sig["frozen"] = vres
+                if sres is not None:
+                    sig["silence"] = sres
+                with _sig_lock:
+                    if sig:
+                        _signal_rx[idx] = sig
+                    else:
+                        _signal_rx.pop(idx, None)
+            with _tx_lock:
+                tx_in = {i: (_tx[i].get("shm_in") or "") for i in range(N_TX)
+                         if _tx[i]["enabled"] and _tx[i].get("shm_in")}
+            for i in range(N_TX):
+                key = ("tx", i)
+                name = (tx_in.get(i) or "").rsplit("/", 1)[-1]
+                if not name:
+                    _sig_drop(key)
+                    with _sig_lock:
+                        _signal_tx.pop(i, None)
+                    continue
+                st = _sig_state.setdefault(key, {})
+                if st.get("name") != name:      # recâblage → repartir d'un état neuf
+                    _sig_close(st)
+                    st = {"name": name}
+                    _sig_state[key] = st
+                vres = _sig_video_probe(st, name, now)
+                with _sig_lock:
+                    if vres is not None:
+                        _signal_tx[i] = {"black": vres[0], "frozen": vres[1]}
+                    else:
+                        _signal_tx.pop(i, None)
+        except Exception as e:
+            print("signal sampler err: {}".format(e), flush=True)
+
+
 class MetricsHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
@@ -648,6 +840,13 @@ class MetricsHandler(BaseHTTPRequestHandler):
         self.end_headers()
         with metrics_lock:
             recs = [dict(m) for m in metrics]
+        # Présence signal (audit A5) : noir/gel/silence par slot, publiés par _signal_loop.
+        with _sig_lock:
+            for m in recs:
+                s = _signal_rx.get(m.get("idx"))
+                if s:
+                    m["signal"] = dict(s)
+            sig_tx = {i: dict(s) for i, s in _signal_tx.items()}
         # Receivers ANC (2110-40) : pas de simu (n'existent que si abonnés) → lus à la volée depuis
         # leur stats json (fps + frame_index + timecode ATC) et exposés en essence "anc".
         for idx in range(N_ANC):
@@ -675,11 +874,14 @@ class MetricsHandler(BaseHTTPRequestHandler):
                     tx_fps, tx_late = _read_tx_stats(i)
                     with _tx_gen_lock:
                         _id_on, _id_sz = _tx_gen[i]["ident"], _tx_gen[i]["ident_size"]
-                    senders.append({"tx_idx": i, "idx": i, "essence": "video",
-                                    "fps": tx_fps, "fps_nominal": float(t.get("fps") or 0),
-                                    "late": tx_late, "sdp": _tx_sdp(i, t),
-                                    "ident": _id_on, "ident_size": _id_sz,
-                                    "inputs_latency_ms": inputs_lat})
+                    entry = {"tx_idx": i, "idx": i, "essence": "video",
+                             "fps": tx_fps, "fps_nominal": float(t.get("fps") or 0),
+                             "late": tx_late, "sdp": _tx_sdp(i, t),
+                             "ident": _id_on, "ident_size": _id_sz,
+                             "inputs_latency_ms": inputs_lat}
+                    if i in sig_tx:
+                        entry["signal"] = sig_tx[i]
+                    senders.append(entry)
                 # Senders AUDIO (2110-30) : un SDP par flux audio configuré (dest mcast+port).
                 for ai, acfg in enumerate(t.get("audios") or []):
                     if acfg.get("mcast") and acfg.get("port"):
@@ -2591,6 +2793,15 @@ for _i in range(N_VIDEO):
     if _i < N_AUDIO:        # tonalité de simu sur le flux audio dérivé du slot (VU-mètres consommateurs)
         threading.Thread(target=_simu_audio_loop, args=(_i,), daemon=True).start()
 threading.Thread(target=_manager_loop, daemon=True).start()
+# Présence signal (audit A5) : sampler noir/gel/silence. SIGBUS intercepté (motif multiview) :
+# la lecture d'un flux MXL recréé/tronqué par son producteur lèverait sinon un SIGBUS fatal —
+# le handler ne fait que marquer ; le sampler rouvre ses readers sur exception au tour suivant.
+if _HAS_MXL:
+    try:
+        signal.signal(signal.SIGBUS, lambda *_a: _sig_bus.set())
+    except (ValueError, OSError):
+        pass
+    threading.Thread(target=_signal_loop, daemon=True).start()
 # Générateur TX : un thread vidéo + 2 threads audio par slot TX (restent en veille si gen off).
 for _i in range(N_TX):
     threading.Thread(target=_txgen_loop, args=(_i,), daemon=True).start()
