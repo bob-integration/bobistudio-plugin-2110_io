@@ -1,7 +1,12 @@
 {
-  "version": "0.35.4",
+  "version": "0.36.0",
   "date": "2026-07-05",
   "changes": {
+    "SMPTE 2022-7 réellement hitless : dual-leg red/blue de bout en bout (REBUILD image requis, 0.36.0)": [
+      "Le data plane émet/reçoit désormais VRAIMENT les 2 pattes : les sessions mtl_rx portent iface2/mcast2/udp_port2 (num_leg=2, MTL_SESSION_PORT_R — branches C déjà présentes, jamais alimentées). libmtl duplique les paquets RTP à l'identique sur les 2 ports (TX) et reconstruit sans coupure (RX). Avant : SDP dual annoncé mais leg1 silencieux.",
+      "Contrôleur : PORT_PAIRS (env, dérivé de node_interfaces pair_group/pair_role) → _pair_iface() ; les 6 builders de session greffent le leg redondant via _leg2() ; parseurs SDP RX (vidéo/audio/ANC) lisent la 2ᵉ section m= (a=group:DUP) ; budget de files : une session dual-leg compte sur CHAQUE NIC.",
+      "Orchestrateur : docker_driver émet PORT_PAIRS ; NMOS interface_bindings passe à 2 entrées (NIC media2110 red+blue du nœud, plus la NIC du contrôleur) quand le sender/receiver est 2022-7 ; _build_dual_sdp greffe désormais a=group:DUP + a=mid (RFC 7104) et est idempotent sur un SDP déjà dual."
+    ],
     "Churn : le daemon ratait un config réécrit dans la même seconde + backoff watchdog (REBUILD image requis, 0.35.4)": [
       "mtl_rx.c comparait (long)st_mtime (SECONDES) pour détecter un changement de config : en rafale de commutations, le contrôleur réécrit le config plusieurs fois dans la même seconde → la dernière écriture était invisible, le daemon restait figé sur un état intermédiaire jusqu'au changement suivant (vu au banc de churn : session créée 12 s en retard). Fix daemon : comparaison st_mtim complet (sec+nsec). Fix contrôleur (efficace même avec un vieux daemon) : _write_config pose un mtime ENTIER strictement croissant (os.utime).",
       "Watchdog : le backoff se réarmait au bounce (le groupe paraissait « frais ») → une source absente re-tentait toutes les 15 s au lieu d'escalader 30 s → 5 min. Fix : ancre du timer (anchor) séparée de la vraie progression (prog) ; reset du backoff uniquement quand toutes les cibles progressent réellement."

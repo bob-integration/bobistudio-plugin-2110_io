@@ -304,6 +304,33 @@ def _tx_iface(idx, pin=None):
     """Port TX : épinglage poussé via /tx (_tx[i]['iface']), sinon répartition auto."""
     return pin if pin in IFACES else _auto_iface(idx)
 
+# ─── SMPTE 2022-7 : appariement red/blue des ports ─────────────────────────────────────
+# PORT_PAIRS (env "ifA:ifB[,ifC:ifD…]", émis par l'orchestrateur depuis node_interfaces
+# pair_group/pair_role) : pour une session dual-leg, le leg redondant part/écoute sur l'iface
+# APPARIÉE à celle du leg primaire. Map bidirectionnelle (le primaire peut être red ou blue,
+# selon épinglage/répartition). Sans paire déclarée → _pair_iface rend "" → mono-leg partout.
+def _parse_port_pairs():
+    out = {}
+    for tok in (os.environ.get("PORT_PAIRS") or "").split(","):
+        a, _, b = tok.strip().partition(":")
+        if a in IFACES and b in IFACES and a != b:
+            out[a], out[b] = b, a
+    return out
+PORT_PAIRS = _parse_port_pairs()
+
+def _pair_iface(iface):
+    """Iface du leg redondant 2022-7 appariée à `iface` ('' si pas de paire déclarée)."""
+    return PORT_PAIRS.get(iface or IFACE, "")
+
+def _leg2(sess, iface, mcast2, port2):
+    """Greffe le leg redondant 2022-7 sur un dict de session mtl_rx. Le daemon passe la
+    session en num_leg=2 dès que iface2+mcast2+udp_port2 sont présents (parse_session_into) ;
+    sans paire déclarée ou sans leg1 alloué → dict inchangé (mono-leg, iso-comportement)."""
+    if2 = _pair_iface(iface)
+    if if2 and mcast2 and port2:
+        sess["iface2"], sess["mcast2"], sess["udp_port2"] = if2, mcast2, int(port2)
+    return sess
+
 
 # ─── Garde-fou IP des ports (post-mortem Horace 2026-07) ──────────────────────────────
 # En AF-XDP, libmtl fige au mtl_init l'IP PRIMAIRE détectée de chaque port et joint les groupes
@@ -1120,6 +1147,16 @@ threading.Thread(target=lambda: HTTPServer(("0.0.0.0", 8082), ControlHandler).se
 
 
 # ─── Parseur SDP minimal (ST 2110-20) ───────────────────────────────
+def _sdp_leg2(txt, media="video"):
+    """2ᵉ section m=<media> d'un SDP dual-leg (SMPTE 2022-7, a=group:DUP / greffe NMOS) →
+    (mcast2, port2) ou None. Chaque section porte son propre c= ; on lit celui de la 2ᵉ."""
+    ms = list(re.finditer(r"^m=%s\s+(\d+)\s+RTP/AVP\s+\d+" % media, txt, re.M))
+    if len(ms) < 2:
+        return None
+    seg = txt[ms[1].start(): ms[2].start() if len(ms) > 2 else len(txt)]
+    c = re.search(r"^c=IN\s+IP4\s+([0-9.]+)", seg, re.M)
+    return (c.group(1), int(ms[1].group(1))) if c else None
+
 def _parse_sdp(path):
     try:
         txt = open(path).read()
@@ -1156,6 +1193,9 @@ def _parse_sdp(path):
     info.setdefault("width", WIDTH)
     info.setdefault("height", HEIGHT)
     info.setdefault("fps", FPS)
+    leg2 = _sdp_leg2(txt, "video")
+    if leg2:
+        info["mcast2"], info["port2"] = leg2
     return info
 
 
@@ -1174,17 +1214,22 @@ def _parse_sdp_audio(path):
     # mtl_rx droppe TOUS les paquets (« pkt len mismatch »). Absent → défaut install (A_PTIME_DEF).
     pt_m = re.search(r"^a=ptime:\s*([0-9.]+)", txt, re.M)
     ptime = float(pt_m.group(1)) if pt_m else A_PTIME_DEF
-    return {"port": int(m.group(1)), "pt": int(m.group(2)), "mcast": c.group(1),
+    info = {"port": int(m.group(1)), "pt": int(m.group(2)), "mcast": c.group(1),
             "channels": A_CHANNELS, "ptime": ptime}
+    leg2 = _sdp_leg2(txt, "audio")
+    if leg2:
+        info["mcast2"], info["port2"] = leg2
+    return info
 
 def _audio_session(idx, info, iface=IFACE):
     """Session RX audio st30 → /dev/shm/{hn}_audio_{idx} (L24 8ch BE, écrit tel quel par mtl_rx)."""
-    return {"kind": "audio", "role": "rx", "iface": iface,
+    return _leg2({"kind": "audio", "role": "rx", "iface": iface,
             "mcast": info["mcast"], "udp_port": info["port"], "payload_type": info["pt"],
             "channels": info.get("channels", A_CHANNELS), "ptime": info.get("ptime", A_PTIME_DEF),
             "ring": A_RING, "hdr": HDR,
             "targets": [{"idx": idx, "shm": "/dev/shm/{}_audio_{}".format(HOSTNAME, idx),
-                         "stats": "/tmp/mtl_a{}.json".format(idx)}]}
+                         "stats": "/tmp/mtl_a{}.json".format(idx)}]},
+            iface, info.get("mcast2"), info.get("port2"))
 
 def _derive_audio_shm(video_shm, idx=0):
     """shm vidéo câblé → shm audio associé : 'host_0' + idx=1 → 'host_audio_1'."""
@@ -1193,11 +1238,12 @@ def _derive_audio_shm(video_shm, idx=0):
 
 def _audio_tx_session(idx, acfg, shm_in, iface=IFACE):
     """Session TX audio st30 : émet le shm audio d'entrée (BE passthrough) vers la dest audio."""
-    return {"kind": "audio", "role": "tx", "iface": iface,
+    return _leg2({"kind": "audio", "role": "tx", "iface": iface,
             "mcast": acfg["mcast"], "udp_port": acfg["port"], "payload_type": acfg.get("pt", 97),
             "ssrc": _ssrc("{}:tx:a:{}".format(HOSTNAME, idx)),
             "channels": A_CHANNELS, "ptime": A_PTIME_DEF, "ring": A_RING, "hdr": HDR,
-            "targets": [{"idx": idx, "shm": shm_in, "stats": "/tmp/mtl_atx{}.json".format(idx)}]}
+            "targets": [{"idx": idx, "shm": shm_in, "stats": "/tmp/mtl_atx{}.json".format(idx)}]},
+            iface, acfg.get("mcast2"), acfg.get("port2"))
 
 
 # ─── ANC (ST 2110-40 / data) ────────────────────────────────────────
@@ -1212,15 +1258,20 @@ def _parse_sdp_anc(path):
     c = re.search(r"^c=IN\s+IP4\s+([0-9.]+)", txt, re.M)
     if not (m and c and re.search(r"smpte291", txt, re.I)):
         return None
-    return {"port": int(m.group(1)), "pt": int(m.group(2)), "mcast": c.group(1)}
+    info = {"port": int(m.group(1)), "pt": int(m.group(2)), "mcast": c.group(1)}
+    leg2 = _sdp_leg2(txt, "video")
+    if leg2:
+        info["mcast2"], info["port2"] = leg2
+    return info
 
 def _anc_session(idx, info, iface=IFACE):
     """Session RX ANC st40 → /dev/shm/{hn}_anc_{idx} (meta+udw sérialisés par mtl_rx)."""
-    return {"kind": "data", "role": "rx", "iface": iface,
+    return _leg2({"kind": "data", "role": "rx", "iface": iface,
             "mcast": info["mcast"], "udp_port": info["port"], "payload_type": info["pt"],
             "ring": 8, "hdr": HDR,
             "targets": [{"idx": idx, "shm": "/dev/shm/{}_anc_{}".format(HOSTNAME, idx),
-                         "stats": "/tmp/mtl_anc{}.json".format(idx)}]}
+                         "stats": "/tmp/mtl_anc{}.json".format(idx)}]},
+            iface, info.get("mcast2"), info.get("port2"))
 
 def _derive_anc_shm(video_shm):
     """shm vidéo câblé → shm ANC associé : 'mtl_0' → 'mtl_anc_0' (None si pas de _N final)."""
@@ -1229,11 +1280,12 @@ def _derive_anc_shm(video_shm):
 
 def _anc_tx_session(idx, t, shm_in, iface=IFACE):
     """Session TX ANC st40 : ré-émet le shm ANC d'entrée (passthrough) vers la dest ANC du slot."""
-    return {"kind": "data", "role": "tx", "iface": iface,
+    return _leg2({"kind": "data", "role": "tx", "iface": iface,
             "mcast": t["anc_mcast"], "udp_port": t["anc_port"], "payload_type": t.get("anc_pt", 97),
             "ssrc": _ssrc("{}:tx:anc:{}".format(HOSTNAME, idx)),
             "fps": t.get("fps") or FPS, "ring": 8, "hdr": HDR,
-            "targets": [{"idx": idx, "shm": shm_in, "stats": "/tmp/mtl_anctx{}.json".format(idx)}]}
+            "targets": [{"idx": idx, "shm": shm_in, "stats": "/tmp/mtl_anctx{}.json".format(idx)}]},
+            iface, t.get("anc_mcast2"), t.get("anc_port2"))
 
 
 # ─── Gestionnaire de sessions central ───────────────────────────────
@@ -1475,12 +1527,13 @@ def _video_session(info, idxs, iface=IFACE):
     # Ordre de champ : pas porté par le SDP 2110-20 → défaut par résolution (1080i=TFF, 576i=BFF),
     # même règle que le helper orchestrateur. mtl_rx s'en sert pour la parité du merge RX.
     fo = "bff" if 0 < int(info.get("height") or 0) <= 576 else "tff"
-    return {"kind": "video", "iface": iface,
+    return _leg2({"kind": "video", "iface": iface,
             "mcast": info["mcast"], "udp_port": info["port"], "payload_type": info["pt"],
             "width": info["width"], "height": info["height"], "fps": info["fps"],
             "interlaced": bool(info.get("interlaced")), "field_order": fo, "bit_depth": BIT_DEPTH,
             "ring": V_RING, "hdr": HDR,
-            "targets": [_video_target(i) for i in idxs]}
+            "targets": [_video_target(i) for i in idxs]},
+            iface, info.get("mcast2"), info.get("port2"))
 
 
 def _tx_session(idx, t, iface=IFACE):
@@ -1497,7 +1550,7 @@ def _tx_session(idx, t, iface=IFACE):
     _fps = float(t["fps"] or 25)
     if t.get("scan") == "i" and _fps > 30:
         _fps /= 2.0
-    return {"kind": "video", "role": "tx", "iface": iface,
+    return _leg2({"kind": "video", "role": "tx", "iface": iface,
             "mcast": t["mcast"], "udp_port": t["udp_port"], "payload_type": t["pt"],
             "ssrc": _ssrc("{}:tx:v:{}".format(HOSTNAME, idx)),
             "width": t["w"], "height": t["h"], "fps": _fps,
@@ -1507,7 +1560,8 @@ def _tx_session(idx, t, iface=IFACE):
             # ident_file TOUJOURS présent (sig stable → toggle IDENT sans recréer la session) ;
             # le fichier n'existe que quand l'IDENT est actif (mtl_rx libère le patch sinon).
             "targets": [{"idx": idx, "shm": shm, "stats": "/tmp/mtl_tx{}.json".format(idx),
-                         "ident_file": _tx_ident_file(idx)}]}
+                         "ident_file": _tx_ident_file(idx)}]},
+            iface, t.get("mcast2"), t.get("udp_port2"))
 
 
 _SDP_ORIGIN_ID = int(time.time())   # o= sess-id : fixe pour la durée du process (identifie CETTE
@@ -1786,6 +1840,11 @@ def _write_config(sessions):
         nic = s.get("iface") or IFACE
         d = tx_per if s.get("role") == "tx" else rx_per
         d[nic] = d.get(nic, 0) + 1
+        # 2022-7 : une session dual-leg (iface2) consomme une file sur CHAQUE NIC (libmtl
+        # alloue un flow/queue par session-port) → compter le leg redondant sur sa NIC.
+        nic2 = s.get("iface2")
+        if nic2 and nic2 != nic:
+            d[nic2] = d.get(nic2, 0) + 1
     ports = []     # RÉSERVE écrite au daemon = max(demande, plancher) + marge
     demand = []    # DEMANDE réelle (sessions effectives) — base de la décision de relance
     for i, nic in enumerate(IFACES):
