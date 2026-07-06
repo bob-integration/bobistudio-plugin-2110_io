@@ -1851,15 +1851,15 @@ def _tx_sdp(i, t):
     ).format(port=int(t.get("udp_port") or 0), pt=pt, mcast=t.get("mcast") or "0.0.0.0",
              sfilter=_sf_line(t.get("mcast"), sip),
              fmtp=fmtp, refclk=_LOCALMAC_REFCLK, ssrc=ssrc_line,
-             mid="a=mid:DUP-1\r\n" if dual else "")
-    grp = "a=group:DUP DUP-1 DUP-2\r\n" if dual else ""
+             mid="a=mid:PRIMARY\r\n" if dual else "")
+    grp = "a=group:DUP PRIMARY SECONDARY\r\n" if dual else ""
     sdp = "v=0\r\no=- {origin} IN IP4 {sip}\r\ns={hn} TX{i}\r\nt=0 0\r\n{grp}".format(
           origin=_sdp_origin(), sip=sip, hn=HOSTNAME, i=i, grp=grp) + leg0
     if dual:
         leg1 = (
             "m=video {port} RTP/AVP {pt}\r\n"
             "c=IN IP4 {mcast}/255\r\n"
-            "a=mid:DUP-2\r\n"
+            "a=mid:SECONDARY\r\n"
             "{sfilter}"
             "a=rtpmap:{pt} raw/90000\r\n"
             "a=fmtp:{pt} {fmtp}\r\n"
@@ -1893,15 +1893,15 @@ def _anc_sdp(i, t):
              mcast=t.get("anc_mcast") or "0.0.0.0",
              sfilter=_sf_line(t.get("anc_mcast"), sip),
              refclk=_LOCALMAC_REFCLK, ssrc=ssrc_line,
-             mid="a=mid:DUP-1\r\n" if dual else "")
-    grp = "a=group:DUP DUP-1 DUP-2\r\n" if dual else ""
+             mid="a=mid:PRIMARY\r\n" if dual else "")
+    grp = "a=group:DUP PRIMARY SECONDARY\r\n" if dual else ""
     sdp = "v=0\r\no=- {origin} IN IP4 {sip}\r\ns={hn} TX{i} ANC\r\nt=0 0\r\n{grp}".format(
           origin=_sdp_origin(), sip=sip, hn=HOSTNAME, i=i, grp=grp) + leg0
     if dual:
         leg1 = (
             "m=video {port} RTP/AVP {pt}\r\n"
             "c=IN IP4 {mcast}/255\r\n"
-            "a=mid:DUP-2\r\n"
+            "a=mid:SECONDARY\r\n"
             "{sfilter}"
             "a=rtpmap:{pt} smpte291/90000\r\n"
             "a=fmtp:{pt} TP=2110TPN; SSN=ST2110-40:2018;\r\n"
@@ -1939,12 +1939,12 @@ def _aud_sdp(i, ai, acfg):
         ).format(port=int(port or 0), pt=pt, mcast=mcast or "0.0.0.0",
                  sfilter=_sf_line(mcast, leg_sip),
                  ch=A_CHANNELS, ptime=ptime_s, refclk=_LOCALMAC_REFCLK, mid=mid, ssrc=ssrc_line)
-    grp = "a=group:DUP DUP-1 DUP-2\r\n" if dual else ""
+    grp = "a=group:DUP PRIMARY SECONDARY\r\n" if dual else ""
     sdp = "v=0\r\no=- {origin} IN IP4 {sip}\r\ns={hn} TX{i} AUDIO{ai}\r\nt=0 0\r\n{grp}".format(
           origin=_sdp_origin(), sip=sip, hn=HOSTNAME, i=i, ai=ai, grp=grp)
-    sdp += _leg(acfg.get("mcast"), acfg.get("port"), "a=mid:DUP-1\r\n" if dual else "", sip)
+    sdp += _leg(acfg.get("mcast"), acfg.get("port"), "a=mid:PRIMARY\r\n" if dual else "", sip)
     if dual:
-        sdp += _leg(acfg.get("mcast2"), acfg.get("port2"), "a=mid:DUP-2\r\n", sip1)
+        sdp += _leg(acfg.get("mcast2"), acfg.get("port2"), "a=mid:SECONDARY\r\n", sip1)
     return sdp
 
 
