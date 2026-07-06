@@ -171,3 +171,6 @@
              max-width:160px; }
 .port-sel:disabled { opacity:.5; }
 .ens-title .port-sel { margin-left:8px; }
+
+/* Lien visuel d'une paire SMPTE 2022-7 dans la bande de ports (red ⇄ blue). */
+.io2110-pairlink { align-self: center; color: var(--text-muted); font-weight: 700; }

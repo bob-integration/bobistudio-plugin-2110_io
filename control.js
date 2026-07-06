@@ -379,7 +379,17 @@ window.MXLPlugins["2110_io"] = {
     // (live/planifié/réservé/libre + repère plafond, comme la globale) sur le budget du PORT + état PTP.
     function _nicPortStrip(ports) {
       if (!ports || ports.length < 2) return '';
-      const strip = ports.map(_portChip).join('');
+      // SMPTE 2022-7 : les deux legs d'une paire sont visuellement liés (chip A ⇄ chip B).
+      const seenPair = new Set();
+      const strip = ports.map(p => {
+        const pr = _pairOf(p.iface);
+        if (!pr) return _portChip(p);
+        if (seenPair.has(p.iface)) return '';
+        const twin = pr[0] === p.iface ? pr[1] : pr[0];
+        const tp = ports.find(x => x.iface === twin);
+        seenPair.add(twin);
+        return _portChip(p) + '<span class="io2110-pairlink" title="SMPTE 2022-7">⇄</span>' + (tp ? _portChip(tp) : '');
+      }).join('');
       const detail = _nicOpen ? `<div class="io2110-portdetail">${
         ports.map(p => {
           const col = _netColor(p.network);
@@ -410,18 +420,37 @@ window.MXLPlugins["2110_io"] = {
     let _cachedVideoCount = 0;  // capacité totale déployée
     let _cachedActiveRx   = 0;  // slots simultanés autorisés (active_rx_count)
     let _nodePorts        = [];  // ports média du nœud (multi-NIC) ; [] = mono-port → pas de sélecteur
+    let _pairs227         = [];  // paires red/blue actives (moteur en SMPTE 2022-7) : [[ifA, ifB], …]
 
     // Sélecteur de PORT (NIC) d'un slot — multi-NIC seulement (≥2 ports). « Auto » = répartition
     // automatique (badge du port effectif courant) ; un port précis = épinglage. POST /api/mtl/<vmid>/pin.
+    // SMPTE 2022-7 : une session dual-leg occupe LES DEUX ports d'une paire → on propose la PAIRE
+    // (« ifA ⇄ ifB », valeur = leg rouge), jamais ses membres séparément ; les ports non appariés
+    // restent sélectionnables individuellement (aucune perte hors 2022-7).
+    function _pairOf(ifn){ return _pairs227.find(pr => pr[0] === ifn || pr[1] === ifn); }
     function portSelector(role, idx, port){
       if (!_nodePorts || _nodePorts.length < 2) return '';
       const cur = (port && port.pinned) ? port.iface : '';   // '' = Auto
       const eff = (port && port.iface) || '';
-      const opts = [`<option value=""${cur===''?' selected':''}>Auto${eff?` (${esc(eff)})`:''}</option>`]
-        .concat(_nodePorts.map(p =>
-          `<option value="${esc(p.ifname)}"${cur===p.ifname?' selected':''}>${esc(p.ifname)}${p.network?` · ${esc(p.network)}`:''}</option>`)).join('');
+      const curPair = _pairOf(cur);
+      const effPair = _pairOf(eff);
+      const effLbl = effPair ? `${effPair[0]} ⇄ ${effPair[1]}` : eff;
+      const opts = [`<option value=""${cur===''?' selected':''}>Auto${eff?` (${esc(effLbl)})`:''}</option>`];
+      const seen = new Set();
+      for (const p of _nodePorts){
+        const pr = _pairOf(p.ifname);
+        if (pr){
+          const key = pr.join(':');
+          if (seen.has(key)) continue;
+          seen.add(key);
+          const sel = curPair && curPair.join(':') === key;   // l'un OU l'autre membre épinglé
+          opts.push(`<option value="${esc(pr[0])}"${sel?' selected':''}>${esc(pr[0])} ⇄ ${esc(pr[1])}${p.network?` · ${esc(p.network)}`:''}</option>`);
+        } else {
+          opts.push(`<option value="${esc(p.ifname)}"${cur===p.ifname?' selected':''}>${esc(p.ifname)}${p.network?` · ${esc(p.network)}`:''}</option>`);
+        }
+      }
       return `<span class="port-wrap"><select class="port-sel" data-role="${role}" data-idx="${idx}"
-                title="Port (NIC) de ce slot — Auto = répartition automatique entre les ports du réseau">${opts}</select></span>`;
+                title="${_pairs227.length ? 'Paire 2022-7 (les deux legs) ou port de ce slot' : 'Port (NIC) de ce slot — Auto = répartition automatique entre les ports du réseau'}">${opts.join('')}</select></span>`;
     }
 
     // Ligne de flux audio/ANC avec bouton de retrait granulaire (« Option A »).
@@ -591,6 +620,7 @@ window.MXLPlugins["2110_io"] = {
       const recvs = (c && c.receivers) || [];
       _cachedRecvs = recvs;
       _nodePorts = (c && c.ports) || [];
+      _pairs227  = (c && c.smpte_2022_7 && c.port_pairs) || [];
       const activeCount = recvs.filter(x => x.active).length;
       _cachedVideoCount = (c && c.video_count) || recvs.length;
       _cachedActiveRx   = (c && c.active_rx_count) || _cachedVideoCount;
