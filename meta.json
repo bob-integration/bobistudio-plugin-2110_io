@@ -1,7 +1,11 @@
 {
-  "version": "0.37.1",
-  "date": "2026-07-05",
+  "version": "0.38.0",
+  "date": "2026-07-06",
   "changes": {
+    "TX 2022-7 : un câble débranché ne tue plus tout le TX (REBUILD image requis, 0.38.0)": [
+      "Gel du leg TX au lien mort : le carrier des NIC est surveillé (0,5 s) ; un leg dont le lien tombe est retiré de la session (émission mono-leg sur le leg vivant, bascule de leg si c'est le primaire qui meurt), et la session duale est recréée automatiquement au retour du lien. Auparavant, émettre vers un lien mort figeait la queue XSK (tx prod full) → st20_tx_queue_fatal_error irrécupérable en AF_XDP, puis la récupération interne de libmtl fuyait des memzones DPDK jusqu'au plafond (2560) : TOUT le TX mourait définitivement, même après rebranchement (banc 2026-07-06).",
+      "Backstop anti-wedge : une session TX démarrée qui ne sort plus aucune frame pendant 5 s (queue XDP morte, quelle qu'en soit la cause) déclenche une sortie immédiate du daemon — le contrôleur le relance (purge XDP/ntuple + backoff, chemin crash existant) et le process neuf repart avec des memzones vierges, legs morts gelés via le carrier."
+    ],
     "Présence signal : détection noir / gel / silence embarquée (REBUILD image requis, 0.37.0)": [
       "Nouveau sampler (thread, 2 s) : sur chaque slot RX live et chaque slot TX câblé, sonde le CONTENU des flux MXL — image noire (moyenne du plan Y sous-échantillonné, 16 lignes ≈ 60 Ko), image figée (crc identique à l'un des 2 précédents — champs entrelacés couverts — sur des grains qui avancent), silence audio (pics < -60 dBFS avec head_index qui avance). Le transport figé reste couvert par rx/tx_stalled : la sonde ne double pas.",
       "Exposé :8080 : champ signal {black, frozen, silence} par entrée receivers[]/senders[] — l'orchestrateur (metrics.py) alerte à transition (warning à l'apparition, info au rétablissement, gate signal_alerts_enabled).",

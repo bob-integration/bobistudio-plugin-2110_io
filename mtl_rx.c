@@ -130,6 +130,23 @@ static int resolve_port(const char* iface, char out[MTL_PORT_MAX_LEN]) {
   return -1;
 }
 
+/* ── 2022-7 : état du LIEN physique par NIC ──────────────────────────────────────────────
+ * Émettre vers un lien mort est FATAL en AF_XDP : le driver ne draine plus le ring XSK
+ * (`tx prod full`) → `st20_tx_queue_fatal_error` que libmtl ne sait pas récupérer (« not dpdk
+ * user pmd, nothing to do ») ; pire, sa récupération interne (audio) recrée ses mempools en
+ * boucle et FUIT des memzones DPDK jusqu'au plafond (2560) → TOUT le TX meurt, même après
+ * rebranchement (banc 2026-07-06, nœud 30). Parade : le carrier est lu à la construction des
+ * sessions (gel du leg TX mort, cf. parse_session_into) et surveillé dans la boucle principale
+ * (un changement force une réconciliation → bascule mono-leg au down, retour dual au link-up). */
+static int iface_carrier(const char* iface) {
+  if (!iface || !iface[0]) return 1;
+  char p[160]; snprintf(p, sizeof(p), "/sys/class/net/%s/carrier", iface);
+  FILE* f = fopen(p, "r");
+  if (!f) return 1;                    /* illisible (netns, nom exotique) → ne jamais geler à l'aveugle */
+  int c = fgetc(f); fclose(f);
+  return c == '0' ? 0 : 1;
+}
+
 /* Namespace UUIDv5 Bobi.Studio = uuid5(NAMESPACE_DNS, "mxl.bobi.studio") — DOIT être identique à
  * bobimxl._NS_BOBI (sinon les flux écrits ici ne sont pas trouvés par les consommateurs Python). */
 static const uint8_t NS_BOBI[16] = {
@@ -185,6 +202,8 @@ struct target {
   uint64_t recv;           /* compteur reçu (pour le débit) */
   uint64_t late;           /* TX vidéo : trames en retard (get_frame > 1,5 période = epoch raté) */
   uint64_t last_feed_ns;   /* TX vidéo : instant (monotone) du dernier get_frame réussi */
+  uint64_t alive_ns;       /* TX (tous kinds) : dernier signe de vie du thread (get_frame OK ou
+                            * attente de câblage). Figé session démarrée = queue TX morte (wedge). */
   int      dbg_depth_logged; /* TX vidéo : log one-shot grainSize/out_size/_src8 au 1er grain */
   uint64_t tx_src_idx;     /* TX vidéo : dernier index de grain SOURCE lu (détection flux figé) */
   uint64_t tx_src_idx_ns;  /* TX vidéo : instant (monotone) où tx_src_idx a changé pour la dernière fois */
@@ -777,11 +796,13 @@ static void* video_tx_thread(void* arg) {
   while (!s->stop) {
     if (!t->reader) {
       t->last_feed_ns = 0;   /* flux pas encore là : ne pas compter l'attente comme du retard */
+      t->alive_ns = mono_ns();   /* attendre un câblage n'est pas un wedge */
       if (open_reader(t) != 0) { usleep(20000); continue; }
     }
     struct st_frame* frame = st20p_tx_get_frame(s->vth);   /* bloque → pacing à fps */
     if (!frame) { usleep(1000); continue; }
     uint64_t tnow = mono_ns();
+    t->alive_ns = tnow;      /* la session transmet (frames libérées par MTL) */
     if (period_ns && t->last_feed_ns) {
       uint64_t gap = tnow - t->last_feed_ns;
       if (gap > period_ns + period_ns / 2) {
@@ -970,10 +991,12 @@ static void* audio_tx_thread(void* arg) {
   int chs = s->channels;
   while (!s->stop) {
     if (!t->reader) {
+      t->alive_ns = mono_ns();   /* attendre un câblage n'est pas un wedge */
       if (open_reader(t) != 0) { usleep(20000); continue; }
     }
     struct st30_frame* frame = st30p_tx_get_frame(s->a_tx);   /* bloque (BLOCK_GET) → pacing 1ms */
     if (!frame) { usleep(500); continue; }
+    t->alive_ns = mono_ns();     /* la session transmet (frames libérées par MTL) */
     uint8_t* dst = (uint8_t*)frame->addr;
     size_t n = frame->data_size / (size_t)(chs * 3);          /* samples par canal à émettre */
     mxlWrappedMultiBufferSlice slc; memset(&slc, 0, sizeof(slc));
@@ -1114,9 +1137,13 @@ static void* data_tx_thread(void* arg) {
   struct sess* s = arg;
   struct target* t = &s->tg[0];
   while (!s->stop) {
-    if (!t->reader) { if (open_reader(t) != 0) { usleep(20000); continue; } }
+    if (!t->reader) {
+      t->alive_ns = mono_ns();   /* attendre un câblage n'est pas un wedge */
+      if (open_reader(t) != 0) { usleep(20000); continue; }
+    }
     struct st40_frame_info* frame = st40p_tx_get_frame(s->d_tx);   /* bloque (BLOCK_GET) → pacing fps */
     if (!frame) { usleep(1000); continue; }
+    t->alive_ns = mono_ns();     /* la session transmet (frames libérées par MTL) */
     mxlGrainInfo gi; uint8_t* src;
     if (reader_latest(t, &gi, &src) == 0) {
       uint32_t mn = ((const uint32_t*)src)[0]; if (mn > ST40_MAX_META) mn = 0;
@@ -1262,6 +1289,34 @@ static int parse_session_into(struct json_object* j, struct sess* s) {
     s->num_leg = 2;
   } else {
     s->num_leg = 1;
+  }
+  /* Gel TX des legs au lien mort (cf. iface_carrier) : mono-leg sur le leg vivant (le mcast
+   * suit son leg — bascule si le primaire est mort), session SAUTÉE si plus aucun leg vivant.
+   * Le sig reflète l'état gelé → un changement de carrier (réconciliation forcée par la boucle
+   * principale) recrée la session sous sa forme complète au retour du lien. RX non concerné :
+   * le merge libmtl tolère un leg silencieux (vérifié au banc). */
+  if (s->role == ROLE_TX) {
+    int cp = iface_carrier(s->iface[0] ? s->iface : (g_nports > 0 ? g_ports[0].iface : ""));
+    int cr = (s->num_leg == 2) ? iface_carrier(s->iface_r) : 0;
+    if (s->num_leg == 2 && cp && !cr) {
+      fprintf(stderr, "mtl_rx: 2022-7 TX %s:%d — lien %s mort, gel du leg redondant\n",
+              s->mcast, s->udp_port, s->iface_r);
+      s->iface_r[0] = 0; s->portname_r[0] = 0; s->mcast_r[0] = 0; s->udp_port_r = 0;
+      s->num_leg = 1;
+    } else if (s->num_leg == 2 && !cp && cr) {
+      fprintf(stderr, "mtl_rx: 2022-7 TX %s:%d — lien %s mort, bascule sur le leg %s (%s:%d)\n",
+              s->mcast, s->udp_port, s->iface, s->iface_r, s->mcast_r, s->udp_port_r);
+      snprintf(s->iface, sizeof(s->iface), "%s", s->iface_r);
+      snprintf(s->portname, sizeof(s->portname), "%s", s->portname_r);
+      snprintf(s->mcast, sizeof(s->mcast), "%s", s->mcast_r);
+      s->udp_port = s->udp_port_r;
+      s->iface_r[0] = 0; s->portname_r[0] = 0; s->mcast_r[0] = 0; s->udp_port_r = 0;
+      s->num_leg = 1;
+    } else if (!cp && (s->num_leg == 1 || !cr)) {
+      fprintf(stderr, "mtl_rx: TX %s:%d — aucun leg avec lien vivant, session gelée\n",
+              s->mcast, s->udp_port);
+      return -1;                     /* pas de session ; recréée au link-up (réconciliation) */
+    }
   }
   if (s->kind == K_VIDEO) {
     s->width=jint(j,"width",1920); s->height=jint(j,"height",1080);
@@ -1566,6 +1621,8 @@ int main(int argc, char** argv) {
     reconcile(reg, config, st, portname);                 /* état initial */
     if (stat(config, &cst) == 0) cfg_mt = cst.st_mtim;
     time_t last_t = time(NULL);
+    int carrier[MTL_PORT_MAX];
+    for (int k = 0; k < g_nports; k++) carrier[k] = iface_carrier(g_ports[k].iface);
     while (!g_stop) {
       for (int z = 0; z < 5 && !g_stop; z++) usleep(100000);   /* ~0.5s, réactif au SIGTERM */
       if (g_stop) break;
@@ -1575,9 +1632,39 @@ int main(int argc, char** argv) {
         cfg_mt = cs.st_mtim;
         reconcile(reg, config, st, portname);             /* config changé → converge à chaud */
       }
+      /* Lien : un changement de carrier force la réconciliation — les sessions TX se recréent
+       * gelées (leg mort retiré, cf. parse_session_into) au DOWN, complètes au retour du lien. */
+      int link_chg = 0;
+      for (int k = 0; k < g_nports; k++) {
+        int c = iface_carrier(g_ports[k].iface);
+        if (c != carrier[k]) {
+          fprintf(stderr, "mtl_rx: lien %s → %s\n", g_ports[k].iface, c ? "UP" : "DOWN");
+          carrier[k] = c; link_chg = 1;
+        }
+      }
+      if (link_chg) reconcile(reg, config, st, portname);
       time_t now = time(NULL); double dt = difftime(now, last_t);
       if (dt >= 2.0) { write_stats(reg, last, dt); last_t = now;
-        mxlGarbageCollectFlows(g_mxl); }   /* récupère les flux orphelins (producteurs morts) */
+        mxlGarbageCollectFlows(g_mxl);   /* récupère les flux orphelins (producteurs morts) */
+        /* Backstop wedge TX : session démarrée dont le thread n'a plus AUCUN signe de vie depuis
+         * > 5 s (get_frame ne rend plus rien) = queue TX XDP morte — irrécupérable in-process
+         * (st20_tx_queue_fatal_error « nothing to do ») et la « récupération » interne de libmtl
+         * fuit des memzones DPDK jusqu'au plafond → sortie IMMÉDIATE : le contrôleur relance le
+         * daemon (purge XDP/ntuple + backoff, chemin crash déjà prévu), le process neuf repart
+         * avec des memzones vierges et gèle les legs morts via le carrier. Pas de cleanup ici :
+         * libérer des queues mortes peut bloquer, et _launch_mtl est conçu pour l'après-crash. */
+        uint64_t wnow = mono_ns();
+        for (int i = 0; i < MAX_SESS; i++) {
+          struct sess* s2 = &reg[i];
+          if (!s2->used || s2->role != ROLE_TX || !s2->started || !s2->tg[0].alive_ns) continue;
+          if (wnow - s2->tg[0].alive_ns > 5ull * 1000000000ull) {
+            fprintf(stderr, "mtl_rx: TX FIGÉ %s:%d (aucune frame depuis %.1fs) — restart du daemon\n",
+                    s2->mcast, s2->udp_port, (wnow - s2->tg[0].alive_ns) / 1e9);
+            fflush(stderr);
+            _exit(3);
+          }
+        }
+      }
     }
     for (int i = 0; i < MAX_SESS; i++) if (reg[i].used) free_session(&reg[i]);
     mtl_uninit(st);
