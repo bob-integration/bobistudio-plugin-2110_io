@@ -79,10 +79,14 @@ RUN ln -sf /usr/include/x86_64-linux-gnu/asm /usr/include/asm
 #    Le composant ld_preload/udp casse (signature ioctl) → ignoré ; gate = pkg-config mtl.
 #    Patch bobi.studio st40/AF-XDP (RX ANC : mbuf port=UINT16_MAX en AF-XDP natif → fallback mono-port)
 #    appliqué APRÈS le clone, AVANT build.sh (qui compile libmtl depuis lib/src).
+#    Patch bobi.studio 2022-7 hitless TX (un port AF_XDP au lien mort jette ses paquets comme
+#    émis au lieu de figer la session entière — sinon un câble débranché tue tout le TX).
 COPY patch_st40_afxdp_port.py /tmp/patch_st40_afxdp_port.py
+COPY patch_afxdp_tx_link_drop.py /tmp/patch_afxdp_tx_link_drop.py
 RUN git clone --depth 1 -b ${MTL_REF} https://github.com/OpenVisualCloud/Media-Transport-Library /src/MTL \
  && cd /src/MTL \
  && python3 /tmp/patch_st40_afxdp_port.py \
+ && python3 /tmp/patch_afxdp_tx_link_drop.py \
  && MTL_PREFIX_ARGS="-Dtests=false" ./script/build_dpdk.sh -f \
  && ./build.sh || true \
  && ldconfig \

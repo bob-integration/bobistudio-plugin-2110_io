@@ -131,13 +131,14 @@ static int resolve_port(const char* iface, char out[MTL_PORT_MAX_LEN]) {
 }
 
 /* ── 2022-7 : état du LIEN physique par NIC ──────────────────────────────────────────────
- * Émettre vers un lien mort est FATAL en AF_XDP : le driver ne draine plus le ring XSK
- * (`tx prod full`) → `st20_tx_queue_fatal_error` que libmtl ne sait pas récupérer (« not dpdk
- * user pmd, nothing to do ») ; pire, sa récupération interne (audio) recrée ses mempools en
- * boucle et FUIT des memzones DPDK jusqu'au plafond (2560) → TOUT le TX meurt, même après
- * rebranchement (banc 2026-07-06, nœud 30). Parade : le carrier est lu à la construction des
- * sessions (gel du leg TX mort, cf. parse_session_into) et surveillé dans la boucle principale
- * (un changement force une réconciliation → bascule mono-leg au down, retour dual au link-up). */
+ * Sans parade, émettre vers un lien mort est FATAL en AF_XDP : le driver ne draine plus le
+ * ring XSK (`tx prod full`) → `st20_tx_queue_fatal_error` que libmtl ne sait pas récupérer
+ * (« not dpdk user pmd, nothing to do ») ; pire, sa récupération interne (audio) recrée ses
+ * mempools en boucle et FUIT des memzones DPDK jusqu'au plafond (2560) → TOUT le TX meurt,
+ * même après rebranchement (banc 2026-07-06, nœud 30). La parade PRINCIPALE est dans libmtl
+ * (patch bobi.studio patch_afxdp_tx_link_drop : port au lien mort ⇒ paquets jetés comme émis,
+ * la session duale ne se fige jamais — vrai hitless). Ici on ne fait que JOURNALISER les
+ * changements de lien (boucle principale) ; le backstop anti-wedge reste l'ultime filet. */
 static int iface_carrier(const char* iface) {
   if (!iface || !iface[0]) return 1;
   char p[160]; snprintf(p, sizeof(p), "/sys/class/net/%s/carrier", iface);
@@ -1290,34 +1291,11 @@ static int parse_session_into(struct json_object* j, struct sess* s) {
   } else {
     s->num_leg = 1;
   }
-  /* Gel TX des legs au lien mort (cf. iface_carrier) : mono-leg sur le leg vivant (le mcast
-   * suit son leg — bascule si le primaire est mort), session SAUTÉE si plus aucun leg vivant.
-   * Le sig reflète l'état gelé → un changement de carrier (réconciliation forcée par la boucle
-   * principale) recrée la session sous sa forme complète au retour du lien. RX non concerné :
-   * le merge libmtl tolère un leg silencieux (vérifié au banc). */
-  if (s->role == ROLE_TX) {
-    int cp = iface_carrier(s->iface[0] ? s->iface : (g_nports > 0 ? g_ports[0].iface : ""));
-    int cr = (s->num_leg == 2) ? iface_carrier(s->iface_r) : 0;
-    if (s->num_leg == 2 && cp && !cr) {
-      fprintf(stderr, "mtl_rx: 2022-7 TX %s:%d — lien %s mort, gel du leg redondant\n",
-              s->mcast, s->udp_port, s->iface_r);
-      s->iface_r[0] = 0; s->portname_r[0] = 0; s->mcast_r[0] = 0; s->udp_port_r = 0;
-      s->num_leg = 1;
-    } else if (s->num_leg == 2 && !cp && cr) {
-      fprintf(stderr, "mtl_rx: 2022-7 TX %s:%d — lien %s mort, bascule sur le leg %s (%s:%d)\n",
-              s->mcast, s->udp_port, s->iface, s->iface_r, s->mcast_r, s->udp_port_r);
-      snprintf(s->iface, sizeof(s->iface), "%s", s->iface_r);
-      snprintf(s->portname, sizeof(s->portname), "%s", s->portname_r);
-      snprintf(s->mcast, sizeof(s->mcast), "%s", s->mcast_r);
-      s->udp_port = s->udp_port_r;
-      s->iface_r[0] = 0; s->portname_r[0] = 0; s->mcast_r[0] = 0; s->udp_port_r = 0;
-      s->num_leg = 1;
-    } else if (!cp && (s->num_leg == 1 || !cr)) {
-      fprintf(stderr, "mtl_rx: TX %s:%d — aucun leg avec lien vivant, session gelée\n",
-              s->mcast, s->udp_port);
-      return -1;                     /* pas de session ; recréée au link-up (réconciliation) */
-    }
-  }
+  /* 2022-7 : PAS de gel/recréation au lien mort — la session reste DUALE en permanence.
+   * C'est libmtl (patch bobi.studio patch_afxdp_tx_link_drop) qui jette les paquets d'un
+   * port au lien mort comme s'ils étaient émis → le leg vivant ne s'arrête JAMAIS (vrai
+   * hitless), reprise silencieuse au link-up. Recréer la session ici couperait ~1 s le
+   * leg sain (les ports d'une session MTL sont figés à la création). */
   if (s->kind == K_VIDEO) {
     s->width=jint(j,"width",1920); s->height=jint(j,"height",1080);
     s->fps=jdbl(j,"fps",25.0); s->interlaced=jint(j,"interlaced",0);
@@ -1632,27 +1610,28 @@ int main(int argc, char** argv) {
         cfg_mt = cs.st_mtim;
         reconcile(reg, config, st, portname);             /* config changé → converge à chaud */
       }
-      /* Lien : un changement de carrier force la réconciliation — les sessions TX se recréent
-       * gelées (leg mort retiré, cf. parse_session_into) au DOWN, complètes au retour du lien. */
-      int link_chg = 0;
+      /* Lien : journalisation seule. Les sessions ne sont PAS touchées — un port au lien
+       * mort jette ses paquets côté libmtl (patch_afxdp_tx_link_drop), le leg vivant
+       * continue sans interruption et le leg mort réémet seul au retour du lien. */
       for (int k = 0; k < g_nports; k++) {
         int c = iface_carrier(g_ports[k].iface);
         if (c != carrier[k]) {
-          fprintf(stderr, "mtl_rx: lien %s → %s\n", g_ports[k].iface, c ? "UP" : "DOWN");
-          carrier[k] = c; link_chg = 1;
+          fprintf(stderr, "mtl_rx: lien %s → %s%s\n", g_ports[k].iface, c ? "UP" : "DOWN",
+                  c ? "" : " (TX de ce port jeté par libmtl jusqu'au retour du lien)");
+          carrier[k] = c;
         }
       }
-      if (link_chg) reconcile(reg, config, st, portname);
       time_t now = time(NULL); double dt = difftime(now, last_t);
       if (dt >= 2.0) { write_stats(reg, last, dt); last_t = now;
         mxlGarbageCollectFlows(g_mxl);   /* récupère les flux orphelins (producteurs morts) */
-        /* Backstop wedge TX : session démarrée dont le thread n'a plus AUCUN signe de vie depuis
+        /* Backstop wedge TX (ultime filet — le lien mort est normalement absorbé par le patch
+         * libmtl link_drop) : session démarrée dont le thread n'a plus AUCUN signe de vie depuis
          * > 5 s (get_frame ne rend plus rien) = queue TX XDP morte — irrécupérable in-process
          * (st20_tx_queue_fatal_error « nothing to do ») et la « récupération » interne de libmtl
          * fuit des memzones DPDK jusqu'au plafond → sortie IMMÉDIATE : le contrôleur relance le
          * daemon (purge XDP/ntuple + backoff, chemin crash déjà prévu), le process neuf repart
-         * avec des memzones vierges et gèle les legs morts via le carrier. Pas de cleanup ici :
-         * libérer des queues mortes peut bloquer, et _launch_mtl est conçu pour l'après-crash. */
+         * avec des memzones vierges. Pas de cleanup ici : libérer des queues mortes peut
+         * bloquer, et _launch_mtl est conçu pour l'après-crash. */
         uint64_t wnow = mono_ns();
         for (int i = 0; i < MAX_SESS; i++) {
           struct sess* s2 = &reg[i];
