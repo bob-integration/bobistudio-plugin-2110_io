@@ -57,7 +57,11 @@ RUN git apply --verbose /tmp/mxl-planar-type.patch \
 # ---------------------------------------------------------------- image finale : runtime MTL
 FROM debian:trixie
 
-ARG MTL_REF=main
+# MTL_REF ÉPINGLÉ (chantier DPDK, 2026-07-06) : SHA de `main` au moment des builds verts
+# 0.36→0.38 (tag amont le plus proche : v26.01). Les patchs bobi.studio ci-dessous
+# (st40 AF-XDP, 2022-7 tx link drop) sont fail-fast contre CE SHA — toute montée de
+# version = décision explicite + re-validation des patchs. Ne PAS remettre `main`.
+ARG MTL_REF=32b1b4e937c834353536a9e84e04f2988754951a
 ENV DEBIAN_FRONTEND=noninteractive
 ENV PKG_CONFIG_PATH=/usr/local/lib/x86_64-linux-gnu/pkgconfig:/usr/local/lib/pkgconfig
 
@@ -83,15 +87,22 @@ RUN ln -sf /usr/include/x86_64-linux-gnu/asm /usr/include/asm
 #    émis au lieu de figer la session entière — sinon un câble débranché tue tout le TX).
 COPY patch_st40_afxdp_port.py /tmp/patch_st40_afxdp_port.py
 COPY patch_afxdp_tx_link_drop.py /tmp/patch_afxdp_tx_link_drop.py
-RUN git clone --depth 1 -b ${MTL_REF} https://github.com/OpenVisualCloud/Media-Transport-Library /src/MTL \
- && cd /src/MTL \
+# MTL_REF est un SHA (pas une branche) → clone + fetch ciblé (GitHub sert les SHA joignables).
+RUN mkdir -p /src/MTL && cd /src/MTL \
+ && git init -q && git remote add origin https://github.com/OpenVisualCloud/Media-Transport-Library \
+ && git fetch --depth 1 origin ${MTL_REF} \
+ && git checkout -q FETCH_HEAD \
  && python3 /tmp/patch_st40_afxdp_port.py \
  && python3 /tmp/patch_afxdp_tx_link_drop.py \
  && MTL_PREFIX_ARGS="-Dtests=false" ./script/build_dpdk.sh -f \
  && ./build.sh || true \
  && ldconfig \
  && pkg-config --exists mtl \
- && test -e /usr/local/lib/x86_64-linux-gnu/libmtl.so
+ && test -e /usr/local/lib/x86_64-linux-gnu/libmtl.so \
+ # Assertions chemin DPDK/vfio (chantier narrow) : le build E810-only doit fournir le PMD
+ # ice DPDK et le bus PCI (BDF/vfio). Échec de build immédiat si l'un manque.
+ && test -n "$(find /usr/local/lib -name 'librte_net_ice*' | head -1)" \
+ && test -n "$(find /usr/local/lib -name 'librte_bus_pci*' | head -1)"
 
 # 3) MtlManager (requis pour AF_XDP) : meson clang BPF a besoin de l'include multiarch.
 RUN cd /src/MTL/manager \
@@ -115,8 +126,10 @@ RUN cc -O2 -o /usr/local/bin/mtl_rx /src/mtl_rx.c \
       -lmxl -ljson-c -lcrypto -lpthread -lm
 
 # 5) DDP comms : NON copié ici. En AF_XDP/kernel le DDP est chargé par le driver ice de l'HÔTE.
-#    Pour le mode PF-DPDK-in-container (plus tard), monter le .pkg via `docker run -v` à
-#    /usr/local/lib/bpf/... ou /lib/firmware/intel/ice/ddp/ice.pkg (évite de versionner un binaire Intel).
+#    En mode PF-DPDK (port en vfio-pci) : le PMD ice DPDK charge le DDP DEPUIS LE CONTENEUR →
+#    docker_driver monte `-v /lib/firmware/intel/ice/ddp/ice.pkg:/lib/firmware/intel/ice/ddp/ice.pkg:ro`
+#    dès qu'un port du nœud est `pmd=dpdk` (le .pkg vit sur l'hôte, cf. node_agent/firmware ;
+#    on ne versionne pas un binaire Intel dans l'image).
 
 # 6) Nettoyage de l'arbre source (les artefacts sont dans /usr/local).
 RUN rm -rf /src/MTL

@@ -112,11 +112,67 @@ def _nic_hw_queues(iface):
         return None
 
 
+_mtl_ports_cache = {"t": 0.0, "data": None}
+
+def _mtl_ports_read():
+    """Contrat /tmp/mtl_ports.json (cf. DPDK_NARROW.md) : stats I/O PAR PORT écrites toutes les
+    ~2 s par le daemon mtl_rx (source mtl_get_port_stats — compteurs CUMULÉS). Remplace
+    ethtool -S pour un port en PMD DPDK (l'iface kernel a disparu en vfio). Cache court.
+    Renvoie {"ts":…, "ports":[…]} ou None (daemon pas encore lancé / fichier absent)."""
+    now = time.monotonic()
+    if now < _mtl_ports_cache["t"] + 0.5:
+        return _mtl_ports_cache["data"]
+    data = None
+    try:
+        with open("/tmp/mtl_ports.json") as f:
+            data = json.load(f)
+    except Exception:
+        pass
+    _mtl_ports_cache["t"] = now
+    _mtl_ports_cache["data"] = data
+    return data
+
+
+def _mtl_port_entry(iface):
+    """Entrée du contrat mtl_ports.json pour le port `iface` (clé 'port' = ifname|BDF), ou None."""
+    d = _mtl_ports_read()
+    for p in (d or {}).get("ports") or []:
+        if p.get("port") in (iface, _port_bdf(iface)):
+            return p
+    return None
+
+
+def _nic_bps_mtl(iface):
+    """Débit RX/TX d'un port PMD DPDK : deltas sur les compteurs cumulés du contrat
+    mtl_ports.json (même mécanique de cache/delta par port que _nic_bps, état _bw_last)."""
+    now = time.monotonic()
+    cap = 100.0   # vfio : /sys/class/net/<if>/speed n'existe plus → capacité E810 par défaut
+    last = _bw_last.get(iface)
+    if last and now < last.get("t", 0) + 0.5:
+        return last.get("rx_gbps"), last.get("tx_gbps"), cap
+    ent = _mtl_port_entry(iface)
+    if ent is None:
+        _bw_last[iface] = {"rx": None, "tx": None, "t": now, "rx_gbps": None, "tx_gbps": None}
+        return None, None, cap
+    rx = int(ent.get("rx_bytes") or 0)
+    tx = int(ent.get("tx_bytes") or 0)
+    rx_gbps = tx_gbps = None
+    if last and last.get("rx") is not None and now > last.get("t", 0) + 0.5:
+        dt = now - last["t"]
+        if dt > 0 and rx >= last["rx"] and tx >= last["tx"]:   # redémarrage daemon → compteurs à 0
+            rx_gbps = round((rx - last["rx"]) * 8 / dt / 1e9, 2)
+            tx_gbps = round((tx - last["tx"]) * 8 / dt / 1e9, 2)
+    _bw_last[iface] = {"rx": rx, "tx": tx, "t": now, "rx_gbps": rx_gbps, "tx_gbps": tx_gbps}
+    return rx_gbps, tx_gbps, cap
+
+
 def _nic_bps(iface):
     """Débit RX/TX via ethtool -S (compteurs matériels, inclut AF_XDP zero-copy).
     sysfs statistics/tx_bytes ne compte PAS le trafic AF_XDP → toujours 0 pour MTL.
     Cache PAR INTERFACE (`_bw_last[iface]`) : multi-NIC = un état de delta par port,
     sinon les compteurs de deux ports écrasent mutuellement leur référence → débits faux."""
+    if _port_pmd(iface) == "dpdk":
+        return _nic_bps_mtl(iface)   # port vfio : plus d'ethtool → stats MTL (contrat)
     now = time.monotonic()
     try:
         cap = int(open(f"/sys/class/net/{iface}/speed").read().strip()) / 1000
@@ -246,6 +302,31 @@ for _i, _if in enumerate(IFACES):
 if SIPS:
     SIPS[0] = SIP or SIPS[0]
 
+# ── PMD PAR PORT (chantier DPDK, cf. DPDK_NARROW.md) ── `PORT_PMDS`/`PORT_BDFS` = CSV alignés
+# sur IFACES, émis par l'orchestrateur SEULEMENT si ≥1 port est en vfio-pci (node_interfaces.pmd
+# ='dpdk', BDF dans PORT_BDFS). Absents → tous les ports en af_xdp → STRICTEMENT iso-comportement
+# (règle anti-régression n°1 : tout le code dpdk est gaté par `_port_pmd(...) == "dpdk"`).
+_pmds_env = [s.strip() for s in (os.environ.get("PORT_PMDS") or "").split(",")]
+_bdfs_env = [s.strip() for s in (os.environ.get("PORT_BDFS") or "").split(",")]
+PORT_PMDS = [(_pmds_env[_i] if _i < len(_pmds_env) and _pmds_env[_i] else "af_xdp")
+             for _i in range(len(IFACES))]
+PORT_BDFS = [(_bdfs_env[_i] if _i < len(_bdfs_env) else "") for _i in range(len(IFACES))]
+_HAS_DPDK = any(p == "dpdk" for p in PORT_PMDS)
+
+def _port_pmd(ifn):
+    """PMD du port `ifn` : 'af_xdp' (défaut, chemin actuel) ou 'dpdk' (vfio-pci)."""
+    return PORT_PMDS[IFACES.index(ifn)] if ifn in IFACES else "af_xdp"
+
+def _port_bdf(ifn):
+    """BDF PCI du port `ifn` ('' si af_xdp / inconnu)."""
+    return PORT_BDFS[IFACES.index(ifn)] if ifn in IFACES else ""
+
+# Ports encore sur le chemin kernel/AF-XDP : SEULS concernés par la plomberie kernel (purge XDP,
+# ntuple, restriction RSS PTP, contrôle d'IP). Un port dpdk n'a PLUS d'iface kernel (vfio-pci) —
+# toute commande ip/ethtool y échouerait — et MTL y gère lui-même ses joins IGMP (PMD DPDK :
+# MT_DRV_F_MCAST_IN_DP absent → mt_mcast émet ses membership reports, cf. lib/src/mt_mcast.c).
+_AFXDP_IFACES = [ifn for _i, ifn in enumerate(IFACES) if PORT_PMDS[_i] != "dpdk"]
+
 # Répartition des sessions sur les ports (multi-NIC). Par défaut le moteur RÉPARTIT automatiquement
 # ses sessions sur les ports du RÉSEAU PRIMAIRE (modulo slot → stable + équilibré, sans flapping) ;
 # un slot peut être ÉPINGLÉ sur un port précis (RX_PINS/_tx[i]['iface'], poussé par l'orchestrateur,
@@ -356,6 +437,8 @@ def _check_port_ips():
             addrs.setdefault(p[1], []).append(p[3].split("/")[0])
     warns = []
     for i, ifn in enumerate(IFACES):
+        if _port_pmd(ifn) == "dpdk":
+            continue   # port vfio : l'iface kernel n'existe plus, joins IGMP gérés par MTL (PMD DPDK)
         sip = SIPS[i] if i < len(SIPS) else ""
         if not sip:
             continue
@@ -921,15 +1004,29 @@ class MetricsHandler(BaseHTTPRequestHandler):
         for _if in IFACES:
             _rxg, _txg, _cap = _nic_bps(_if)
             _q = _qmap.get(_if, {})
-            _hwq = _nic_hw_queues(_if) if _if != IFACE else hw_q   # budget HW de files de CE port
-            nic_ports.append({"iface": _if, "sip": _q.get("sip", ""),
-                              "rx_gbps": _rxg, "tx_gbps": _txg,
-                              "port_capacity_gbps": _cap, "link_up": _nic_link(_if),
-                              "rx_queues": _q.get("rx_queues"), "tx_queues": _q.get("tx_queues"),
-                              # Sessions AF-XDP LIVE sur ce port (exact, fan-out compris) + plafond HW du port.
-                              "active": _xdp_active_per_iface.get(_if, 0),
-                              "hw_max_combined": (_hwq["max"] if _hwq else None),
-                              "primary": _if in _auto_ports})
+            _is_dpdk = _port_pmd(_if) == "dpdk"
+            # Port dpdk : pas d'iface kernel → ethtool -l sans objet (et le plafond de files
+            # AF-XDP ne s'applique pas au PMD DPDK).
+            _hwq = None if _is_dpdk else (_nic_hw_queues(_if) if _if != IFACE else hw_q)
+            _pent = {"iface": _if, "sip": _q.get("sip", ""),
+                     "rx_gbps": _rxg, "tx_gbps": _txg,
+                     "port_capacity_gbps": _cap, "link_up": _nic_link(_if),
+                     "rx_queues": _q.get("rx_queues"), "tx_queues": _q.get("tx_queues"),
+                     # Sessions AF-XDP LIVE sur ce port (exact, fan-out compris) + plafond HW du port.
+                     "active": _xdp_active_per_iface.get(_if, 0),
+                     "hw_max_combined": (_hwq["max"] if _hwq else None),
+                     "primary": _if in _auto_ports}
+            if _is_dpdk:
+                # Clés ADDITIVES (les consommateurs actuels ignorent les clés inconnues) :
+                # budget="dpdk" = le plafond de files AF-XDP (16/48) est SANS OBJET sur ce port ;
+                # mtl_stats = relais brut du contrat /tmp/mtl_ports.json (source des rx/tx_gbps).
+                _pent["pmd"] = "dpdk"
+                _pent["bdf"] = _port_bdf(_if)
+                _pent["budget"] = "dpdk"
+                _ment = _mtl_port_entry(_if)
+                if _ment:
+                    _pent["mtl_stats"] = _ment
+            nic_ports.append(_pent)
         port_cap = nic_ports[0]["port_capacity_gbps"] if nic_ports else 100.0
         def _sum_gbps(key):
             vals = [p[key] for p in nic_ports if p[key] is not None]
@@ -1638,8 +1735,9 @@ def _xdp_off():
     le XDP (mtl_uninit incomplet, MtlManager qui ne peut pas remplacer un dispatcher existant) →
     la mtl_init suivante échoue en boucle (`native xdp dev init fail -5`). On repart d'une interface
     propre. Coût : refaute ptp4l ~15 s (auto-recovery), acceptable au (re)lancement.
-    Multi-NIC : purge CHAQUE PF média (sinon une 2ᵉ NIC garde un XDP résiduel → init en boucle)."""
-    for nic in IFACES:
+    Multi-NIC : purge CHAQUE PF média (sinon une 2ᵉ NIC garde un XDP résiduel → init en boucle).
+    Ports dpdk exclus : plus d'iface kernel (vfio-pci) → rien à détacher."""
+    for nic in _AFXDP_IFACES:
         try:
             subprocess.run(["ip", "link", "set", nic, "xdp", "off"],
                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=5)
@@ -1653,8 +1751,9 @@ def _flush_ntuple():
     sur le MATÉRIEL (elles survivent au conteneur) ; la création d'un nouveau flow pour le même
     5-tuple échoue alors (« socket add flow fail » → init_hw fail -5) → session muette sans retry.
     On repart d'une table de flow propre — mtl_init réinstalle les règles voulues. Sûr : l'interface
-    (PF E810) est dédiée à MTL sur ce nœud. Multi-NIC : purge CHAQUE PF média."""
-    for nic in IFACES:
+    (PF E810) est dédiée à MTL sur ce nœud. Multi-NIC : purge CHAQUE PF média.
+    Ports dpdk exclus : ethtool sans objet sur un port vfio (fdir géré par le PMD ice DPDK)."""
+    for nic in _AFXDP_IFACES:
         try:
             out = subprocess.run(["ethtool", "-n", nic], capture_output=True, text=True, timeout=5).stdout
             ids = re.findall(r"Filter:\s*(\d+)", out)
@@ -1694,7 +1793,8 @@ def _steer_ptp_to_kernel_queue():
     daemon (par sécurité, au cas où l'init toucherait la table). Best-effort."""
     def _apply(tag):
         # Multi-NIC : restreindre RSS sur CHAQUE PF média (chacune peut porter du PTP en coexistence).
-        for nic in IFACES:
+        # Ports dpdk exclus : pas d'iface kernel, le PTP du nœud vit sur un AUTRE port (Phase 1).
+        for nic in _AFXDP_IFACES:
             try:
                 rc = subprocess.run(["ethtool", "-X", nic, "equal", str(PTP_KERNEL_QUEUE + 1)],
                                     stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, timeout=5)
@@ -2080,8 +2180,14 @@ def _write_config(sessions):
         mg_tx = hr_tx if _hr else 0
         rq = max(d_rx, fl_rx) + mg_rx
         tq = max(d_tx, fl_tx) + mg_tx
-        ports.append({"iface": nic, "sip": SIPS[i] if i < len(SIPS) else "",
-                      "rx_queues": max(1, rq), "tx_queues": max(1, tq)})
+        _pe = {"iface": nic, "sip": SIPS[i] if i < len(SIPS) else "",
+               "rx_queues": max(1, rq), "tx_queues": max(1, tq)}
+        # PMD par port (chantier DPDK) : clés émises SEULEMENT si ≥1 port dpdk sur le nœud →
+        # un nœud 100 % af_xdp produit un config OCTET-IDENTIQUE à avant (anti-régression).
+        if _HAS_DPDK:
+            _pe["pmd"] = _port_pmd(nic)
+            _pe["bdf"] = _port_bdf(nic)
+        ports.append(_pe)
         demand.append({"iface": nic, "rx_queues": d_rx, "tx_queues": d_tx})
     # Totaux (exposés :8080 xdp.allocated + réservation au lancement du daemon).
     _rx_queues_alloc = sum(p["rx_queues"] for p in ports)
@@ -2091,11 +2197,19 @@ def _write_config(sessions):
     with open(_CONFIG_PATH, "w") as f:
         # `ports` = source de vérité (mtl_rx le lit en priorité). iface/sip/rx_queues/tx_queues
         # scalaires = repli rétro-compat (1ʳᵉ NIC) pour un mtl_rx antérieur au multi-port.
-        json.dump({"pmd": "af_xdp", "lcores": LCORES, "quota_mbs": QUOTA_MBS,
-                   "ports": ports,
-                   "iface": IFACE, "sip": SIP,
-                   "rx_queues": ports[0]["rx_queues"], "tx_queues": ports[0]["tx_queues"],
-                   "sessions": sessions}, f)
+        # Le "pmd" GLOBAL reste "af_xdp" (repli rétro-compat) ; le PMD réel est PAR PORT
+        # (ports[].pmd/bdf, émis seulement si ≥1 port dpdk — cf. plus haut).
+        _cfg = {"pmd": "af_xdp", "lcores": LCORES, "quota_mbs": QUOTA_MBS,
+                "ports": ports,
+                "iface": IFACE, "sip": SIP,
+                "rx_queues": ports[0]["rx_queues"], "tx_queues": ports[0]["tx_queues"],
+                "sessions": sessions}
+        # Pacing TX 2110-21 (mtl_init_params.pacing, niveau device) : "auto"|"rl"|"tsc".
+        # RL (rate-limit matériel) = prérequis du profil narrow — sans objet en AF-XDP (TSC).
+        # Clé émise seulement si un port est dpdk ou si l'opérateur force MTL_PACING.
+        if _HAS_DPDK or os.environ.get("MTL_PACING"):
+            _cfg["pacing"] = (os.environ.get("MTL_PACING") or "auto").strip()
+        json.dump(_cfg, f)
     # mtime ENTIER strictement croissant : un mtl_rx antérieur au compare-nanosecondes détecte le
     # changement sur (long)st_mtime — deux écritures dans la même seconde (rafale de commutations)
     # étaient invisibles → daemon figé sur un état intermédiaire (vu au banc de churn Horace).

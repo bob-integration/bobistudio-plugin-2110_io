@@ -107,7 +107,10 @@ static mxlInstance g_mxl = NULL;
 /* ── Ports MTL (NIC) du device ── un mtl_init unique peut déclarer plusieurs NIC média
  * (MTL_PORT_MAX). Remplis à l'init, puis résolus PAR SESSION via le nom d'iface (multi-NIC :
  * chaque session vise la NIC qui porte physiquement son mcast — AF-XDP, pas d'auto-sélection). */
-struct mtl_port_ent { char iface[64]; char portname[MTL_PORT_MAX_LEN]; };
+struct mtl_port_ent {
+  char iface[64]; char portname[MTL_PORT_MAX_LEN];
+  char pmd[16];   /* étiquette PMD du port ("af_xdp"|"dpdk"|"kernel") — publiée dans mtl_ports.json */
+};
 static struct mtl_port_ent g_ports[MTL_PORT_MAX];
 static int g_nports = 0;
 
@@ -1475,6 +1478,42 @@ static void write_stats(struct sess* reg, uint64_t last[][MAX_TG], double dt) {
   }
 }
 
+/* Stats I/O PAR PORT (NIC) — contrat /tmp/mtl_ports.json (cf. DPDK_NARROW.md « Contrats de la
+ * nuit ») : remplace `ethtool -S` côté contrôleur quand un port est en PMD DPDK (l'iface kernel
+ * a disparu en vfio). Source = mtl_get_port_stats() (mtl_api.h) : compteurs CUMULÉS depuis
+ * mtl_init (struct mtl_port_status). Écrit pour TOUS les ports (af_xdp compris — le contrôleur
+ * n'y bascule ses débits que pour pmd=dpdk). Écriture atomique (tmp + rename) : le contrôleur
+ * peut lire à tout instant sans lire un JSON tronqué. Cadence = celle de write_stats (~2 s). */
+static void write_port_stats(mtl_handle st) {
+  if (g_nports <= 0) return;
+  const char* tmp = "/tmp/mtl_ports.json.tmp";
+  FILE* f = fopen(tmp, "w");
+  if (!f) return;
+  fprintf(f, "{\"ts\": %llu, \"ports\": [",
+          (unsigned long long)(now_ns() / 1000000000ULL));
+  for (int k = 0; k < g_nports; k++) {
+    struct mtl_port_status ps; memset(&ps, 0, sizeof(ps));
+    if (mtl_get_port_stats(st, (enum mtl_port)k, &ps) != 0)
+      memset(&ps, 0, sizeof(ps));          /* échec → champs à 0 (contrat : absents = 0) */
+    fprintf(f,
+      "%s{\"port\": \"%s\", \"pmd\": \"%s\", "
+      "\"rx_packets\": %llu, \"tx_packets\": %llu, "
+      "\"rx_bytes\": %llu, \"tx_bytes\": %llu, "
+      "\"rx_err\": %llu, \"tx_err\": %llu, "
+      "\"rx_hw_dropped\": %llu, \"rx_nombuf\": %llu}",
+      k ? ", " : "",
+      g_ports[k].iface[0] ? g_ports[k].iface : g_ports[k].portname,
+      g_ports[k].pmd[0] ? g_ports[k].pmd : "af_xdp",
+      (unsigned long long)ps.rx_packets,            (unsigned long long)ps.tx_packets,
+      (unsigned long long)ps.rx_bytes,              (unsigned long long)ps.tx_bytes,
+      (unsigned long long)ps.rx_err_packets,        (unsigned long long)ps.tx_err_packets,
+      (unsigned long long)ps.rx_hw_dropped_packets, (unsigned long long)ps.rx_nombuf_packets);
+  }
+  fprintf(f, "]}\n");
+  fclose(f);
+  rename(tmp, "/tmp/mtl_ports.json");
+}
+
 int main(int argc, char** argv) {
   /* globaux partagés */
   char pmd[32] = "af_xdp", iface[64] = "", sip[64] = "", lcores[128] = "";
@@ -1533,6 +1572,7 @@ int main(int argc, char** argv) {
     snprintf(iface,sizeof(iface),"%s",jstr(root,"iface",""));
     snprintf(sip,sizeof(sip),"%s",jstr(root,"sip",""));
     snprintf(lcores,sizeof(lcores),"%s",jstr(root,"lcores",""));
+    char pacing[16]; snprintf(pacing,sizeof(pacing),"%s",jstr(root,"pacing","auto"));
     int rx_q = jint(root,"rx_queues", 8);   /* plafond de sessions RX (= rx_count du moteur) */
     int tx_q = jint(root,"tx_queues", 1);   /* TX : Phase 2 (1 = file de contrôle IGMP/ARP) */
     int quota_mbs = jint(root,"quota_mbs", 5000);   /* Mb/s max par scheduler (lcore), cf. mtl_init */
@@ -1549,7 +1589,19 @@ int main(int argc, char** argv) {
         if (!pif[0]) continue;
         int idx = g_nports++;
         snprintf(g_ports[idx].iface, sizeof(g_ports[idx].iface), "%s", pif);
-        build_portname(pmd, pif, g_ports[idx].portname);
+        /* PMD PAR PORT (chantier DPDK) : un nœud peut être MIXTE (af_xdp + dpdk). "pmd"/"bdf"
+         * absents de l'entrée → pmd global (rétro-compat, comportement STRICTEMENT inchangé).
+         * pmd=="dpdk" : le portname EST le BDF PCI tel quel ("0000:xx:00.y", aucun préfixe →
+         * mtl_pmd_by_port_name rend MTL_PMD_DPDK_USER, cf. lib/src/mt_util.c). `iface` reste le
+         * nom kernel historique : clé de résolution session→port (resolve_port) côté config. */
+        const char* ppmd = jstr(pj, "pmd", "");
+        const char* pbdf = jstr(pj, "bdf", "");
+        if (!ppmd[0]) ppmd = pmd;                    /* repli : pmd global existant */
+        if (!strcmp(ppmd, "dpdk") && pbdf[0])
+          snprintf(g_ports[idx].portname, MTL_PORT_MAX_LEN, "%s", pbdf);
+        else
+          build_portname(ppmd, pif, g_ports[idx].portname);
+        snprintf(g_ports[idx].pmd, sizeof(g_ports[idx].pmd), "%s", ppmd);
         snprintf(p.port[idx], MTL_PORT_MAX_LEN, "%s", g_ports[idx].portname);
         const char* psip = jstr(pj,"sip","");
         if (psip[0]) inet_pton(AF_INET, psip, p.sip_addr[idx]);
@@ -1562,6 +1614,7 @@ int main(int argc, char** argv) {
       int idx = g_nports++;
       snprintf(g_ports[idx].iface, sizeof(g_ports[idx].iface), "%s", iface);
       build_portname(pmd, iface, g_ports[idx].portname);
+      snprintf(g_ports[idx].pmd, sizeof(g_ports[idx].pmd), "%s", pmd);
       snprintf(p.port[idx], MTL_PORT_MAX_LEN, "%s", g_ports[idx].portname);
       if (sip[0]) inet_pton(AF_INET, sip, p.sip_addr[idx]);
       p.pmd[idx] = mtl_pmd_by_port_name(g_ports[idx].portname);
@@ -1583,6 +1636,13 @@ int main(int argc, char** argv) {
      * sur les lcores fournis ; les flags MIGRATE rééquilibrent à chaud un sch détecté trop busy. */
     p.flags |= MTL_FLAG_TX_VIDEO_MIGRATE | MTL_FLAG_RX_VIDEO_MIGRATE;
     p.data_quota_mbs_per_sch = quota_mbs > 0 ? (uint32_t)quota_mbs : 0;
+    /* Pacing TX ST 2110-21 (mtl_init_params.pacing, niveau DEVICE — enum st21_tx_pacing_way,
+     * cf. mtl_api.h) : "rl" = rate-limit MATÉRIEL (prérequis profil narrow, PMD DPDK/ice
+     * uniquement) ; "tsc" = logiciel (chemin actuel AF-XDP) ; "auto" (défaut) = libmtl choisit
+     * (memset a déjà posé ST21_TX_PACING_WAY_AUTO=0 → clé absente = comportement inchangé). */
+    if      (!strcmp(pacing, "rl"))  p.pacing = ST21_TX_PACING_WAY_RL;
+    else if (!strcmp(pacing, "tsc")) p.pacing = ST21_TX_PACING_WAY_TSC;
+    else                             p.pacing = ST21_TX_PACING_WAY_AUTO;
     p.log_level = MTL_LOG_LEVEL_INFO;
     p.lcores = lcores[0] ? lcores : NULL;
 
@@ -1623,6 +1683,7 @@ int main(int argc, char** argv) {
       }
       time_t now = time(NULL); double dt = difftime(now, last_t);
       if (dt >= 2.0) { write_stats(reg, last, dt); last_t = now;
+        write_port_stats(st);            /* contrat /tmp/mtl_ports.json (stats I/O par NIC) */
         mxlGarbageCollectFlows(g_mxl);   /* récupère les flux orphelins (producteurs morts) */
         /* Backstop wedge TX (ultime filet — le lien mort est normalement absorbé par le patch
          * libmtl link_drop) : session démarrée dont le thread n'a plus AUCUN signe de vie depuis

@@ -83,3 +83,38 @@ l'émission sur la grille PTP (voir les articles *PTP* et *Synchronisation (Genl
 - Les UUID NMOS sont stables (registre de niveau cluster) : un recreate/restore ne casse pas les
   abonnements des contrôleurs externes.
 - Les shm produits sont identiques à ceux de `receiver_2110` → interchangeables côté consommateurs.
+
+## Diagnostiquer un port en mode DPDK/vfio
+
+Quand une interface média est passée en `pmd=dpdk` (`node_interfaces`), le port est lié à
+**vfio-pci** : il **disparaît de `/sys/class/net`**. Conséquences : plus d'`ethtool`, plus de
+`tcpdump`, plus de compteurs kernel sur ce port. Les compteurs viennent alors du **moteur**
+(daemon MTL → `/tmp/mtl_ports.json` dans le conteneur, relayé sur `:8080` sous
+`nic.ports[i].mtl_stats`) ; l'onglet Serveurs du Monitoring continue d'afficher le débit du
+port (source `mtl`), et l'agent-nœud ≥ 0.15.0 remonte l'interface avec `state:"vfio"` au lieu
+de la faire disparaître.
+
+### Table d'équivalences (geste kernel → geste vfio)
+
+| Avant (netdev/AF-XDP) | Après (vfio/DPDK) |
+|---|---|
+| `ethtool -S <if> \| grep rx_queue_N` (deltas par file — discriminant du playbook gel RX) | Compteurs **par port** : `nic.ports[i].mtl_stats` sur `:8080` (`rx_packets`/`rx_bytes` qui avancent = le port reçoit) + stats **par session** MTL : `receivers[]` de `:8080` (`frame_index`/`fps` par slot = l'équivalent « ma file avance »). Dans le conteneur : `cat /tmp/mtl_ports.json` deux fois à quelques secondes d'écart et comparer. |
+| `ethtool -S <if> \| grep -i drop/error` | `mtl_stats.rx_err`, `tx_err`, `rx_hw_dropped`, `rx_nombuf` (nombuf qui monte = manque de mbufs → moteur sous-dimensionné, pas le réseau). |
+| `ethtool -i <if>` (driver/firmware) | `lspci -vvs <BDF>` sur l'hôte (le BDF est dans `node_interfaces.pci`) : `Kernel driver in use: vfio-pci` confirme le binding ; firmware visible via `lspci` ou en relançant temporairement le driver `ice`. |
+| `ethtool -T <if>` (capacités PTP) | Le PHC de la carte reste visible via le **port frère** de la même carte (PHC partagé sur E810 bi-port) : `ethtool -T` sur l'autre port. |
+| `ip -s link show <if>` (lien/compteurs) | Lien : `nic.ports[i].link_up` sur `:8080` (état vu par le moteur). Compteurs : `mtl_stats`. |
+| `tcpdump -i <if>` | **Impossible** sur le port (le kernel ne le voit plus). Alternatives : **port mirror sur le switch** vers une machine d'analyse ; stats RX **par session** sur `:8080` (fps, `frame_index`, `rx_latency_ms`, signal noir/figé) pour localiser le flux en cause ; en dernier recours, repasser le port en `af_xdp` (rebind kernel) le temps du diagnostic. |
+| Join IGMP visible côté kernel (`ip maddr`) | Les joins sont émis par **MTL lui-même** (plus par le kernel) : vérifier côté **switch** (table snooping IGMP) que le groupe est bien appris sur le port. |
+
+### Symptômes et gestes de recovery (inchangés)
+
+- **Alerte « port vfio muet »** (Monitoring) : compteurs `mtl_stats` figés alors que des sessions
+  sont actives. Vérifier d'abord la source amont et le switch (snooping IGMP), puis **redémarrer le
+  moteur** (Containers → restart du conteneur `2110_io`) — le restart re-crée les sessions MTL et
+  ré-émet les joins, comme dans le playbook gel RX historique.
+- **Un seul slot RX muet** (les autres vivent) : problème de flux/abonnement, pas de port → stats
+  par session sur `:8080`, SDP/IGMP côté source, comme avant.
+- **Tout le port muet** (`rx_packets` figé) : lien (`link_up`), câble/SFP, config switch, binding
+  vfio (`lspci -k`). Le restart moteur reste le geste de recovery de référence.
+- Les hugepages, le budget lcores et les plafonds de sessions se diagnostiquent **comme avant**
+  (rien ne passait par ethtool).
