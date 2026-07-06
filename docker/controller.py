@@ -407,6 +407,24 @@ def _sf_line(mcast, sip):
         return ""
     return "a=source-filter:incl IN IP4 {} {}\r\n".format(mcast or "0.0.0.0", sip or "0.0.0.0")
 
+def _sip_of_iface(ifn):
+    """IP source de la NIC `ifn` (SIPS aligné sur IFACES), '' si inconnue."""
+    try:
+        return SIPS[IFACES.index(ifn)] if ifn in IFACES else ""
+    except Exception:
+        return ""
+
+def _tx_leg_sips(i, t):
+    """(sip_leg0, sip_leg1) d'un slot TX : chaque leg 2022-7 annonce l'IP de SA NIC
+    (leg1 = interface appariée). Un SDP dont les deux sections portent la même source
+    ferait croire à une double émission sur un seul port — et casserait les récepteurs
+    SSM (IGMPv3 source-specific) sur le leg secondaire."""
+    ifn0 = _tx_iface(i, t.get("iface"))
+    sip0 = _sip_of_iface(ifn0) or SIP or "0.0.0.0"
+    ifn1 = _pair_iface(ifn0)
+    sip1 = (_sip_of_iface(ifn1) if ifn1 else "") or sip0
+    return sip0, sip1
+
 # ─── Layout shm (simu) — RÉSOLUTION DYNAMIQUE ───────────────────────
 # La simu (GÉN ou fallback sans SDP) doit suivre la résolution du flux LIVE (lue du SDP) pour
 # que le shm garde la MÊME taille que mtl_rx → les consommateurs ne cassent pas au basculement
@@ -1796,7 +1814,7 @@ def _fps_str(fps):
 def _tx_sdp(i, t):
     """SDP ST 2110-20 d'un slot TX. Si mcast2/udp_port2 présents (SMPTE 2022-7),
     génère un unique SDP avec deux sections m=video (leg0 + leg1)."""
-    sip   = SIP or "0.0.0.0"
+    sip, sip1 = _tx_leg_sips(i, t)
     interlaced = t.get("scan") == "i"
     scan  = "interlace; " if interlaced else ""
     pt    = int(t.get("pt") or 96)
@@ -1849,14 +1867,14 @@ def _tx_sdp(i, t):
             "a=mediaclk:direct=0\r\n"
             "{ssrc}"
         ).format(port=int(t["udp_port2"]), pt=pt, mcast=t["mcast2"],
-                 sfilter=_sf_line(t["mcast2"], sip), fmtp=fmtp,
+                 sfilter=_sf_line(t["mcast2"], sip1), fmtp=fmtp,
                  refclk=_LOCALMAC_REFCLK, ssrc=ssrc_line)
         sdp += leg1
     return sdp
 
 def _anc_sdp(i, t):
     """SDP ST 2110-40 (ANC) d'un slot TX. Dual-section si anc_mcast2/anc_port2 présents (2022-7)."""
-    sip  = SIP or "0.0.0.0"
+    sip, sip1 = _tx_leg_sips(i, t)
     pt   = int(t.get("anc_pt") or 97)
     dual = bool(t.get("anc_mcast2") and t.get("anc_port2"))
     ssrc = _ssrc("{}:tx:anc:{}".format(HOSTNAME, i))
@@ -1891,7 +1909,7 @@ def _anc_sdp(i, t):
             "a=mediaclk:direct=0\r\n"
             "{ssrc}"
         ).format(port=int(t["anc_port2"]), pt=pt, mcast=t["anc_mcast2"],
-                 sfilter=_sf_line(t["anc_mcast2"], sip),
+                 sfilter=_sf_line(t["anc_mcast2"], sip1),
                  refclk=_LOCALMAC_REFCLK, ssrc=ssrc_line)
         sdp += leg1
     return sdp
@@ -1899,14 +1917,14 @@ def _anc_sdp(i, t):
 def _aud_sdp(i, ai, acfg):
     """SDP ST 2110-30 d'un flux audio TX (L24 / 48 kHz / 8 ch). Dual-section si mcast2/port2
     présents (SMPTE 2022-7 : group:DUP + a=mid:). ts-refclk:localmac (upgrade PTP côté orchestrateur)."""
-    sip = SIP or "0.0.0.0"
+    sip, sip1 = _tx_leg_sips(i, _tx[i] if 0 <= i < len(_tx) else {})
     pt  = int(acfg.get("pt") or 97)
     ptime = A_PTIME_DEF if A_PTIME_DEF in (0.125, 0.25, 1.0, 4.0) else 1.0
     ptime_s = ("%g" % ptime)
     dual = bool(acfg.get("mcast2") and acfg.get("port2"))
     ssrc = _ssrc("{}:tx:a:{}".format(HOSTNAME, i * 2 + ai))
     ssrc_line = "a=ssrc:{} cname:{}\r\n".format(ssrc, HOSTNAME)
-    def _leg(mcast, port, mid):
+    def _leg(mcast, port, mid, leg_sip):
         return (
             "m=audio {port} RTP/AVP {pt}\r\n"
             "c=IN IP4 {mcast}/255\r\n"
@@ -1919,14 +1937,14 @@ def _aud_sdp(i, ai, acfg):
             "a=mediaclk:direct=0\r\n"
             "{ssrc}"
         ).format(port=int(port or 0), pt=pt, mcast=mcast or "0.0.0.0",
-                 sfilter=_sf_line(mcast, sip),
+                 sfilter=_sf_line(mcast, leg_sip),
                  ch=A_CHANNELS, ptime=ptime_s, refclk=_LOCALMAC_REFCLK, mid=mid, ssrc=ssrc_line)
     grp = "a=group:DUP DUP-1 DUP-2\r\n" if dual else ""
     sdp = "v=0\r\no=- {origin} IN IP4 {sip}\r\ns={hn} TX{i} AUDIO{ai}\r\nt=0 0\r\n{grp}".format(
           origin=_sdp_origin(), sip=sip, hn=HOSTNAME, i=i, ai=ai, grp=grp)
-    sdp += _leg(acfg.get("mcast"), acfg.get("port"), "a=mid:DUP-1\r\n" if dual else "")
+    sdp += _leg(acfg.get("mcast"), acfg.get("port"), "a=mid:DUP-1\r\n" if dual else "", sip)
     if dual:
-        sdp += _leg(acfg.get("mcast2"), acfg.get("port2"), "a=mid:DUP-2\r\n")
+        sdp += _leg(acfg.get("mcast2"), acfg.get("port2"), "a=mid:DUP-2\r\n", sip1)
     return sdp
 
 

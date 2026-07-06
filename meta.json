@@ -1,5 +1,5 @@
 {
-  "version": "0.37.0",
+  "version": "0.37.1",
   "date": "2026-07-05",
   "changes": {
     "Présence signal : détection noir / gel / silence embarquée (REBUILD image requis, 0.37.0)": [
