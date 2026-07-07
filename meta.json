@@ -1,7 +1,10 @@
 {
-  "version": "0.39.9",
+  "version": "0.39.10",
   "date": "2026-07-07",
   "changes": {
+    "Fix #25 : sonde gamut référençait _CHROMA non défini → gamut/gamut_pct ne remontaient jamais sur :8080 (0.39.10)": [
+      "_sig_video_probe utilisait _CHROMA.get(...) (le dict de bobimxl, hors namespace controller) → NameError attrapé silencieusement à chaque échantillon → gam_pct toujours None. _CHROMA={'420':(2,2),'422':(2,1),'444':(1,1)} désormais défini dans controller.py (à côté de _CW/_CH). Trouvé au banc dl360-1 (la math gamut/R128 était correcte, seule la remontée live était cassée). REBUILD image requis."
+    ],
     "Paliers CONTENU #25 : gamut/niveaux illégaux (vidéo) + loudness R128 momentané (audio) sur :8080 (REBUILD image requis, 0.39.9)": [
       "Vidéo : _sig_video_probe lit désormais les plans Cb/Cr (4:2:2) en plus de Y, matrice BT.709 → % pixels hors-gamut RGB legal (couvre aussi super-noir/super-blanc). Champs :8080 signal.gamut (bool soutenu SIGNAL_HOLD_S) + signal.gamut_pct. Coût borné (mêmes SIGNAL_ROWS lignes que noir/gel).",
       "Audio : loudness momentané EBU R128 (BS.1770 K-weighting) calculé via FFT (|H_K(f)|² sur la DSP, numpy seul, pas de scipy) sur une fenêtre 400 ms L/R. Champs :8080 signal.lufs + signal.loud (bool hors cible -23 LUFS ±2 LU). La même fenêtre sert au pic de silence.",

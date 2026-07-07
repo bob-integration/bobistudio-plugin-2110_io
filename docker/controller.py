@@ -547,6 +547,9 @@ _WHITE   = 235 << (BIT_DEPTH - 8) if _DEEP else 235
 _SCALE   = (1 << (BIT_DEPTH - 8)) if _DEEP else 1   # 8-bit ref → profondeur courante (barres de couleur)
 _CW = {"420": 2, "422": 2, "444": 1}.get(CHROMA, 2)
 _CH = {"420": 2, "422": 1, "444": 1}.get(CHROMA, 1)
+# Sous-échantillonnage chroma (hx, hy) PAR fmt — la sonde gamut (#25) lit le chroma réel de chaque
+# flux (RX/TX arbitraire), pas seulement CHROMA local. (Défini ici, pas dans bobimxl.)
+_CHROMA = {"420": (2, 2), "422": (2, 1), "444": (1, 1)}
 
 
 def _layout(w, h):
