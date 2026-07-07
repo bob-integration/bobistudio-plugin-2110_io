@@ -88,9 +88,13 @@ RUN ln -sf /usr/include/x86_64-linux-gnu/asm /usr/include/asm
 #    Patch bobi.studio RX resetting guard (RX+TX pacing RL même port : le commit TM du shaper RL
 #    stoppe brièvement le port ; le burst RX doit respecter inf->resetting sinon SIGSEGV « rx_pkt_burst
 #    for not ready port » — narrow matériel mono-port réparable).
+#    Patch bobi.studio TM hierarchy (lève le mur des 8 files TX RL : arbre traffic-manager RAMIFIÉ
+#    — plusieurs nœuds queue-group au lieu d'un seul — pour >8 senders RL/port ET création en rafale ;
+#    nb_qps = P_parents × fan-out 8 côté PMD ice, jusqu'à MT_MAX_RL_ITEMS=128).
 COPY patch_st40_afxdp_port.py /tmp/patch_st40_afxdp_port.py
 COPY patch_afxdp_tx_link_drop.py /tmp/patch_afxdp_tx_link_drop.py
 COPY patch_rx_resetting_guard.py /tmp/patch_rx_resetting_guard.py
+COPY patch_tm_hierarchy.py /tmp/patch_tm_hierarchy.py
 # MTL_REF est un SHA (pas une branche) → clone + fetch ciblé (GitHub sert les SHA joignables).
 RUN mkdir -p /src/MTL && cd /src/MTL \
  && git init -q && git remote add origin https://github.com/OpenVisualCloud/Media-Transport-Library \
@@ -99,6 +103,7 @@ RUN mkdir -p /src/MTL && cd /src/MTL \
  && python3 /tmp/patch_st40_afxdp_port.py \
  && python3 /tmp/patch_afxdp_tx_link_drop.py \
  && python3 /tmp/patch_rx_resetting_guard.py \
+ && python3 /tmp/patch_tm_hierarchy.py \
  && MTL_PREFIX_ARGS="-Dtests=false" ./script/build_dpdk.sh -f \
  && ./build.sh || true \
  && ldconfig \

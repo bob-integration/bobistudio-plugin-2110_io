@@ -45,6 +45,13 @@ A_RING     = max(2, int(os.environ.get("AUDIO_RING") or 100))   # ring shm audio
 A_PTIME_DEF = float(os.environ.get("AUDIO_PTIME") or 1.0)
 ACTIVE_RX   = int(os.environ.get("ACTIVE_RX_COUNT") or min(6, max(1, N_VIDEO)))
 ACTIVE_TX_C = int(os.environ.get("ACTIVE_TX_COUNT") or min(6, max(0, N_TX)))
+# Plafond de files TX sous pacing RL matériel (port E810 dpdk), APRÈS le patch libmtl
+# `patch_tm_hierarchy.py` (arbre TM ramifié, 0.39.6). Le patch attache jusqu'à
+# MT_MAX_RL_ITEMS=128 feuilles réparties sur P nœuds queue-group (P×8), la file de contrôle
+# comprise (nb_tx_q = tx_queues+1). Capacité RÉELLE mesurée au banc dl360-1 (2026-07-07,
+# loopback E810, DDP comms 1.3.63) = >8 confirmé, ≥16 senders RL tenus (cf. DPDK_NARROW.md
+# §Capacité RL réelle E810). Bornage conservateur : la file de contrôle + marge.
+RL_TX_QUEUES_CAP = int(os.environ.get("RL_TX_QUEUES_CAP") or 63)
 _cpu_last_usec = None
 _cpu_last_time = None
 _bw_last = {}
@@ -2180,16 +2187,21 @@ def _write_config(sessions):
         mg_tx = hr_tx if _hr else 0
         rq = max(d_rx, fl_rx) + mg_rx
         tq = max(d_tx, fl_tx) + mg_tx
-        # Plafond RL/E810 (chantier DPDK, mesuré dl360-1 2026-07-07) : le shaper RL (rte_tm) du
-        # PMD ice refuse de committer la hiérarchie au-delà de nb_tx_q=8 (« ice_tx_queue_start:
-        # Failed to add lan txq ») → mtl_init retombe en pacing tsc (perd le narrow) ET laisse le
-        # port STOPPÉ, ce qui fait échouer en cascade le join IGMP (send report fail -5 → RX no
-        # attach). MTL ajoute 1 file de contrôle (nb_tx_q = tx_queues+1) → on borne tx_queues ≤ 7
-        # sur un port dpdk. audio/ANC = shared_queue (1 file partagée), seule la vidéo prend une
-        # file RL dédiée → 6 senders vidéo tiennent. Contrainte assumée : ACTIVE_TX_COUNT ≤ 7 par
-        # port dpdk (au-delà, splitter sur 2 ports). Sans objet en AF_XDP (budget 48 files).
-        if _HAS_DPDK and _port_pmd(nic) == "dpdk":
-            tq = min(tq, 7)
+        # Plafond RL/E810 (chantier DPDK). HISTORIQUE (0.39.1) : le shaper RL (rte_tm) du PMD ice
+        # refusait de committer la hiérarchie au-delà de nb_tx_q=8 (« ice_tx_queue_start: Failed to
+        # add lan txq ») car libmtl accrochait TOUTES ses files-feuilles sous UN SEUL nœud QG
+        # (fan-out 8) → on bornait tx_queues ≤ 7. Le patch libmtl `patch_tm_hierarchy.py` (0.39.6)
+        # RAMIFIE l'arbre TM (P nœuds QG, chacun ≤8 feuilles) → nb_qps = P×8 jusqu'à
+        # MT_MAX_RL_ITEMS=128 → le mur des 8 est LEVÉ (>8 senders RL/port ET création en rafale).
+        # Le cap ne concerne QUE le mécanisme RL (arbre TM) : tsc/tsc_narrow ne construisent AUCUNE
+        # hiérarchie → JAMAIS bornés. On re-gate donc sur le pacing (narrow-wins : "rl"/"auto" =
+        # RL device-wide sur E810 dpdk ; "tsc"/"tsc_narrow"/"tsn" = pas de cap). Nouveau plafond =
+        # capacité réelle du patch mesurée au banc (dl360-1 2026-07-07, cf. DPDK_NARROW.md), + la
+        # file de contrôle (nb_tx_q = tx_queues+1). Sans objet en AF_XDP (budget 48 files).
+        _pacing = (os.environ.get("MTL_PACING") or "auto").strip().lower()
+        _rl_active = _pacing in ("rl", "auto")   # auto → RL sur port E810 dpdk (TM supporté)
+        if _HAS_DPDK and _port_pmd(nic) == "dpdk" and _rl_active:
+            tq = min(tq, RL_TX_QUEUES_CAP)
         _pe = {"iface": nic, "sip": SIPS[i] if i < len(SIPS) else "",
                "rx_queues": max(1, rq), "tx_queues": max(1, tq)}
         # PMD par port (chantier DPDK) : clés émises SEULEMENT si ≥1 port dpdk sur le nœud →
