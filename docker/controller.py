@@ -2180,6 +2180,16 @@ def _write_config(sessions):
         mg_tx = hr_tx if _hr else 0
         rq = max(d_rx, fl_rx) + mg_rx
         tq = max(d_tx, fl_tx) + mg_tx
+        # Plafond RL/E810 (chantier DPDK, mesuré dl360-1 2026-07-07) : le shaper RL (rte_tm) du
+        # PMD ice refuse de committer la hiérarchie au-delà de nb_tx_q=8 (« ice_tx_queue_start:
+        # Failed to add lan txq ») → mtl_init retombe en pacing tsc (perd le narrow) ET laisse le
+        # port STOPPÉ, ce qui fait échouer en cascade le join IGMP (send report fail -5 → RX no
+        # attach). MTL ajoute 1 file de contrôle (nb_tx_q = tx_queues+1) → on borne tx_queues ≤ 7
+        # sur un port dpdk. audio/ANC = shared_queue (1 file partagée), seule la vidéo prend une
+        # file RL dédiée → 6 senders vidéo tiennent. Contrainte assumée : ACTIVE_TX_COUNT ≤ 7 par
+        # port dpdk (au-delà, splitter sur 2 ports). Sans objet en AF_XDP (budget 48 files).
+        if _HAS_DPDK and _port_pmd(nic) == "dpdk":
+            tq = min(tq, 7)
         _pe = {"iface": nic, "sip": SIPS[i] if i < len(SIPS) else "",
                "rx_queues": max(1, rq), "tx_queues": max(1, tq)}
         # PMD par port (chantier DPDK) : clés émises SEULEMENT si ≥1 port dpdk sur le nœud →
