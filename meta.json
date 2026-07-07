@@ -1,7 +1,12 @@
 {
-  "version": "0.39.8",
+  "version": "0.39.9",
   "date": "2026-07-07",
   "changes": {
+    "Paliers CONTENU #25 : gamut/niveaux illégaux (vidéo) + loudness R128 momentané (audio) sur :8080 (REBUILD image requis, 0.39.9)": [
+      "Vidéo : _sig_video_probe lit désormais les plans Cb/Cr (4:2:2) en plus de Y, matrice BT.709 → % pixels hors-gamut RGB legal (couvre aussi super-noir/super-blanc). Champs :8080 signal.gamut (bool soutenu SIGNAL_HOLD_S) + signal.gamut_pct. Coût borné (mêmes SIGNAL_ROWS lignes que noir/gel).",
+      "Audio : loudness momentané EBU R128 (BS.1770 K-weighting) calculé via FFT (|H_K(f)|² sur la DSP, numpy seul, pas de scipy) sur une fenêtre 400 ms L/R. Champs :8080 signal.lufs + signal.loud (bool hors cible -23 LUFS ±2 LU). La même fenêtre sert au pic de silence.",
+      "Sondes refactorées pour renvoyer un dict extensible (au lieu d'un tuple/bool). Orchestrateur (metrics.py _SIGNAL_LABELS) alerte à transition sur gamut/loud par parité avec noir/gel/silence (rétro-compat : n'alerte que si le champ est présent). Réglages SIGNAL_GAMUT_PCT/_TOL, SIGNAL_LOUD_MS/_TARGET/_TOL."
+    ],
     "Classe 2110-21 PAR SESSION TX (#26) : ops.transport_pacing dérivé du profil d'émetteur PAR PORT (narrow/narrow_linear/wide) → narrow sur un port, wide sur un autre, simultanément (REBUILD image requis, 0.39.8)": [
       "Jusqu'ici seul le MÉCANISME device (mtl_init_params.pacing = RL/TSC, narrow-wins) était piloté (MTL_PACING). La CLASSE 2110-21 (cible VRX : ST21_PACING_NARROW/LINEAR/WIDE) est un paramètre PAR SESSION libmtl (st20p_tx_ops.transport_pacing) → désormais posé par session TX vidéo selon le profil de la NIC de sortie. Sous mécanisme RL, chaque port honore sa classe indépendamment.",
       "Moteur (mtl_rx.c) : struct mtl_port_ent porte `profile` (enum st21_pacing, défaut NARROW=memset) ; parse_profile() mappe la chaîne config ; resolve_profile(iface) résout la classe de la session depuis sa NIC ; ports[].profile lu au parsing config (+ repli scalaire `profile`) ; setup_video_tx pose ops.transport_pacing = resolve_profile(s->iface).",

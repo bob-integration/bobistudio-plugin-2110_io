@@ -780,6 +780,12 @@ SIGNAL_BLACK_Y    = int(os.environ.get("SIGNAL_BLACK_Y") or 0)        # 0 = auto
 SIGNAL_SILENCE_DB = float(os.environ.get("SIGNAL_SILENCE_DB") or -60.0)
 SIGNAL_SILENCE_S  = float(os.environ.get("SIGNAL_SILENCE_S") or 10.0)
 SIGNAL_ROWS       = 16                                                 # lignes Y échantillonnées
+# Paliers CONTENU supplémentaires (#25) — gamut/niveaux illégaux (vidéo) + loudness R128 (audio).
+SIGNAL_GAMUT_PCT  = float(os.environ.get("SIGNAL_GAMUT_PCT") or 2.0)   # % pixels hors-gamut avant flag
+SIGNAL_GAMUT_TOL  = float(os.environ.get("SIGNAL_GAMUT_TOL") or 0.02)  # tolérance RGB (fraction de plage)
+SIGNAL_LOUD_MS    = float(os.environ.get("SIGNAL_LOUD_MS") or 400.0)   # fenêtre loudness momentané (R128 « M »)
+SIGNAL_LOUD_TARGET= float(os.environ.get("SIGNAL_LOUD_TARGET") or -23.0)  # cible EBU R128 (LUFS)
+SIGNAL_LOUD_TOL   = float(os.environ.get("SIGNAL_LOUD_TOL") or 2.0)    # ± LU avant flag « hors cible »
 
 _signal_rx = {}      # idx slot RX → {"black","frozen"[,"silence"]} — lu par MetricsHandler
 _signal_tx = {}      # idx slot TX → {"black","frozen"} (contenu du shm d'entrée câblé)
@@ -797,8 +803,75 @@ def _sig_close(st):
         st[k] = None
 
 
+def _gamut_illegal_pct(y, u, v, bd):
+    """Fraction (%) de pixels hors-gamut RGB legal sur des lignes Y/Cb/Cr échantillonnées (10-bit
+    limited, matrice BT.709 HD). Couvre AUSSI les niveaux illégaux (super-noir/super-blanc → RGB<0
+    ou >1). `u`/`v` = plans chroma 4:2:2 (demi-largeur) suréchantillonnés ×2 pour matcher Y. Coût
+    borné : mêmes SIGNAL_ROWS lignes que noir/gel. Retourne un float (0..100)."""
+    s = float((235 - 16) << (bd - 8))                      # plage luma legal (876 en 10-bit)
+    cmid = float(128 << (bd - 8))                          # milieu chroma (512 en 10-bit)
+    crange = float((240 - 16) << (bd - 8))                 # plage chroma pleine (896 en 10-bit)
+    yb = float(16 << (bd - 8))                             # noir legal (64 en 10-bit)
+    yn = (y.astype(np.float32) - yb) / s
+    cb = (u.astype(np.float32) - cmid) / crange
+    cr = (v.astype(np.float32) - cmid) / crange
+    r = yn + 1.5748 * cr
+    g = yn - 0.1873 * cb - 0.4681 * cr
+    b = yn + 1.8556 * cb
+    tol = SIGNAL_GAMUT_TOL
+    bad = ((r < -tol) | (r > 1 + tol) | (g < -tol) | (g > 1 + tol) |
+           (b < -tol) | (b > 1 + tol))
+    return 100.0 * float(bad.mean()) if bad.size else 0.0
+
+
+# ─── Loudness R128 (BS.1770 K-weighting) via FFT ───────────────────────────────────────
+# numpy seul (pas de scipy) : on n'a pas besoin du signal filtré, seulement de son mean-square
+# (l'énergie), donc on applique |H_K(f)|² à la DSP et on somme (Parseval). Exact à l'énergie près
+# des effets de bord (négligeables sur une fenêtre 400 ms). Coefficients 48 kHz (audio site fixe).
+_KW_CACHE = {}
+
+def _kweight_pw(n):
+    """Poids spectraux |H_K(f)|² × facteur one-sided pour une rfft de taille `n` @48 kHz (caché)."""
+    pw = _KW_CACHE.get(n)
+    if pw is not None:
+        return pw
+    f = np.fft.rfftfreq(n, 1.0 / 48000.0)
+    w = 2.0 * np.pi * f / 48000.0
+    z1 = np.exp(-1j * w); z2 = z1 * z1
+    # Étage 1 : shelving haute fréquence (pré-filtre tête) — coeffs BS.1770 @48 kHz.
+    h1 = (1.53512485958697 - 2.69169618940638 * z1 + 1.19839281085285 * z2) / \
+         (1.0 - 1.69065929318241 * z1 + 0.73248077421585 * z2)
+    # Étage 2 : passe-haut RLB.
+    h2 = (1.0 - 2.0 * z1 + 1.0 * z2) / (1.0 - 1.99004745483398 * z1 + 0.99007225036621 * z2)
+    mag2 = np.abs(h1 * h2) ** 2
+    one = np.full(mag2.shape, 2.0)                 # bins repliés comptés ×2…
+    one[0] = 1.0
+    if n % 2 == 0:
+        one[-1] = 1.0                              # …sauf DC et Nyquist
+    pw = mag2 * one
+    _KW_CACHE[n] = pw
+    return pw
+
+def _loudness_lufs(block):
+    """Loudness momentané R128 (LUFS) d'un bloc audio (n, channels) float32, canaux L/R (poids 1).
+    Retourne un float (LUFS) ou None si bloc trop court."""
+    n = block.shape[0]
+    if n < 1024:
+        return None
+    pw = _kweight_pw(n)
+    z = 0.0
+    for ch in range(min(2, block.shape[1])):       # programme stéréo L/R (poids 1.0 chacun)
+        x = np.ascontiguousarray(block[:, ch])
+        X = np.fft.rfft(x)
+        z += float(np.sum((np.abs(X) ** 2) * pw)) / (float(n) * float(n))  # mean-square K-pondéré
+    if z <= 1e-12:
+        return -70.0                               # plancher de gate absolu R128
+    return -0.691 + 10.0 * float(np.log10(z))
+
+
 def _sig_video_probe(st, name, now):
-    """Sonde noir/gel du flux MXL vidéo `name` → (black, frozen) ou None si illisible OU si
+    """Sonde noir/gel/gamut du flux MXL vidéo `name` → dict {black,frozen,gamut,gamut_pct} ou None
+    si illisible OU si
     aucun grain neuf depuis le dernier passage (transport figé = déjà couvert par rx/tx_stalled,
     on ne double pas l'alarme). Reader rouvert sur exception (flux recréé par le producteur —
     motif multiview) ; garbage_collect pour se rattacher à la génération vivante."""
@@ -825,10 +898,30 @@ def _sig_video_probe(st, name, now):
         st["fmt"] = fmt
         w, h, bd = int(fmt["width"]), int(fmt["height"]), int(fmt.get("bit_depth") or 8)
         dt = np.uint16 if bd > 8 else np.uint8
+        step = max(1, h // SIGNAL_ROWS)
         y = np.frombuffer(view, dtype=dt, count=w * h).reshape(h, w)
-        rows = np.ascontiguousarray(y[::max(1, h // SIGNAL_ROWS)])
+        rows = np.ascontiguousarray(y[::step])
         mean = float(rows.mean())
         crc = zlib.crc32(rows.tobytes())
+        # Gamut / niveaux illégaux (#25) : lire les MÊMES lignes des plans Cb/Cr (4:2:2, demi-
+        # largeur, hy=1), suréchantillonner ×hx pour matcher Y, matricer BT.709 → % hors-gamut RGB.
+        # Isolé dans son propre try : un plan chroma illisible ne doit pas fermer le reader vidéo.
+        gam_pct = None
+        try:
+            hx, hy = _CHROMA.get(str(fmt.get("chroma") or "422"), (2, 1))
+            cw, ch_ = w // hx, h // hy
+            it = np.dtype(dt).itemsize
+            u = np.frombuffer(view, dtype=dt, count=cw * ch_, offset=w * h * it).reshape(ch_, cw)
+            v = np.frombuffer(view, dtype=dt, count=cw * ch_,
+                              offset=(w * h + cw * ch_) * it).reshape(ch_, cw)
+            yr = rows                                              # lignes Y (h/step, w)
+            cstep = max(1, ch_ // SIGNAL_ROWS)
+            ur = np.repeat(u[::cstep], hx, axis=1)[:, :w]          # chroma suréchantillonné → largeur w
+            vr = np.repeat(v[::cstep], hx, axis=1)[:, :w]
+            n = min(yr.shape[0], ur.shape[0], vr.shape[0])
+            gam_pct = _gamut_illegal_pct(yr[:n], ur[:n], vr[:n], bd)
+        except Exception:
+            gam_pct = None
         thr = SIGNAL_BLACK_Y or ((16 + 6) << (bd - 8))    # noir nominal 16 (8 bits) + marge
         if mean < thr:
             st.setdefault("black_since", now)
@@ -843,8 +936,16 @@ def _sig_video_probe(st, name, now):
         else:
             st.pop("frozen_since", None)
         st["crcs"] = (crcs + [crc])[-2:]
-        return (("black_since" in st and now - st["black_since"] >= SIGNAL_HOLD_S),
-                ("frozen_since" in st and now - st["frozen_since"] >= SIGNAL_HOLD_S))
+        if gam_pct is not None and gam_pct >= SIGNAL_GAMUT_PCT:
+            st.setdefault("gamut_since", now)
+        else:
+            st.pop("gamut_since", None)
+        res = {"black":  ("black_since" in st and now - st["black_since"] >= SIGNAL_HOLD_S),
+               "frozen": ("frozen_since" in st and now - st["frozen_since"] >= SIGNAL_HOLD_S)}
+        if gam_pct is not None:
+            res["gamut"] = ("gamut_since" in st and now - st["gamut_since"] >= SIGNAL_HOLD_S)
+            res["gamut_pct"] = round(gam_pct, 2)
+        return res
     except Exception:
         _sig_close(st)
         try:
@@ -870,7 +971,8 @@ def _sig_audio_probe(st, name, now):
         if prev is None or head < 0 or head == prev:
             st.pop("sil_since", None)
             return None
-        r = ar.read_latest(48)          # dernier bloc (≤ 1 ms @48 kHz), float32 [-1,1]
+        nwin = max(48, int(SIGNAL_LOUD_MS / 1000.0 * 48000.0))   # fenêtre R128 « M » (400 ms) — sert
+        r = ar.read_latest(nwin)                                 # aussi au pic (silence), float32 [-1,1]
         if r is None or not r.size:
             return None
         peak_db = 20.0 * float(np.log10(max(float(np.max(np.abs(r))), 1e-6)))
@@ -878,7 +980,15 @@ def _sig_audio_probe(st, name, now):
             st.setdefault("sil_since", now)
         else:
             st.pop("sil_since", None)
-        return "sil_since" in st and now - st["sil_since"] >= SIGNAL_SILENCE_S
+        silence = "sil_since" in st and now - st["sil_since"] >= SIGNAL_SILENCE_S
+        out = {"silence": silence}
+        if r.ndim == 2:                                          # loudness momentané (#25) sur L/R
+            lufs = _loudness_lufs(r)
+            if lufs is not None:
+                out["lufs"] = round(lufs, 1)
+                # « hors cible » seulement sur de l'audio présent (le silence est déjà flaggé).
+                out["loud"] = (not silence) and abs(lufs - SIGNAL_LOUD_TARGET) > SIGNAL_LOUD_TOL
+        return out
     except Exception:
         _sig_close(st)
         try:
@@ -926,9 +1036,9 @@ def _signal_loop():
                     sres = _sig_audio_probe(st, "{}_audio_{}".format(HOSTNAME, idx), now)
                 sig = {}
                 if vres is not None:
-                    sig["black"], sig["frozen"] = vres
+                    sig.update(vres)          # black/frozen/gamut/gamut_pct
                 if sres is not None:
-                    sig["silence"] = sres
+                    sig.update(sres)          # silence/lufs/loud
                 with _sig_lock:
                     if sig:
                         _signal_rx[idx] = sig
@@ -953,7 +1063,7 @@ def _signal_loop():
                 vres = _sig_video_probe(st, name, now)
                 with _sig_lock:
                     if vres is not None:
-                        _signal_tx[i] = {"black": vres[0], "frozen": vres[1]}
+                        _signal_tx[i] = dict(vres)     # black/frozen/gamut(+pct)
                     else:
                         _signal_tx.pop(i, None)
         except Exception as e:
