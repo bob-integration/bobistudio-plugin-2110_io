@@ -1635,6 +1635,16 @@ int main(int argc, char** argv) {
      * récepteur). quota_mbs (Mb/s) borne chaque scheduler (~2×1080p50 à 5000) → éclatement initial
      * sur les lcores fournis ; les flags MIGRATE rééquilibrent à chaud un sch détecté trop busy. */
     p.flags |= MTL_FLAG_TX_VIDEO_MIGRATE | MTL_FLAG_RX_VIDEO_MIGRATE;
+    /* PMD DPDK/ice sur PF média : filet optionnel pour le multicast. En AF-XDP le noyau programme
+     * le filtre MAC mcast du groupe rejoint ; en DPDK user c'est libmtl (mt_mcast:
+     * rte_eth_dev_mac_addr_add) qui l'ajoute. Si un déploiement observe rx_packets=0 AU NIVEAU PORT
+     * malgré steering+join OK, activer MTL_FLAG_NIC_RX_PROMISCUOUS (env NIC_PROMISCUOUS=1) laisse
+     * passer tout le trafic sur le port média dédié. Défaut OFF : sur ice le mac_addr_add suffit
+     * dès que la SOURCE IGMP (sip du port) est correcte (cf. dl360-1 2026-07-07 : rx=0 était dû au
+     * sip erroné, pas au filtre MAC). Sans objet en AF-XDP (jamais de port dpdk). */
+    if (getenv("NIC_PROMISCUOUS") && atoi(getenv("NIC_PROMISCUOUS")))
+      for (int k = 0; k < g_nports; k++)
+        if (!strcmp(g_ports[k].pmd, "dpdk")) { p.flags |= MTL_FLAG_NIC_RX_PROMISCUOUS; break; }
     p.data_quota_mbs_per_sch = quota_mbs > 0 ? (uint32_t)quota_mbs : 0;
     /* Pacing TX ST 2110-21 (mtl_init_params.pacing, niveau DEVICE — enum st21_tx_pacing_way,
      * cf. mtl_api.h) : "rl" = rate-limit MATÉRIEL (prérequis profil narrow, PMD DPDK/ice
