@@ -327,6 +327,12 @@ _bdfs_env = [s.strip() for s in (os.environ.get("PORT_BDFS") or "").split(",")]
 PORT_PMDS = [(_pmds_env[_i] if _i < len(_pmds_env) and _pmds_env[_i] else "af_xdp")
              for _i in range(len(IFACES))]
 PORT_BDFS = [(_bdfs_env[_i] if _i < len(_bdfs_env) else "") for _i in range(len(IFACES))]
+# CLASSE 2110-21 PAR PORT (#26) : `PORT_PROFILES` = CSV aligné sur IFACES (narrow|narrow_linear|
+# wide), émis par l'orchestrateur avec les autres clés dpdk. Absent/vide → narrow (défaut strict) →
+# ops.transport_pacing=NARROW côté moteur = comportement historique (memset).
+_profs_env = [s.strip().lower() for s in (os.environ.get("PORT_PROFILES") or "").split(",")]
+PORT_PROFILES = [((_profs_env[_i] if _i < len(_profs_env) and _profs_env[_i] in
+                   ("narrow", "narrow_linear", "wide") else "narrow")) for _i in range(len(IFACES))]
 _HAS_DPDK = any(p == "dpdk" for p in PORT_PMDS)
 
 def _port_pmd(ifn):
@@ -336,6 +342,10 @@ def _port_pmd(ifn):
 def _port_bdf(ifn):
     """BDF PCI du port `ifn` ('' si af_xdp / inconnu)."""
     return PORT_BDFS[IFACES.index(ifn)] if ifn in IFACES else ""
+
+def _port_profile(ifn):
+    """Classe 2110-21 (profil d'émetteur) du port `ifn` : narrow|narrow_linear|wide (défaut narrow)."""
+    return PORT_PROFILES[IFACES.index(ifn)] if ifn in IFACES else "narrow"
 
 # Ports encore sur le chemin kernel/AF-XDP : SEULS concernés par la plomberie kernel (purge XDP,
 # ntuple, restriction RSS PTP, contrôle d'IP). Un port dpdk n'a PLUS d'iface kernel (vfio-pci) —
@@ -2218,6 +2228,7 @@ def _write_config(sessions):
         if _HAS_DPDK:
             _pe["pmd"] = _port_pmd(nic)
             _pe["bdf"] = _port_bdf(nic)
+            _pe["profile"] = _port_profile(nic)   # classe 2110-21 PAR PORT (#26 : ops.transport_pacing)
         ports.append(_pe)
         demand.append({"iface": nic, "rx_queues": d_rx, "tx_queues": d_tx})
     # Totaux (exposés :8080 xdp.allocated + réservation au lancement du daemon).

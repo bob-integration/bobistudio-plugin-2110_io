@@ -110,9 +110,32 @@ static mxlInstance g_mxl = NULL;
 struct mtl_port_ent {
   char iface[64]; char portname[MTL_PORT_MAX_LEN];
   char pmd[16];   /* étiquette PMD du port ("af_xdp"|"dpdk"|"kernel") — publiée dans mtl_ports.json */
+  enum st21_pacing profile;   /* CLASSE 2110-21 PAR PORT (#26) : cible VRX par session TX émise sur ce
+                               * port. NARROW=0 (défaut memset) = comportement historique. C'est la
+                               * manette produit (ops.transport_pacing par session), distincte du
+                               * MÉCANISME device (mtl_init_params.pacing = st21_tx_pacing_way). */
 };
 static struct mtl_port_ent g_ports[MTL_PORT_MAX];
 static int g_nports = 0;
+
+/* Classe 2110-21 (profil d'émetteur) : chaîne config → enum st21_pacing. Défaut/inconnu = NARROW
+ * (le plus strict, cf. DPDK_NARROW.md : une iface non configurée compte comme narrow). */
+static enum st21_pacing parse_profile(const char* s) {
+  if (!s || !s[0]) return ST21_PACING_NARROW;
+  if (!strcmp(s, "wide"))                                   return ST21_PACING_WIDE;
+  if (!strcmp(s, "narrow_linear") || !strcmp(s, "linear"))  return ST21_PACING_LINEAR;
+  return ST21_PACING_NARROW;   /* "narrow" + repli */
+}
+
+/* Résout la CLASSE 2110-21 (ops.transport_pacing) de la session depuis sa NIC de sortie. iface vide
+ * → port 0 (mono-NIC). iface inconnue → NARROW (le plus strict, jamais wide par accident). */
+static enum st21_pacing resolve_profile(const char* iface) {
+  if (g_nports <= 0) return ST21_PACING_NARROW;
+  if (!iface || !iface[0]) return g_ports[0].profile;
+  for (int k = 0; k < g_nports; k++)
+    if (!strcmp(g_ports[k].iface, iface)) return g_ports[k].profile;
+  return ST21_PACING_NARROW;
+}
 
 /* Nom de port MTL selon le PMD : native_af_xdp:<if> / kernel:<if> / <if> (PCI/dpdk). */
 static void build_portname(const char* pmd, const char* iface, char out[MTL_PORT_MAX_LEN]) {
@@ -975,6 +998,12 @@ static int setup_video_tx(struct sess* s) {
   ops.device = ST_PLUGIN_DEVICE_AUTO;
   ops.framebuff_cnt = 3;
   ops.flags = ST20P_TX_FLAG_BLOCK_GET;             /* get_frame bloque → pacing à fps */
+  /* CLASSE 2110-21 PAR SESSION (#26) : cible VRX (narrow/NL/wide) selon le profil de la NIC de
+   * sortie (node_interfaces.output_profile → ports[].profile). NARROW par défaut (memset l'a déjà
+   * posé, resolve_profile le confirme). Sous mécanisme RL device, chaque session honore SA classe →
+   * narrow sur un port, wide sur un autre, simultanément. Sous TSC, la classe oriente la cible du
+   * pacer logiciel. Le leg redondant (2022-7) suit la même classe (attribut de session). */
+  ops.transport_pacing = resolve_profile(s->iface);
 
   s->vth = st20p_tx_create(s->st, &ops);
   if (!s->vth) { fprintf(stderr, "mtl_rx: st20p_tx_create fail (video %s:%d)\n", s->mcast, s->udp_port); return -1; }
@@ -1643,6 +1672,7 @@ int main(int argc, char** argv) {
     snprintf(sip,sizeof(sip),"%s",jstr(root,"sip",""));
     snprintf(lcores,sizeof(lcores),"%s",jstr(root,"lcores",""));
     char pacing[16]; snprintf(pacing,sizeof(pacing),"%s",jstr(root,"pacing","auto"));
+    char profile[16]; snprintf(profile,sizeof(profile),"%s",jstr(root,"profile",""));  /* classe scalaire (#26, repli mono-NIC) */
     int rx_q = jint(root,"rx_queues", 8);   /* plafond de sessions RX (= rx_count du moteur) */
     int tx_q = jint(root,"tx_queues", 1);   /* TX : Phase 2 (1 = file de contrôle IGMP/ARP) */
     int quota_mbs = jint(root,"quota_mbs", 5000);   /* Mb/s max par scheduler (lcore), cf. mtl_init */
@@ -1672,6 +1702,9 @@ int main(int argc, char** argv) {
         else
           build_portname(ppmd, pif, g_ports[idx].portname);
         snprintf(g_ports[idx].pmd, sizeof(g_ports[idx].pmd), "%s", ppmd);
+        /* CLASSE 2110-21 PAR PORT (#26) : profil d'émetteur (narrow/narrow_linear/wide) → cible VRX
+         * des sessions TX de ce port. Absent → NARROW (défaut strict). */
+        g_ports[idx].profile = parse_profile(jstr(pj, "profile", ""));
         snprintf(p.port[idx], MTL_PORT_MAX_LEN, "%s", g_ports[idx].portname);
         const char* psip = jstr(pj,"sip","");
         if (psip[0]) inet_pton(AF_INET, psip, p.sip_addr[idx]);
@@ -1685,6 +1718,7 @@ int main(int argc, char** argv) {
       snprintf(g_ports[idx].iface, sizeof(g_ports[idx].iface), "%s", iface);
       build_portname(pmd, iface, g_ports[idx].portname);
       snprintf(g_ports[idx].pmd, sizeof(g_ports[idx].pmd), "%s", pmd);
+      g_ports[idx].profile = parse_profile(profile);   /* repli scalaire (#26, mono-NIC) */
       snprintf(p.port[idx], MTL_PORT_MAX_LEN, "%s", g_ports[idx].portname);
       if (sip[0]) inet_pton(AF_INET, sip, p.sip_addr[idx]);
       p.pmd[idx] = mtl_pmd_by_port_name(g_ports[idx].portname);
