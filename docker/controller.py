@@ -33,6 +33,15 @@ except Exception as _mxl_err:
     _HAS_MXL = False
     print("controller: bobimxl indisponible:", _mxl_err, flush=True)
 
+# Base des ports du contrôleur (--network host) : :BASE métriques (get_metrics), :BASE+1 contrat
+# agent (/nmos/subscribe, /status), :BASE+2 contrôle à chaud (/gen, /input…). Défaut 8080 → moteur
+# mono-nœud STRICTEMENT inchangé. Une SONDE (probe_2110) déployée sur le MÊME nœud qu'un moteur (banc
+# loopback : générateur port A + sonde port B) reçoit un offset (docker_driver -e CONTROLLER_PORT_BASE)
+# pour ne pas entrer en conflit de ports avec le moteur (les 3 :808x sont en dur sinon).
+PORT_BASE     = int(os.environ.get("CONTROLLER_PORT_BASE") or 8080)
+PORT_METRICS  = PORT_BASE       # rapport / métriques (contrat get_metrics)
+PORT_AGENT    = PORT_BASE + 1   # contrat agent : /nmos/subscribe (SDP IS-05), /status, /tx, /pin
+PORT_CONTROL  = PORT_BASE + 2   # contrôle à chaud : /gen, /ident, /input, /state…
 HOSTNAME   = os.environ.get("HOSTNAME_RX") or os.environ.get("HOSTNAME") or "mtlrx"
 N_VIDEO    = int(os.environ.get("RX_COUNT") or os.environ.get("VIDEO_COUNT") or 1)   # slots RX vidéo
 N_TX       = int(os.environ.get("TX_COUNT") or 0)                                     # slots TX (senders)
@@ -1453,20 +1462,20 @@ def _agent_tls_context():
 
 def _serve_agent():
     ctx, mode = _agent_tls_context()
-    srv = HTTPServer(("0.0.0.0", 8081), AgentHandler)
+    srv = HTTPServer(("0.0.0.0", PORT_AGENT), AgentHandler)
     if ctx is not None:
         try:
             srv.socket = ctx.wrap_socket(srv.socket, server_side=True)
         except Exception as e:
-            print(f"[8081] wrap TLS échoué ({e}) → repli HTTP clair", flush=True)
+            print(f"[{PORT_AGENT}] wrap TLS échoué ({e}) → repli HTTP clair", flush=True)
             mode = "HTTP clair (repli après échec wrap)"
-    print(f"[8081] contrat agent servi en {mode}", flush=True)
+    print(f"[{PORT_AGENT}] contrat agent servi en {mode}", flush=True)
     srv.serve_forever()
 
-threading.Thread(target=lambda: HTTPServer(("0.0.0.0", 8080), MetricsHandler).serve_forever(),
+threading.Thread(target=lambda: HTTPServer(("0.0.0.0", PORT_METRICS), MetricsHandler).serve_forever(),
                  daemon=True).start()
 threading.Thread(target=_serve_agent, daemon=True).start()
-threading.Thread(target=lambda: HTTPServer(("0.0.0.0", 8082), ControlHandler).serve_forever(),
+threading.Thread(target=lambda: HTTPServer(("0.0.0.0", PORT_CONTROL), ControlHandler).serve_forever(),
                  daemon=True).start()
 
 
@@ -2666,6 +2675,19 @@ def _simu_loop(idx):
                             metrics[idx]["frame_index"] = int(d.get("frame_index", 0))
                             # Latence de réception (segment A = capture média → écriture shm), en ms.
                             metrics[idx]["rx_latency_ms"] = d.get("rx_latency_ms")
+                            # SONDE 2110-21 : surfacer le verdict du timing parser (mtl_v{idx}.json)
+                            # sur :8080 — c'est ce que la page /probe (static/probe.js) lit à plat par
+                            # receiver. Ces clés N'EXISTENT que si TIMING_PARSER=1 (mtl_rx les écrit) :
+                            # un moteur 2110_io normal (parser off) ne les a pas → receiver inchangé.
+                            # Verdict `compliant` ABSOLU fiable seulement avec PTP ; sans grandmaster,
+                            # lire Cinst + vrx_span (invariants à la dérive, cf. PROBE_2110.md).
+                            for _tk in ("compliant", "failed_cause", "cinst_max", "cinst_avg",
+                                        "vrx_max", "vrx_min", "vrx_avg", "vrx_span",
+                                        "fpt", "latency", "late"):
+                                if _tk in d:
+                                    metrics[idx][_tk] = d[_tk]
+                                else:
+                                    metrics[idx].pop(_tk, None)
             else:
                 # Non abonné ET générateur off (ou MXL indispo) → rien généré (cf. symétrie audio).
                 with metrics_lock:
