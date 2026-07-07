@@ -1,5 +1,5 @@
 {
-  "version": "0.39.2",
+  "version": "0.39.3",
   "date": "2026-07-06",
   "changes": {
     "TX 2022-7 vraiment hitless : un lien mort ne coupe plus RIEN (REBUILD image requis, 0.38.0)": [

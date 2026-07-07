@@ -1650,9 +1650,10 @@ int main(int argc, char** argv) {
      * cf. mtl_api.h) : "rl" = rate-limit MATÉRIEL (prérequis profil narrow, PMD DPDK/ice
      * uniquement) ; "tsc" = logiciel (chemin actuel AF-XDP) ; "auto" (défaut) = libmtl choisit
      * (memset a déjà posé ST21_TX_PACING_WAY_AUTO=0 → clé absente = comportement inchangé). */
-    if      (!strcmp(pacing, "rl"))  p.pacing = ST21_TX_PACING_WAY_RL;
-    else if (!strcmp(pacing, "tsc")) p.pacing = ST21_TX_PACING_WAY_TSC;
-    else                             p.pacing = ST21_TX_PACING_WAY_AUTO;
+    if      (!strcmp(pacing, "rl"))         p.pacing = ST21_TX_PACING_WAY_RL;
+    else if (!strcmp(pacing, "tsc_narrow")) p.pacing = ST21_TX_PACING_WAY_TSC_NARROW;
+    else if (!strcmp(pacing, "tsc"))        p.pacing = ST21_TX_PACING_WAY_TSC;
+    else                                    p.pacing = ST21_TX_PACING_WAY_AUTO;
     p.log_level = MTL_LOG_LEVEL_INFO;
     p.lcores = lcores[0] ? lcores : NULL;
 
