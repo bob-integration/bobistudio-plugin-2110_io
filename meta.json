@@ -1,7 +1,11 @@
 {
-  "version": "0.39.3",
-  "date": "2026-07-06",
+  "version": "0.39.4",
+  "date": "2026-07-07",
   "changes": {
+    "Sonde de conformité ST 2110-21 embarquée (env TIMING_PARSER=1, défaut OFF ; REBUILD image requis, 0.39.4)": [
+      "Capacité analyseur greffée dans le moteur RX, gardée STRICTEMENT par l'env TIMING_PARSER=1 (défaut OFF → comportement de prod inchangé, aucun flag posé). À l'init device : MTL_FLAG_ENABLE_HW_TIMESTAMP (timestamp HW du mbuf, prérequis d'une mesure d'arrivée fiable → PMD DPDK/vfio). Sur chaque session RX vidéo st20p : ST20P_RX_FLAG_TIMING_PARSER_META. À chaque trame reçue, lecture de st_frame_tp_meta(frame, port) (parser libmtl st_rx_timing_parser.c : Cinst/VRX/FPT/latency par trame + verdict FAILED|WIDE|NARROW selon le gabarit -21 du format). Accumulation lockless sur la fenêtre de stats (même modèle que rx_latency).",
+      "Exposé sur le stats-file :8080 de chaque cible RX vidéo : compliant (narrow|wide|failed), failed_cause, cinst_max/cinst_avg, vrx_max/vrx_avg, fpt, latency. Le verdict de fenêtre = le PIRE observé (failed<wide<narrow). Instrument du banc de conformité narrow (DPDK_NARROW.md verrou n°1 / PROBE_2110.md) : mesure si le pacing RL/tsc_narrow produit vraiment du narrow, sans scope matériel."
+    ],
     "TX 2022-7 vraiment hitless : un lien mort ne coupe plus RIEN (REBUILD image requis, 0.38.0)": [
       "Patch libmtl (patch_afxdp_tx_link_drop.py, appliqué au build comme le patch st40) : un port AF_XDP dont le LIEN est mort jette ses paquets comme s'ils étaient émis (carrier lu en cache 100 ms dans le chemin TX). La session 2022-7 reste DUALE en permanence : le leg vivant continue à cadence nominale SANS AUCUNE interruption, et le leg mort réémet tout seul au retour du lien. Auparavant, émettre vers un lien mort figeait le ring XSK (tx prod full) → st20_tx_queue_fatal_error irrécupérable en AF_XDP, puis la récupération interne de libmtl fuyait des memzones DPDK jusqu'au plafond (2560) : TOUT le TX mourait définitivement, même après rebranchement (banc 2026-07-06 — les mbufs d'une trame étant partagés entre les deux legs, le leg sain se figeait aussi).",
       "Backstop anti-wedge dans mtl_rx : une session TX démarrée qui ne sort plus aucune frame pendant 5 s (queue XDP morte, quelle qu'en soit la cause) déclenche une sortie immédiate du daemon — le contrôleur le relance (purge XDP/ntuple + backoff, chemin crash existant) et le process neuf repart avec des memzones vierges. Les changements de lien sont journalisés (« lien ensX → DOWN »)."

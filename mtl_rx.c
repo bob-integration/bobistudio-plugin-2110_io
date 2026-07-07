@@ -275,6 +275,23 @@ struct sess {
   st40p_rx_handle d_rx;    /* RX */
   st40p_tx_handle d_tx;    /* TX */
   uint32_t max_udw;        /* taille du buffer UDW (octets) */
+  /* ── Timing parser 2110-21 (RX vidéo, TIMING_PARSER=1 uniquement) ── conformité par session.
+   * Le parser libmtl (st_rx_timing_parser.c) calcule Cinst/VRX/FPT/latency par TRAME et rend un
+   * verdict FAILED|WIDE|NARROW + failed_cause. On accumule sur la fenêtre de write_stats (lockless,
+   * même modèle que lat_sum/lat_cnt : accum côté video_rx_thread, lecture+reset côté write_stats).
+   * Le verdict de fenêtre = le PIRE (enum min : failed<wide<narrow). Sans HW timestamp le parser
+   * n'a pas de mesure fiable → capacité gardée strictement par tp_enabled (getenv TIMING_PARSER). */
+  int      tp_enabled;         /* 1 = session RX vidéo avec parser actif (flag posé au create) */
+  int      tp_worst;           /* pire verdict de la fenêtre (enum st_rx_tp_compliant) ; -1 = aucun échantillon */
+  char     tp_cause[64];       /* failed_cause du pire verdict (vide si narrow) */
+  int32_t  tp_cinst_max, tp_vrx_max, tp_vrx_min; /* extrêmes de la fenêtre */
+  int32_t  tp_vrx_span_max;    /* pire amplitude INTRA-trame (vrx_max-vrx_min d'UNE trame) sur la fenêtre.
+                                * Invariante au décalage/dérive d'horloge RX↔TX (différences intra-trame)
+                                * → discriminant narrow/wide robuste quand la sonde n'est pas PTP-lockée
+                                * sur l'émetteur (ex. banc loopback free-running). */
+  double   tp_cinst_sum, tp_vrx_sum; /* Σ des moyennes/trame (÷ tp_cnt = moyenne de fenêtre) */
+  int32_t  tp_fpt, tp_latency; /* dernières valeurs (ns) de la fenêtre */
+  uint32_t tp_cnt;             /* nb de trames échantillonnées dans la fenêtre */
 };
 
 /* ── flowDef MXL (ressource Flow NMOS IS-04) — mêmes champs/conventions que bobimxl.build_*. ── */
@@ -511,6 +528,35 @@ static inline int field_parity(int second_field, int tff) {
   return (second_field ? 1 : 0) ^ (tff ? 0 : 1);
 }
 
+/* Capacité SONDE (analyseur 2110-21) gardée STRICTEMENT par l'env TIMING_PARSER=1 : défaut OFF →
+ * aucun flag posé, chemin RX inchangé (le HW timestamp du mbuf et le parser ne sont demandés qu'ici).
+ * Prérequis réel : PMD DPDK/vfio (le HW timestamp AF_XDP n'est pas fiable, cf. PROBE_2110.md). */
+static int tp_wanted(void) {
+  const char* e = getenv("TIMING_PARSER");
+  return e && atoi(e);
+}
+
+/* Accumule le tp_meta d'une trame RX vidéo dans la fenêtre de stats de la session (lockless : appelé
+ * seulement depuis video_rx_thread ; write_stats lit+reset). tp = frame->tp[port] (NULL si le parser
+ * n'a pas encore de verdict pour cette trame — début de flux/trame incomplète). */
+static void accum_tp(struct sess* s, const struct st20_rx_tp_meta* tp) {
+  if (!tp) return;
+  int v = (int)tp->compliant;                 /* FAILED=0 < WIDE=1 < NARROW=2 */
+  if (s->tp_worst < 0 || v < s->tp_worst) {   /* garder le PIRE verdict + sa cause */
+    s->tp_worst = v;
+    snprintf(s->tp_cause, sizeof(s->tp_cause), "%s", tp->failed_cause);
+  }
+  if (s->tp_cnt == 0 || tp->cinst_max > s->tp_cinst_max) s->tp_cinst_max = tp->cinst_max;
+  if (s->tp_cnt == 0 || tp->vrx_max   > s->tp_vrx_max)   s->tp_vrx_max   = tp->vrx_max;
+  if (s->tp_cnt == 0 || tp->vrx_min   < s->tp_vrx_min)   s->tp_vrx_min   = tp->vrx_min;
+  int32_t span = tp->vrx_max - tp->vrx_min;               /* amplitude VRX de CETTE trame */
+  if (s->tp_cnt == 0 || span > s->tp_vrx_span_max) s->tp_vrx_span_max = span;
+  s->tp_cinst_sum += tp->cinst_avg;
+  s->tp_vrx_sum   += tp->vrx_avg;
+  s->tp_fpt = tp->fpt; s->tp_latency = tp->latency;   /* dernières valeurs de la fenêtre */
+  s->tp_cnt++;
+}
+
 static void* video_rx_thread(void* arg) {
   struct sess* s = arg;
   uint64_t frame_idx_latch = 0;   /* entrelacé : index TRAME latché sur le 1er champ (→ index champ = ×2+sf) */
@@ -518,6 +564,7 @@ static void* video_rx_thread(void* arg) {
     struct st_frame* frame = st20p_rx_get_frame(s->vh);
     if (!frame) { usleep(1000); continue; }
     if (!frame->addr[0]) { st20p_rx_put_frame(s->vh, frame); continue; }
+    if (s->tp_enabled) accum_tp(s, st_frame_tp_meta(frame, MTL_SESSION_PORT_P));
     /* Timestamp MÉDIA (capture) de la frame, en TAI ns — commun audio/vidéo via PTP (ST 2110-10).
      * st10_get_tai normalise TAI ou media-clk → ns (sampling 90 kHz vidéo). */
     uint64_t mts = media_ts_to_tai(s->st, frame->tfmt, frame->timestamp, MEDIA_CLK_VIDEO);
@@ -682,6 +729,9 @@ static int setup_video(struct sess* s) {
   ops.framebuff_cnt = s->ring;
   ops.notify_frame_available = frame_available;
   /* af_xdp → copy_mode : frames internes MTL, on memcpy (pas d'ext-frame DMA). */
+  /* SONDE 2110-21 (TIMING_PARSER=1) : demande le parser de timing par trame (Cinst/VRX/verdict).
+   * Défaut OFF → flag jamais posé, comportement de prod inchangé. */
+  if (tp_wanted()) { ops.flags |= ST20P_RX_FLAG_TIMING_PARSER_META; s->tp_enabled = 1; s->tp_worst = -1; }
 
   s->vh = st20p_rx_create(s->st, &ops);
   if (!s->vh) { fprintf(stderr, "mtl_rx: st20p_rx_create fail (video %s:%d)\n", s->mcast, s->udp_port); return -1; }
@@ -1449,9 +1499,26 @@ static void reconcile(struct sess* reg, const char* path, mtl_handle st, const c
 
 /* Écrit le fichier de stats {fps, frame_index} de chaque cible vivante. */
 static void write_stats(struct sess* reg, uint64_t last[][MAX_TG], double dt) {
+  static const char* TP_VERDICT[] = {"failed", "wide", "narrow"};
   for (int i = 0; i < MAX_SESS; i++) {
     struct sess* s = &reg[i];
     if (!s->used || !s->started) continue;
+    /* SONDE 2110-21 : fragment conformité (compliant/cause/cinst/vrx/fpt/latency) calculé UNE fois
+     * par session (le tp_meta est une propriété du flux, commun à toutes les cibles fan-out), puis
+     * concaténé à chaque stats-file. Lecture+reset de la fenêtre ici (lockless, cf. accum_tp). */
+    char tpbuf[320]; tpbuf[0] = '\0';
+    if (s->tp_enabled && s->tp_cnt > 0) {
+      int w = s->tp_worst >= 0 && s->tp_worst < 3 ? s->tp_worst : 0;
+      char cbuf[80]; cbuf[0] = '\0';
+      if (w != 2 && s->tp_cause[0]) snprintf(cbuf, sizeof(cbuf), ", \"failed_cause\": \"%s\"", s->tp_cause);
+      snprintf(tpbuf, sizeof(tpbuf),
+               ", \"compliant\": \"%s\"%s, \"cinst_max\": %d, \"cinst_avg\": %.1f, "
+               "\"vrx_max\": %d, \"vrx_min\": %d, \"vrx_avg\": %.1f, \"vrx_span\": %d, "
+               "\"fpt\": %d, \"latency\": %d",
+               TP_VERDICT[w], cbuf, s->tp_cinst_max, s->tp_cinst_sum / s->tp_cnt,
+               s->tp_vrx_max, s->tp_vrx_min, s->tp_vrx_sum / s->tp_cnt, s->tp_vrx_span_max,
+               s->tp_fpt, s->tp_latency);
+    }
     for (int ti = 0; ti < s->ntg; ti++) {
       struct target* t = &s->tg[ti];
       if (!t->stats_path[0]) continue;
@@ -1467,14 +1534,17 @@ static void write_stats(struct sess* reg, uint64_t last[][MAX_TG], double dt) {
         if (rx_lat >= 0.0) snprintf(latbuf, sizeof(latbuf), "%.1f", rx_lat);
         else               snprintf(latbuf, sizeof(latbuf), "null");
         if (s->kind == K_DATA && t->tc_valid)
-          fprintf(sf, "{\"fps\": %.1f, \"frame_index\": %llu, \"timecode\": \"%s\", \"df\": %s, \"rx_latency_ms\": %s}\n",
-                  rate, (unsigned long long)t->index, t->tc, t->tc_df ? "true" : "false", latbuf);
+          fprintf(sf, "{\"fps\": %.1f, \"frame_index\": %llu, \"timecode\": \"%s\", \"df\": %s, \"rx_latency_ms\": %s%s}\n",
+                  rate, (unsigned long long)t->index, t->tc, t->tc_df ? "true" : "false", latbuf, tpbuf);
         else
-          fprintf(sf, "{\"fps\": %.1f, \"frame_index\": %llu, \"late\": %llu, \"rx_latency_ms\": %s}\n",
-                  rate, (unsigned long long)t->index, (unsigned long long)t->late, latbuf);
+          fprintf(sf, "{\"fps\": %.1f, \"frame_index\": %llu, \"late\": %llu, \"rx_latency_ms\": %s%s}\n",
+                  rate, (unsigned long long)t->index, (unsigned long long)t->late, latbuf, tpbuf);
         fclose(sf);
       }
     }
+    /* Reset de la fenêtre tp après avoir servi toutes les cibles (le pire verdict repart à « aucun
+     * échantillon » → chaque fenêtre reflète l'état courant, pas un pire historique collant). */
+    if (s->tp_enabled) { s->tp_cnt = 0; s->tp_worst = -1; s->tp_cause[0] = '\0'; s->tp_cinst_sum = s->tp_vrx_sum = 0.0; }
   }
 }
 
@@ -1635,6 +1705,9 @@ int main(int argc, char** argv) {
      * récepteur). quota_mbs (Mb/s) borne chaque scheduler (~2×1080p50 à 5000) → éclatement initial
      * sur les lcores fournis ; les flags MIGRATE rééquilibrent à chaud un sch détecté trop busy. */
     p.flags |= MTL_FLAG_TX_VIDEO_MIGRATE | MTL_FLAG_RX_VIDEO_MIGRATE;
+    /* SONDE 2110-21 (TIMING_PARSER=1, niveau DEVICE) : active le HW timestamp du mbuf, prérequis du
+     * timing parser (mesure fiable de l'arrivée paquet → Cinst/VRX/FPT/latency). Défaut OFF. */
+    if (tp_wanted()) p.flags |= MTL_FLAG_ENABLE_HW_TIMESTAMP;
     /* PMD DPDK/ice sur PF média : filet optionnel pour le multicast. En AF-XDP le noyau programme
      * le filtre MAC mcast du groupe rejoint ; en DPDK user c'est libmtl (mt_mcast:
      * rte_eth_dev_mac_addr_add) qui l'ajoute. Si un déploiement observe rx_packets=0 AU NIVEAU PORT
