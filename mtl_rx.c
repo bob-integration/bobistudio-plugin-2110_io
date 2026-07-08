@@ -1761,6 +1761,22 @@ int main(int argc, char** argv) {
     else if (!strcmp(pacing, "tsc_narrow")) p.pacing = ST21_TX_PACING_WAY_TSC_NARROW;
     else if (!strcmp(pacing, "tsc"))        p.pacing = ST21_TX_PACING_WAY_TSC;
     else                                    p.pacing = ST21_TX_PACING_WAY_AUTO;
+    /* PTP INTERNE libmtl (chantier horloge, cf. PTP_CLOCK.md) — env-gaté, DÉFAUT OFF (inchangé :
+     * libmtl lit CLOCK_REALTIME via ptp_from_real_time, discipliné par ptp4l/phc2sys kernel).
+     * ENGINE_PTP=libmtl → libmtl devient esclave PTPv2 sur le(s) port(s) DPDK et discipline+lit le
+     * PHC lui-même (ptp_from_eth) → indépendant du kernel (obligatoire en full-vfio où ptp4l kernel
+     * ne tourne plus). +PI = servo PI (mt_ptp.c). ENGINE_PHC2SYS=1 → libmtl discipline AUSSI
+     * CLOCK_REALTIME depuis le PHC (remplace phc2sys kernel). N'a de sens qu'avec ≥1 port DPDK. */
+    int _has_dpdk = 0;
+    for (int k = 0; k < g_nports; k++)
+      if (!strcmp(g_ports[k].pmd, "dpdk")) { _has_dpdk = 1; break; }
+    if (getenv("ENGINE_PTP") && !strcmp(getenv("ENGINE_PTP"), "libmtl") && _has_dpdk) {
+      p.flags |= MTL_FLAG_PTP_ENABLE | MTL_FLAG_PTP_PI;
+      if (getenv("ENGINE_PHC2SYS") && atoi(getenv("ENGINE_PHC2SYS")))
+        p.flags |= MTL_FLAG_PHC2SYS_ENABLE;
+      fprintf(stderr, "mtl_rx: PTP interne libmtl ACTIF (esclave PTPv2 + PI%s) — lit le PHC\n",
+              (p.flags & MTL_FLAG_PHC2SYS_ENABLE) ? " + phc2sys REALTIME" : "");
+    }
     p.log_level = MTL_LOG_LEVEL_INFO;
     p.lcores = lcores[0] ? lcores : NULL;
 
