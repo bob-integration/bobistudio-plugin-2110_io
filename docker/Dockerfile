@@ -95,6 +95,8 @@ COPY patch_st40_afxdp_port.py /tmp/patch_st40_afxdp_port.py
 COPY patch_afxdp_tx_link_drop.py /tmp/patch_afxdp_tx_link_drop.py
 COPY patch_rx_resetting_guard.py /tmp/patch_rx_resetting_guard.py
 COPY patch_tm_hierarchy.py /tmp/patch_tm_hierarchy.py
+COPY patch_igmp_router_alert.py /tmp/patch_igmp_router_alert.py
+COPY patch_ptp_mcast_flow.py /tmp/patch_ptp_mcast_flow.py
 # MTL_REF est un SHA (pas une branche) → clone + fetch ciblé (GitHub sert les SHA joignables).
 RUN mkdir -p /src/MTL && cd /src/MTL \
  && git init -q && git remote add origin https://github.com/OpenVisualCloud/Media-Transport-Library \
@@ -104,6 +106,8 @@ RUN mkdir -p /src/MTL && cd /src/MTL \
  && python3 /tmp/patch_afxdp_tx_link_drop.py \
  && python3 /tmp/patch_rx_resetting_guard.py \
  && python3 /tmp/patch_tm_hierarchy.py \
+ && python3 /tmp/patch_igmp_router_alert.py \
+ && python3 /tmp/patch_ptp_mcast_flow.py \
  && MTL_PREFIX_ARGS="-Dtests=false" ./script/build_dpdk.sh -f \
  && ./build.sh || true \
  && ldconfig \

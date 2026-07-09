@@ -1,7 +1,13 @@
 {
-  "version": "0.39.11",
-  "date": "2026-07-08",
+  "version": "0.39.13",
+  "date": "2026-07-09",
   "changes": {
+    "Fix PTP DPDK #2 : règle rte_flow admettant le mcast PTP sur la queue CNI (E810/ice, REBUILD requis, 0.39.13)": [
+      "patch_ptp_mcast_flow.py (patch libmtl mt_ptp.c + mt_main.h) : en DPDK pur sur E810/ice, le PTP interne de libmtl (ENGINE_PTP=libmtl) ne recevait AUCUN paquet PTP (224.0.1.129, UDP 319/320) — la NIC droppe le mcast faute de règle rte_flow. Dans ptp_init, la branche CNI ne faisait que mt_mcast_join + mt_mcast_l2_join, sans AUCUNE règle rte_flow ; or sur E810 c'est la règle rte_flow (dst-IP mcast + UDP dst-port → QUEUE) qui admet le mcast dans le pipeline (une session st20p_rx en pose une et reçoit bien son mcast, la queue système CNI saute la création de flow). C'est le 2ᵉ blocage RX du socle full-PF DPDK, APRÈS l'option Router Alert (0.39.12) : le join arrive au switch, mais la NIC ne laisse pas entrer le PTP. Fix : après mt_mcast_l2_join, poser deux règles rte_flow (event 319 / general 320) vers la queue de la rxq CNI via mt_rx_flow_create (remplissage identique aux sessions : dip=mcast, sip=mt_sip_addr, dst_port ; flags=0 → vraie règle matérielle), libérées dans ptp_uinit via mt_rx_flow_free. Deux handles stockés dans struct mt_ptp_impl. N'affecte que le chemin CNI/DPDK."
+    ],
+    "Fix PTP carte-directe : option IP Router Alert aux reports IGMP libmtl (REBUILD requis, 0.39.12)": [
+      "patch_igmp_router_alert.py (patch libmtl mt_mcast.c) : les reports IGMPv3 forgés par libmtl n'avaient PAS l'option IP Router Alert (RFC 2113) — en-tête IP 20 octets (IHL=5). Un switch à IGMP snooping conforme (Cisco du plant) IGNORE un report sans Router Alert → ne snoope pas le join → ne forwarde pas le multicast (dont le PTP 224.0.1.129) au port de la PF DPDK. Symptôme MESURÉ (banc SPAN dl360-1 2026-07-09) : ptp4l kernel LOCKE à 14 ns mais le PTP interne libmtl (ENGINE_PTP=libmtl) reste 'not connected' (0 paquet reçu) sur le MÊME port/sip ; capture paquet = report kernel IHL=24 + '94040000' (Router Alert), report libmtl IHL=20 absent (seul delta). Fix : IHL=6, option 0x94 0x04 0x00 0x00 insérée entre l'en-tête IP et l'IGMP, IGMP décalé de 4, ip.total_length +4, l3_len +=4 (checksum IP offload + pkt_len). Débloque la synchro carte-directe du socle full-PF DPDK (cf. mémoire narrow-full-pf-dpdk-socle)."
+    ],
     "Chantier horloge — PTP interne libmtl env-gaté (ENGINE_PTP=libmtl) sur les ports DPDK (REBUILD requis, 0.39.11)": [
       "mtl_rx.c : ENGINE_PTP=libmtl + ≥1 port dpdk → p.flags |= MTL_FLAG_PTP_ENABLE|MTL_FLAG_PTP_PI (libmtl devient esclave PTPv2, discipline+lit le PHC via ptp_from_eth au lieu de CLOCK_REALTIME) ; ENGINE_PHC2SYS=1 → + MTL_FLAG_PHC2SYS_ENABLE (libmtl discipline aussi REALTIME). DÉFAUT OFF = comportement inchangé (lit REALTIME, discipliné par ptp4l/phc2sys kernel). Pivot du modèle PTP_CLOCK.md (Gate 0 = valider charge prod full-DPDK + PTP libmtl stable au banc)."
     ],
