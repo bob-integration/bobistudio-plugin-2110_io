@@ -13,6 +13,7 @@
   "nmos_role": "both",
   "split_io": true,
   "deploy_order": 0,
+  "auto_provision": true,
   "version": "0.39.7",
   "adapts_input": true,
   "aggregate_fps": false,
