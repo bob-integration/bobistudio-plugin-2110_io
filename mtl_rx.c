@@ -23,6 +23,7 @@
 #include <math.h>
 #include <pthread.h>
 #include <signal.h>
+#include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -78,6 +79,16 @@ static void on_signal(int s) { (void)s; g_stop = 1; }
  * mort HORS ajout) reste actif dès la grâce écoulée. */
 #define TX_ADD_GRACE_NS (20ull * 1000000000ull)
 static uint64_t g_tx_add_grace_ns = 0;   /* mono_ns jusqu'auquel le backstop TX est suspendu */
+
+/* bobi.studio: gate d'ÉTAT du backstop TX quand le PTP interne libmtl est actif (G4 2026-07-10/11).
+ * Le train de pacing TX attend le PTP stable (mt_ptp_wait_stable, 180 s) et ÉCHOUE au timeout →
+ * zéro frame tant que le GM n'est pas là. Une grâce à durée fixe ne couvre pas « GM absent au
+ * boot » (la boucle de restart revient à l'expiration) : on suspend le backstop tant que le PTP
+ * n'est PAS synchrone (getter exporté par patch_ptp_stable_getter.py — même critère de stabilité
+ * que mt_ptp_wait_stable). GM absent → le daemon attend sans churn (log « not connected » 10 s) ;
+ * lock → TX démarre et le backstop se réarme pour son vrai rôle (queue morte). */
+extern bool mt_bobi_ptp_stable(void* impl, int port);
+static int g_engine_ptp = 0;             /* 1 = ENGINE_PTP=libmtl actif (PTP interne sur port DPDK) */
 
 static uint64_t now_ns(void) {
   struct timespec ts;
@@ -1860,12 +1871,9 @@ int main(int argc, char** argv) {
         p.flags |= MTL_FLAG_PHC2SYS_ENABLE;
       fprintf(stderr, "mtl_rx: PTP interne libmtl ACTIF (esclave PTPv2 + PI%s) — lit le PHC\n",
               (p.flags & MTL_FLAG_PHC2SYS_ENABLE) ? " + phc2sys REALTIME" : "");
-      /* bobi.studio: démarrage à FROID (G4 2026-07-10) — libmtl n'émet AUCUNE frame TX tant que son
-       * PTP interne n'est pas stable (mt_ptp_wait_stable, jusqu'à 180 s : PHC loin du GM après un
-       * reboot). Le backstop « TX FIGÉ » (5 s, grâce add 20 s) redémarrerait le daemon en boucle
-       * AVANT la convergence — et chaque restart repart de zéro. On suspend le backstop sur toute
-       * la fenêtre de stabilisation ; les writes au create TX sont en max monotone (jamais réduite). */
-      g_tx_add_grace_ns = mono_ns() + 200ull * 1000000000ull;
+      /* bobi.studio: le backstop « TX FIGÉ » est gaté sur l'ÉTAT de synchro PTP (cf. déclaration de
+       * mt_bobi_ptp_stable) — pas de frame TX possible avant le lock, ce n'est pas un wedge. */
+      g_engine_ptp = 1;
     }
     p.log_level = MTL_LOG_LEVEL_INFO;
     p.lcores = lcores[0] ? lcores : NULL;
@@ -1918,9 +1926,13 @@ int main(int argc, char** argv) {
          * avec des memzones vierges. Pas de cleanup ici : libérer des queues mortes peut
          * bloquer, et _launch_mtl est conçu pour l'après-crash. */
         uint64_t wnow = mono_ns();
+        /* bobi.studio: PTP interne pas (encore/plus) synchrone → aucune frame TX ne PEUT sortir
+         * (train de pacing en attente) : suspendre le backstop, ce n'est pas un wedge de queue. */
+        int ptp_gate = g_engine_ptp && !mt_bobi_ptp_stable(st, 0);
         for (int i = 0; i < MAX_SESS; i++) {
           struct sess* s2 = &reg[i];
           if (!s2->used || s2->role != ROLE_TX || !s2->started || !s2->tg[0].alive_ns) continue;
+          if (ptp_gate) { s2->tg[0].alive_ns = wnow; continue; }   /* re-tare : pas de tir différé au lock */
           if (wnow - s2->tg[0].alive_ns > 5ull * 1000000000ull) {
             /* bobi.studio: un ajout TX récent a stoppé le port (commit RL) → le stall n'est pas un
              * wedge, l'émission reprend seule à la fin du commit. Ne pas redémarrer pendant la grâce. */
