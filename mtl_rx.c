@@ -1596,7 +1596,8 @@ static void reconcile(struct sess* reg, const char* path, mtl_handle st, const c
     if (r == 0) { s->used = 1; s->seen = 1;
       /* bobi.studio: un create TX vient de committer l'arbre RL (port stoppé le temps du commit) →
        * armer la grâce backstop pour ne pas confondre le port-off avec un wedge des autres sessions. */
-      if (s->role == ROLE_TX) g_tx_add_grace_ns = mono_ns() + TX_ADD_GRACE_NS;
+      if (s->role == ROLE_TX) { uint64_t g = mono_ns() + TX_ADD_GRACE_NS;
+                                if (g > g_tx_add_grace_ns) g_tx_add_grace_ns = g; }
     }
     else {
       fprintf(stderr,"mtl_rx: création session %s:%d échouée\n", s->mcast, s->udp_port);
@@ -1859,6 +1860,12 @@ int main(int argc, char** argv) {
         p.flags |= MTL_FLAG_PHC2SYS_ENABLE;
       fprintf(stderr, "mtl_rx: PTP interne libmtl ACTIF (esclave PTPv2 + PI%s) — lit le PHC\n",
               (p.flags & MTL_FLAG_PHC2SYS_ENABLE) ? " + phc2sys REALTIME" : "");
+      /* bobi.studio: démarrage à FROID (G4 2026-07-10) — libmtl n'émet AUCUNE frame TX tant que son
+       * PTP interne n'est pas stable (mt_ptp_wait_stable, jusqu'à 180 s : PHC loin du GM après un
+       * reboot). Le backstop « TX FIGÉ » (5 s, grâce add 20 s) redémarrerait le daemon en boucle
+       * AVANT la convergence — et chaque restart repart de zéro. On suspend le backstop sur toute
+       * la fenêtre de stabilisation ; les writes au create TX sont en max monotone (jamais réduite). */
+      g_tx_add_grace_ns = mono_ns() + 200ull * 1000000000ull;
     }
     p.log_level = MTL_LOG_LEVEL_INFO;
     p.lcores = lcores[0] ? lcores : NULL;
