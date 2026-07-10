@@ -1445,8 +1445,15 @@ static int parse_session_into(struct json_object* j, struct sess* s) {
   struct json_object* tgs;
   if (json_object_object_get_ex(j,"targets",&tgs) && json_object_is_type(tgs,json_type_array)) {
     int nt = json_object_array_length(tgs);
-    for (int ti = 0; ti < nt && s->ntg < MAX_TG; ti++)
-      if (parse_target(json_object_array_get_idx(tgs, ti), &s->tg[s->ntg]) == 0) s->ntg++;
+    for (int ti = 0; ti < nt && s->ntg < MAX_TG; ti++) {
+      int r = parse_target(json_object_array_get_idx(tgs, ti), &s->tg[s->ntg]);
+      /* bobi.studio: un TX peut être PRÉ-PROVISIONNÉ sans source (slot silencieux : session + feuille
+       * RL créées, thread muet en attente de câblage → 0 Gb/s). parse_target rejette une source vide ;
+       * pour un TX on accepte quand même (la cible EST peuplée : shm_path="", stats, ident). La source
+       * arrive ensuite par swap à chaud (tx_set_source) SANS re-créer la session. RX : source de sortie
+       * requise → on garde le rejet. */
+      if (r == 0 || s->role == ROLE_TX) s->ntg++;
+    }
   } else {
     if (parse_target(j, &s->tg[0]) == 0) s->ntg = 1;   /* compat : shm/stats/ident_file inline */
   }

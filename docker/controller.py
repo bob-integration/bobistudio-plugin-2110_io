@@ -1280,6 +1280,7 @@ class AgentHandler(BaseHTTPRequestHandler):
             with _tx_lock:
                 t = _tx[idx]
                 t["enabled"] = bool(body.get("enabled"))
+                if "provisioned" in body: t["provisioned"] = bool(body.get("provisioned"))
                 if "mcast"     in body: t["mcast"]     = body.get("mcast") or None
                 if "udp_port"  in body: t["udp_port"]  = int(body.get("udp_port") or 0)
                 if "mcast2"    in body: t["mcast2"]    = body.get("mcast2") or None
@@ -1787,6 +1788,10 @@ N_AUD_PER_TX = max(1, (N_AUDIO // N_TX) if N_TX else 1)
 _tx = [{"enabled": False, "mcast": None, "udp_port": 0, "pt": 96,
         "mcast2": None, "udp_port2": 0,      # leg1 SMPTE 2022-7 (vidéo)
         "shm_in": None, "cable_shm": None,   # cable_shm = shm câblé réel (distinct de shm_in qui peut pointer vers txgen)
+        "provisioned": False,                 # slot PRÉ-CRÉÉ (session + feuille RL) même SANS source →
+                                              # silencieux (0 Gb/s) jusqu'à câblage. Le contenu se route
+                                              # ensuite à chaud par swap de source (mtl_rx découple
+                                              # source↔session : pas de re-création → pas de dé-lock PTP).
         "fallback_mode": "black",             # repli automatique sans câble : "none"|"black"|"bars"
         "w": WIDTH, "h": HEIGHT, "fps": FPS, "bd": BIT_DEPTH, "ring": V_RING,
         "scan": "p", "field_order": "tff",   # passthrough entrelacé : suit le format de la source câblée
@@ -2687,7 +2692,10 @@ def _manager_loop():
         with _tx_lock:
             for i in range(min(N_TX, ACTIVE_TX_C)):
                 t = _tx[i]
-                if t["enabled"] and t["mcast"] and t["udp_port"] and t["shm_in"]:
+                # Émission de la session vidéo TX : soit CÂBLÉE (enabled + source), soit PRÉ-PROVISIONNÉE
+                # (session/feuille RL créée sans source → silencieuse ; mtl_rx tolère shm_in vide et
+                # route le contenu à chaud par swap). Destination (mcast+port) toujours requise.
+                if t["mcast"] and t["udp_port"] and ((t["enabled"] and t["shm_in"]) or t.get("provisioned")):
                     sessions.append(_tx_session(i, t, _tx_iface(i, t.get("iface"))))
                 # TX audio : priorité TONALITÉ (gen autonome) > mire/repli (GEN vidéo) > câblé.
                 # NON câblé et sans tonalité ⇒ pas de session (silence).
