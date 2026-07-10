@@ -68,6 +68,17 @@ enum sess_role { ROLE_RX, ROLE_TX };           /* RX = wire→shm (receiver) ; T
 static volatile int g_stop = 0;
 static void on_signal(int s) { (void)s; g_stop = 1; }
 
+/* bobi.studio: fenêtre de grâce du backstop « TX FIGÉ » après une création de session TX.
+ * Créer un sender RL commit l'arbre traffic-manager (rte_tm_hierarchy_commit) → le PMD ice STOPPE
+ * tout le port ~qq s → les sessions TX déjà vives ne transmettent plus le temps du commit (leur
+ * alive_ns stagne). Ce N'EST PAS un wedge : la garde libmtl (patch_tx_hang_resetting_guard) évite le
+ * fatal_error, mais le backstop process-wide de mtl_rx.c, lui, redémarrerait le daemon (→ re-lock PTP,
+ * blip flotte, voire boucle car re-lock 2 min > seuil 5 s). On suspend donc le backstop TX_ADD_GRACE_NS
+ * après tout create TX : l'émission reprend seule à la fin du commit. Le vrai détecteur (lien/queue
+ * mort HORS ajout) reste actif dès la grâce écoulée. */
+#define TX_ADD_GRACE_NS (20ull * 1000000000ull)
+static uint64_t g_tx_add_grace_ns = 0;   /* mono_ns jusqu'auquel le backstop TX est suspendu */
+
 static uint64_t now_ns(void) {
   struct timespec ts;
   clock_gettime(CLOCK_REALTIME, &ts);
@@ -1514,7 +1525,11 @@ static void reconcile(struct sess* reg, const char* path, mtl_handle st, const c
     int r = (s->role == ROLE_TX)
             ? ((s->kind == K_AUDIO) ? setup_audio_tx(s) : (s->kind == K_DATA) ? setup_data_tx(s) : setup_video_tx(s))
             : ((s->kind == K_AUDIO) ? setup_audio(s)    : (s->kind == K_DATA) ? setup_data(s)    : setup_video(s));
-    if (r == 0) { s->used = 1; s->seen = 1; }
+    if (r == 0) { s->used = 1; s->seen = 1;
+      /* bobi.studio: un create TX vient de committer l'arbre RL (port stoppé le temps du commit) →
+       * armer la grâce backstop pour ne pas confondre le port-off avec un wedge des autres sessions. */
+      if (s->role == ROLE_TX) g_tx_add_grace_ns = mono_ns() + TX_ADD_GRACE_NS;
+    }
     else {
       fprintf(stderr,"mtl_rx: création session %s:%d échouée\n", s->mcast, s->udp_port);
       /* RX : remonter l'échec dans le stats json du slot (sinon le contrôleur le croit « mtl »). */
@@ -1832,6 +1847,9 @@ int main(int argc, char** argv) {
           struct sess* s2 = &reg[i];
           if (!s2->used || s2->role != ROLE_TX || !s2->started || !s2->tg[0].alive_ns) continue;
           if (wnow - s2->tg[0].alive_ns > 5ull * 1000000000ull) {
+            /* bobi.studio: un ajout TX récent a stoppé le port (commit RL) → le stall n'est pas un
+             * wedge, l'émission reprend seule à la fin du commit. Ne pas redémarrer pendant la grâce. */
+            if (wnow < g_tx_add_grace_ns) continue;
             fprintf(stderr, "mtl_rx: TX FIGÉ %s:%d (aucune frame depuis %.1fs) — restart du daemon\n",
                     s2->mcast, s2->udp_port, (wnow - s2->tg[0].alive_ns) / 1e9);
             fflush(stderr);
