@@ -54,6 +54,13 @@ A_RING     = max(2, int(os.environ.get("AUDIO_RING") or 100))   # ring shm audio
 A_PTIME_DEF = float(os.environ.get("AUDIO_PTIME") or 1.0)
 ACTIVE_RX   = int(os.environ.get("ACTIVE_RX_COUNT") or min(6, max(1, N_VIDEO)))
 ACTIVE_TX_C = int(os.environ.get("ACTIVE_TX_COUNT") or min(6, max(0, N_TX)))
+# Plafond de FILES TX du PMD (E810 dpdk clampe à 64 files au mtl_init — banc dl360-1 2026-07-10 ;
+# ce n'est PAS les 128 feuilles MT_MAX_RL_ITEMS). 1 file = contrôle → budget émission = MAX-1. On y
+# BORNE le nombre de sessions TX émises (vidéo+audio+ANC), sinon demande > réserve → RELANCE EN BOUCLE
+# (le daemon redemande plus de files que le PMD n'en donne). Réglable si le HW/PMD évolue.
+MTL_MAX_TX_QUEUES = int(os.environ.get("MTL_MAX_TX_QUEUES") or 64)
+_TX_SESSION_BUDGET = max(0, MTL_MAX_TX_QUEUES - 1)
+_tx_budget_warned = False
 # Plafond de files TX sous pacing RL matériel (port E810 dpdk), APRÈS le patch libmtl
 # `patch_tm_hierarchy.py` (arbre TM ramifié, 0.39.6). Le patch attache jusqu'à
 # MT_MAX_RL_ITEMS=128 feuilles réparties sur P nœuds queue-group (P×8), la file de contrôle
@@ -2597,6 +2604,7 @@ def _manager_loop():
     dernier mtl_init (sinon plafond muet ~8 = 2 files/port × 4 ports) — relance DEBOUNCÉE (config
     stable depuis _RELAUNCH_SETTLE_S) pour regrouper une rafale d'abonnements en une seule réinit."""
     global _mtl_proc, _cur_sig, _fail_streak, _xdp_sessions_active, _xdp_active_per_iface, _sig_changed_at, _ip_check_at
+    global _tx_budget_warned
     while True:
         groups = {}        # (mcast, port) → {"info": sdp, "idxs": [..]} — fan-out même-source
         for idx in range(N_VIDEO):
@@ -2689,6 +2697,16 @@ def _manager_loop():
         # Sessions TX : un slot émet s'il est activé, a une destination et un shm d'entrée câblé.
         # Plafonné à ACTIVE_TX_C (budget de queues partagé RX+TX) — les slots provisionnés au-delà
         # ne créent aucune session (cf. _tx_gen_apply qui les force déjà à enabled=False).
+        # Budget de FILES TX (le PMD E810 dpdk clampe à MTL_MAX_TX_QUEUES=64) : on BORNE le nombre de
+        # sessions TX émises (vidéo+audio+ANC), sinon demande > réserve → le daemon relance en boucle
+        # pour agrandir un budget que le HW ne donnera jamais. Les sessions au-delà sont IGNORÉES (loggé).
+        _ntx_q = 0; _tx_dropped = 0
+        def _emit_tx(sess):
+            nonlocal _ntx_q, _tx_dropped
+            if _ntx_q < _TX_SESSION_BUDGET:
+                sessions.append(sess); _ntx_q += 1
+            else:
+                _tx_dropped += 1
         with _tx_lock:
             for i in range(min(N_TX, ACTIVE_TX_C)):
                 t = _tx[i]
@@ -2696,7 +2714,7 @@ def _manager_loop():
                 # (session/feuille RL créée sans source → silencieuse ; mtl_rx tolère shm_in vide et
                 # route le contenu à chaud par swap). Destination (mcast+port) toujours requise.
                 if t["mcast"] and t["udp_port"] and ((t["enabled"] and t["shm_in"]) or t.get("provisioned")):
-                    sessions.append(_tx_session(i, t, _tx_iface(i, t.get("iface"))))
+                    _emit_tx(_tx_session(i, t, _tx_iface(i, t.get("iface"))))
                 # TX audio : priorité TONALITÉ (gen autonome) > mire/repli (GEN vidéo) > câblé.
                 # NON câblé et sans tonalité ⇒ pas de session (silence).
                 _acable = t.get("audio_cable_shm") or []
@@ -2711,13 +2729,20 @@ def _manager_loop():
                     if t["enabled"] and ashm:
                         if not ashm.startswith("/"):
                             ashm = "/dev/shm/" + ashm
-                        sessions.append(_audio_tx_session(i * 2 + ai, acfg, ashm, _tx_iface(i, t.get("iface"))))
+                        _emit_tx(_audio_tx_session(i * 2 + ai, acfg, ashm, _tx_iface(i, t.get("iface"))))
                 # TX ANC : câblage INDÉPENDANT (anc_cable_shm). NON câblé ⇒ pas de session.
                 dshm = t.get("anc_cable_shm")
                 if t["enabled"] and t.get("anc_mcast") and t.get("anc_port") and dshm:
                     if not dshm.startswith("/"):
                         dshm = "/dev/shm/" + dshm
-                    sessions.append(_anc_tx_session(i, t, dshm, _tx_iface(i, t.get("iface"))))
+                    _emit_tx(_anc_tx_session(i, t, dshm, _tx_iface(i, t.get("iface"))))
+        if _tx_dropped and not _tx_budget_warned:
+            _tx_budget_warned = True
+            print("mtl_rx: {} session(s) TX au-delà du budget de {} files (PMD E810 dpdk) — IGNORÉES. "
+                  "Réduire les sorties actives ou régler MTL_MAX_TX_QUEUES.".format(
+                      _tx_dropped, MTL_MAX_TX_QUEUES), flush=True)
+        elif not _tx_dropped:
+            _tx_budget_warned = False
 
         # 1) config : réécrit dès qu'il change → le daemon réconcilie à chaud (aucune relance/faute PTP)
         sig = json.dumps(sessions, sort_keys=True)
