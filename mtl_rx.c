@@ -255,6 +255,14 @@ struct target {
   uint8_t* ident_patch; int id_bw, id_bh; long id_mtime;
   /* timecode ATC (data/ANC) — dernier TC décodé, publié dans les stats */
   char     tc[16]; int tc_df; int tc_valid;
+  /* bobi.studio: SWAP de SOURCE à chaud sans re-créer la session TX (découplage source↔session).
+   * reconcile (writer unique) pose la nouvelle source via tx_set_source ; le thread TX la prend via
+   * tx_take_source puis rouvre son reader. La source n'est PLUS dans compute_sig (TX) → changer de
+   * source ne déclenche plus st20p_tx_create → pas de commit RL → pas de dé-lock PTP. Seqlock car la
+   * source change rarement (routage) alors que le thread lit ~50 Hz. */
+  char     want_shm[300];      /* source désirée (reconcile) */
+  volatile uint32_t src_seq;   /* seqlock : pair = stable, impair = écriture en cours */
+  uint32_t src_seq_seen;       /* dernière séquence consommée par le thread TX */
 };
 
 /* Une session = un flux réseau décodé UNE fois sur le mtl_handle partagé, fan-out vers ses cibles. */
@@ -787,6 +795,29 @@ static int setup_video(struct sess* s) {
 }
 
 /* ═══ TX commun (lecture du flux d'entrée câblé via un reader MXL) ═════════════ */
+/* bobi.studio: DÉCOUPLAGE source↔session — reconcile (writer unique) pose la source désirée ; le
+ * thread TX la prend et rouvre son reader. Voir struct target (want_shm/src_seq). */
+static void tx_set_source(struct target* t, const char* src) {
+  t->src_seq++;                                 /* impair : écriture en cours */
+  __sync_synchronize();
+  snprintf(t->want_shm, sizeof(t->want_shm), "%s", src ? src : "");
+  __sync_synchronize();
+  t->src_seq++;                                 /* pair : publié */
+}
+/* Retourne 1 si la source a changé (⇒ le thread relâche son reader pour rouvrir sur t->shm_path). */
+static int tx_take_source(struct target* t) {
+  uint32_t seq = t->src_seq;
+  if (seq == t->src_seq_seen) return 0;         /* rien de neuf (séquence paire déjà consommée) */
+  char local[300]; uint32_t s0;
+  do { s0 = t->src_seq & ~1u; __sync_synchronize();
+       snprintf(local, sizeof(local), "%s", t->want_shm);
+       __sync_synchronize();
+  } while (s0 != t->src_seq);                    /* lecture torn (écriture concurrente) → retry */
+  snprintf(t->shm_path, sizeof(t->shm_path), "%s", local);
+  t->src_seq_seen = s0;
+  return 1;
+}
+
 /* Crée (paresseusement) le reader MXL du flux d'entrée câblé. -1 si le flux n'existe pas encore
  * (le producteur peut démarrer après nous) → l'appelant réessaie. */
 static int open_reader(struct target* t) {
@@ -882,6 +913,11 @@ static void* video_tx_thread(void* arg) {
   uint64_t period_ns = s->fps > 0 ? (uint64_t)(1e9 / s->fps) : 0;
   if (s->interlaced) period_ns /= 2;
   while (!s->stop) {
+    /* bobi.studio: source permutée à chaud par reconcile (sans re-créer la session) → rouvrir le reader
+     * sur la nouvelle source. Source vidée ("") → open_reader échoue → thread muet (slot silencieux). */
+    if (tx_take_source(t) && t->reader) {
+      mxlReleaseFlowReader(g_mxl, t->reader); t->reader = NULL; t->tx_src_idx_init = 0;
+    }
     if (!t->reader) {
       t->last_feed_ns = 0;   /* flux pas encore là : ne pas compter l'attente comme du retard */
       t->alive_ns = mono_ns();   /* attendre un câblage n'est pas un wedge */
@@ -1084,6 +1120,9 @@ static void* audio_tx_thread(void* arg) {
   struct target* t = &s->tg[0];
   int chs = s->channels;
   while (!s->stop) {
+    if (tx_take_source(t) && t->reader) {   /* bobi.studio: source audio permutée à chaud → rouvrir */
+      mxlReleaseFlowReader(g_mxl, t->reader); t->reader = NULL; t->tx_src_idx_init = 0;
+    }
     if (!t->reader) {
       t->alive_ns = mono_ns();   /* attendre un câblage n'est pas un wedge */
       if (open_reader(t) != 0) { usleep(20000); continue; }
@@ -1231,6 +1270,9 @@ static void* data_tx_thread(void* arg) {
   struct sess* s = arg;
   struct target* t = &s->tg[0];
   while (!s->stop) {
+    if (tx_take_source(t) && t->reader) {   /* bobi.studio: source ANC permutée à chaud → rouvrir */
+      mxlReleaseFlowReader(g_mxl, t->reader); t->reader = NULL; t->tx_src_idx_init = 0;
+    }
     if (!t->reader) {
       t->alive_ns = mono_ns();   /* attendre un câblage n'est pas un wedge */
       if (open_reader(t) != 0) { usleep(20000); continue; }
@@ -1419,9 +1461,13 @@ static void compute_sig(struct sess* s) {
                    s->role, s->kind, s->mcast, s->udp_port, s->payload_type, s->ssrc,
                    s->width, s->height, s->fps, s->interlaced, s->tff, s->bit_depth, s->ring,
                    s->channels, s->a_ptime, s->iface, s->iface_r, s->mcast_r, s->udp_port_r);
-  for (int ti = 0; ti < s->ntg && n > 0 && n < (int)sizeof(s->sig); ti++)
-    n += snprintf(s->sig + n, sizeof(s->sig) - n, "%s>%s,",
-                  s->tg[ti].shm_path, s->tg[ti].has_ident ? s->tg[ti].ident_file : "-");
+  /* bobi.studio: pour un TX la SOURCE (tg[].shm_path) n'entre PAS dans l'identité de session → la
+   * changer ne recrée plus la session (swap à chaud via tx_set_source/tx_take_source, pas de commit
+   * RL / dé-lock PTP). Pour un RX les flux de SORTIE font partie de l'identité → on les garde. */
+  if (s->role != ROLE_TX)
+    for (int ti = 0; ti < s->ntg && n > 0 && n < (int)sizeof(s->sig); ti++)
+      n += snprintf(s->sig + n, sizeof(s->sig) - n, "%s>%s,",
+                    s->tg[ti].shm_path, s->tg[ti].has_ident ? s->tg[ti].ident_file : "-");
 }
 
 /* Libère une session vivante : arrêt PROPRE du thread, free du handle MTL (le flow RX), munmap des
@@ -1476,7 +1522,16 @@ static void reconcile(struct sess* reg, const char* path, mtl_handle st, const c
     if (parse_session_into(json_object_array_get_idx(arr, k), &want) != 0) continue;
     compute_sig(&want);
     for (int i = 0; i < MAX_SESS; i++)
-      if (reg[i].used && !reg[i].seen && !strcmp(reg[i].sig, want.sig)) { reg[i].seen = 1; break; }
+      if (reg[i].used && !reg[i].seen && !strcmp(reg[i].sig, want.sig)) {
+        reg[i].seen = 1;
+        /* bobi.studio: TX — sig identique même si la SOURCE diffère (source hors-sig). On PROPAGE la
+         * nouvelle source à la session VIVANTE (le thread rouvre son reader) au lieu de détruire+
+         * recréer → aucun st20p_tx_create, aucun commit RL, aucun dé-lock PTP de la flotte. */
+        if (reg[i].role == ROLE_TX && reg[i].ntg > 0 && want.ntg > 0 &&
+            strcmp(reg[i].tg[0].want_shm, want.tg[0].shm_path) != 0)
+          tx_set_source(&reg[i].tg[0], want.tg[0].shm_path);
+        break;
+      }
   }
 
   /* Pass 2 — FREE-BEFORE-CREATE : libérer les sessions périmées AVANT toute création. Libère leur
@@ -1504,6 +1559,12 @@ static void reconcile(struct sess* reg, const char* path, mtl_handle st, const c
     struct sess* s = &reg[slot];
     *s = want;
     s->st = st; s->stop = 0;
+    /* bobi.studio: amorcer le miroir de source (want_shm) = source initiale → reconcile compare
+     * `want_shm` (possédé par reconcile) et ne déclenche un swap que sur un VRAI changement. */
+    for (int ti = 0; ti < s->ntg; ti++) {
+      snprintf(s->tg[ti].want_shm, sizeof(s->tg[ti].want_shm), "%s", s->tg[ti].shm_path);
+      s->tg[ti].src_seq = 0; s->tg[ti].src_seq_seen = 0;
+    }
     /* `iface` absent → portname déjà résolu sur le port 0 par parse. Repli mono-NIC ultime
      * (g_ports vide) : le portname global du device. */
     if (!s->portname[0] && !s->iface[0]) snprintf(s->portname, sizeof(s->portname), "%s", portname);
