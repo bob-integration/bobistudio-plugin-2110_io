@@ -54,12 +54,6 @@ A_RING     = max(2, int(os.environ.get("AUDIO_RING") or 100))   # ring shm audio
 A_PTIME_DEF = float(os.environ.get("AUDIO_PTIME") or 1.0)
 ACTIVE_RX   = int(os.environ.get("ACTIVE_RX_COUNT") or min(6, max(1, N_VIDEO)))
 ACTIVE_TX_C = int(os.environ.get("ACTIVE_TX_COUNT") or min(6, max(0, N_TX)))
-# Plafond de FILES TX du PMD (E810 dpdk clampe à 64 files au mtl_init — banc dl360-1 2026-07-10 ;
-# ce n'est PAS les 128 feuilles MT_MAX_RL_ITEMS). 1 file = contrôle → budget émission = MAX-1. On y
-# BORNE le nombre de sessions TX émises (vidéo+audio+ANC), sinon demande > réserve → RELANCE EN BOUCLE
-# (le daemon redemande plus de files que le PMD n'en donne). Réglable si le HW/PMD évolue.
-MTL_MAX_TX_QUEUES = int(os.environ.get("MTL_MAX_TX_QUEUES") or 64)
-_TX_SESSION_BUDGET = max(0, MTL_MAX_TX_QUEUES - 1)
 _tx_budget_warned = False
 # Plafond de files TX sous pacing RL matériel (port E810 dpdk), APRÈS le patch libmtl
 # `patch_tm_hierarchy.py` (arbre TM ramifié, 0.39.6). Le patch attache jusqu'à
@@ -2697,13 +2691,14 @@ def _manager_loop():
         # Sessions TX : un slot émet s'il est activé, a une destination et un shm d'entrée câblé.
         # Plafonné à ACTIVE_TX_C (budget de queues partagé RX+TX) — les slots provisionnés au-delà
         # ne créent aucune session (cf. _tx_gen_apply qui les force déjà à enabled=False).
-        # Budget de FILES TX (le PMD E810 dpdk clampe à MTL_MAX_TX_QUEUES=64) : on BORNE le nombre de
-        # sessions TX émises (vidéo+audio+ANC), sinon demande > réserve → le daemon relance en boucle
-        # pour agrandir un budget que le HW ne donnera jamais. Les sessions au-delà sont IGNORÉES (loggé).
+        # Budget de sessions TX = RL_TX_QUEUES_CAP (files RL/port de la carte − contrôle ; injecté en env
+        # par docker_driver depuis la BIBLIOTHÈQUE DE CARTES, défaut 63 = E810-C). On BORNE le nombre de
+        # sessions TX émises (vidéo+audio+ANC) DESSUS : sinon demande > réserve → le daemon relance en
+        # boucle pour agrandir un budget que le HW ne donnera jamais. Sessions au-delà = IGNORÉES (loggé).
         _ntx_q = 0; _tx_dropped = 0
         def _emit_tx(sess):
             nonlocal _ntx_q, _tx_dropped
-            if _ntx_q < _TX_SESSION_BUDGET:
+            if _ntx_q < RL_TX_QUEUES_CAP:
                 sessions.append(sess); _ntx_q += 1
             else:
                 _tx_dropped += 1
@@ -2738,9 +2733,9 @@ def _manager_loop():
                     _emit_tx(_anc_tx_session(i, t, dshm, _tx_iface(i, t.get("iface"))))
         if _tx_dropped and not _tx_budget_warned:
             _tx_budget_warned = True
-            print("mtl_rx: {} session(s) TX au-delà du budget de {} files (PMD E810 dpdk) — IGNORÉES. "
-                  "Réduire les sorties actives ou régler MTL_MAX_TX_QUEUES.".format(
-                      _tx_dropped, MTL_MAX_TX_QUEUES), flush=True)
+            print("mtl_rx: {} session(s) TX au-delà du cap RL de la carte ({} sessions/port, "
+                  "RL_TX_QUEUES_CAP) — IGNORÉES. Réduire les sorties actives (limite carte, cf. §7)."
+                  .format(_tx_dropped, RL_TX_QUEUES_CAP), flush=True)
         elif not _tx_dropped:
             _tx_budget_warned = False
 
