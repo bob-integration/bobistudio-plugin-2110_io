@@ -50,7 +50,9 @@ RUN cmake -S . -B build -G Ninja \
            for f in $(ls -t /opt/vcpkg/buildtrees/*/*-err.log 2>/dev/null | head -3); do \
              echo "--- $f ---"; tail -n 60 "$f"; done; false; }
 COPY plugins/_compute_runtime/patches/mxl-planar-type.patch /tmp/mxl-planar-type.patch
+COPY plugins/_compute_runtime/patches/mxl-planar-slices.patch /tmp/mxl-planar-slices.patch
 RUN git apply --verbose /tmp/mxl-planar-type.patch \
+ && git apply --verbose /tmp/mxl-planar-slices.patch \
  && cmake --build build -j"$(nproc)" \
  && cmake --install build
 

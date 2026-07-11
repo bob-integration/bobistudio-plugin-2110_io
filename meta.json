@@ -1,7 +1,10 @@
 {
-  "version": "0.39.20",
+  "version": "0.39.21",
   "date": "2026-07-11",
   "changes": {
+    "Chantier tranche (Phase 3) — patch libmxl mxl-planar-slices appliqué (writer multi-slice, 0.39.21)": [
+      "Dockerfile (+ _compute_runtime + staging images.py) : le patch libmxl mxl-planar-slices.patch EXISTAIT dans le repo mais n'était JAMAIS appliqué → le libmxl déployé faisait totalSlices=1 (multi-slice writer absent) malgré l'API reader GetGrainSlice présente. Appliqué après mxl-planar-type : le flowDef porte slice_height (lignes/bande) → grain planar publié en N=hauteur/slice_height tranches égales → commit progressif validSlices=1..N (latence sous-trame). Fondation du chantier mode tranche. REBUILD requis."
+    ],
     "SDP TX conforme sur socle DPDK : export du grandmaster PTP libmtl → a=ts-refclk:ptp (0.39.20)": [
       "patch_ptp_gm_export.py + mtl_rx.c + controller.py + app/ptp.refclk_from_engine + services/nmos : en full-PF DPDK le ptp4l kernel n'existe plus (PTP dans libmtl) → pmc aveugle → SDP TX sans a=ts-refclk:ptp (non conforme). mt_bobi_ptp_gm exporte l'identité GM (master_port_id.clock_identity, peuplée par ptp_parse_announce), le domaine (t1_domain_number) et l'offset UTC ; gaté sur active + master_initialized (Announce reçu → GM connu) — PAS sur ptp->locked (lock SERVO delta<100ns, distinct de la précision system-clock ; le SDP doit annoncer le GM de référence indépendamment de la précision instantanée, cf. pmc PARENT). mtl_rx.c publie le bloc ptp dans mtl_ports.json, controller.py le relaie :8080, app/ptp.refclk_from_engine le lit, services/nmos bascule dessus en repli de refclk_for_host. SDP TX re-annonce a=ts-refclk:ptp=IEEE1588-2008:<gm>:<domain>. (0.39.19 gatait à tort sur ptp->locked → GM jamais exposé.)"
     ],
