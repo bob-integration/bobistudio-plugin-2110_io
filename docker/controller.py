@@ -1294,6 +1294,12 @@ class AgentHandler(BaseHTTPRequestHandler):
                 if "pt"        in body: t["pt"]        = int(body.get("pt") or 96)
                 if "iface"     in body: t["iface"]     = (body.get("iface") or "").strip() or None
                 if "shm_in"    in body: t["shm_in"]    = (body.get("shm_in") or "").strip() or None
+                # Rythme d'émission : 0 = émission alignée epoch (défaut) ; >0 = grille d'émission
+                # décalée de N µs après l'epoch nominal (mode tranche — l'image part dès que ses
+                # premières tranches sont prêtes). Timestamp RTP inchangé, TROFF déclaré au SDP.
+                if "epoch_shift_us" in body:
+                    try: t["epoch_shift_us"] = max(0, int(body.get("epoch_shift_us") or 0))
+                    except Exception: t["epoch_shift_us"] = 0
                 if "audios" in body:
                     t["audios"] = [{"mcast": a.get("mcast") or None,
                                     "port": int(a.get("port") or 0),
@@ -2027,6 +2033,9 @@ def _tx_session(idx, t, iface=IFACE):
             # Passthrough du balayage : on ré-émet en entrelacé si la source câblée l'est.
             "interlaced": (t.get("scan") == "i"), "field_order": t.get("field_order") or "tff",
             "bit_depth": t["bd"], "ring": t["ring"], "hdr": HDR,
+            # Rythme d'émission (mode tranche) : >0 = grille d'émission décalée de N µs (dans la
+            # signature de session mtl_rx → changement = recréation propre de la session).
+            "epoch_shift_us": int(t.get("epoch_shift_us") or 0),
             # ident_file TOUJOURS présent (sig stable → toggle IDENT sans recréer la session) ;
             # le fichier n'existe que quand l'IDENT est actif (mtl_rx libère le patch sinon).
             "targets": [{"idx": idx, "shm": shm, "stats": "/tmp/mtl_tx{}.json".format(idx),
@@ -2088,6 +2097,12 @@ def _tx_sdp(i, t):
     # si le SDP n'en porte pas.
     ssrc = _ssrc("{}:tx:v:{}".format(HOSTNAME, i))
     ssrc_line = "a=ssrc:{} cname:{}\r\n".format(ssrc, HOSTNAME)
+    # TROFF (ST 2110-21) : déclaré SEULEMENT en émission décalée (epoch_shift_us > 0). Valeur en
+    # ticks d'horloge média (90 kHz) = TROFF standard (43/1125 × période trame ≈ 3440/fps ticks)
+    # + décalage de grille. Sans décalage on n'émet pas la ligne (défaut normatif implicite).
+    _shift_us = int(t.get("epoch_shift_us") or 0)
+    troff_line = ("a=troff:{}\r\n".format(int(round(3440.0 / _fps + _shift_us * 0.09)))
+                  if _shift_us > 0 else "")
     leg0 = (
         "m=video {port} RTP/AVP {pt}\r\n"
         "c=IN IP4 {mcast}/255\r\n"
@@ -2095,12 +2110,13 @@ def _tx_sdp(i, t):
         "{sfilter}"
         "a=rtpmap:{pt} raw/90000\r\n"
         "a=fmtp:{pt} {fmtp}\r\n"
+        "{troff}"
         "{refclk}"
         "a=mediaclk:direct=0\r\n"
         "{ssrc}"
     ).format(port=int(t.get("udp_port") or 0), pt=pt, mcast=t.get("mcast") or "0.0.0.0",
              sfilter=_sf_line(t.get("mcast"), sip),
-             fmtp=fmtp, refclk=_LOCALMAC_REFCLK, ssrc=ssrc_line,
+             fmtp=fmtp, troff=troff_line, refclk=_LOCALMAC_REFCLK, ssrc=ssrc_line,
              mid="a=mid:PRIMARY\r\n" if dual else "")
     grp = "a=group:DUP PRIMARY SECONDARY\r\n" if dual else ""
     sdp = "v=0\r\no=- {origin} IN IP4 {sip}\r\ns={hn} TX{i}\r\nt=0 0\r\n{grp}".format(
@@ -2113,11 +2129,12 @@ def _tx_sdp(i, t):
             "{sfilter}"
             "a=rtpmap:{pt} raw/90000\r\n"
             "a=fmtp:{pt} {fmtp}\r\n"
+            "{troff}"
             "{refclk}"
             "a=mediaclk:direct=0\r\n"
             "{ssrc}"
         ).format(port=int(t["udp_port2"]), pt=pt, mcast=t["mcast2"],
-                 sfilter=_sf_line(t["mcast2"], sip1), fmtp=fmtp,
+                 sfilter=_sf_line(t["mcast2"], sip1), fmtp=fmtp, troff=troff_line,
                  refclk=_LOCALMAC_REFCLK, ssrc=ssrc_line)
         sdp += leg1
     return sdp

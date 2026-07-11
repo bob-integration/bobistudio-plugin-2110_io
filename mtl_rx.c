@@ -313,6 +313,12 @@ struct sess {
   st20p_tx_handle vth;     /* TX */
   int      width, height, bit_depth, interlaced; double fps;
   int      tff;            /* entrelacé : 1=TFF (1080i), 0=BFF (576i) — parité des champs */
+  int      epoch_shift_us; /* TX vidéo EPOCH-SHIFT (0=off) : fenêtre d'émission décalée de +shift µs
+                              APRÈS l'epoch nominal, timestamp RTP restant sur l'epoch NOMINAL — le
+                              récepteur mesure FPT ≈ shift (TROFF ST 2110-21, déclaré dans le SDP par
+                              le contrôleur). Convention bobi libmtl (patch_epoch_shift) : porté par
+                              ops.rtp_timestamp_delta_us NÉGATIF. Une chaîne interne à ~5 ms de phase
+                              évite ainsi de payer +1 trame (« attendre l'image suivante »). */
   size_t   src_framesize; int conv8;
   size_t   shm_slotsize;   /* taille d'un slot shm = TRAME PLEINE (≠ slotsize = taille CHAMP en
                               entrelacé, côté libmtl). 0 ⇒ open_shm retombe sur slotsize (audio/data). */
@@ -1564,6 +1570,11 @@ static int setup_video_slice_tx(struct sess* s) {
   ops.query_frame_lines_ready = tx_sl_lines_ready;
   /* CLASSE 2110-21 PAR SESSION (#26) : même résolution que le chemin whole-frame. */
   ops.pacing = resolve_profile(s->iface);
+  /* EPOCH-SHIFT TX (patch bobi patch_epoch_shift) : delta NÉGATIF ⇒ libmtl décale la grille
+   * d'émission de +epoch_shift_us APRÈS l'epoch nominal et le stamp RTP retombe sur l'epoch
+   * NOMINAL (le récepteur mesure FPT ≈ shift = TROFF). Dans le sig ⇒ changer le shift recrée
+   * la session (le pacing libmtl est figé à la création). */
+  if (s->epoch_shift_us > 0) ops.rtp_timestamp_delta_us = -(int32_t)s->epoch_shift_us;
 
   s->sl_tx = st20_tx_create(s->st, &ops);
   if (!s->sl_tx) {
@@ -1575,6 +1586,9 @@ static int setup_video_slice_tx(struct sess* s) {
           s->width, s->height, s->fps, s->payload_type, s->ssrc, s->mcast, s->udp_port,
           s->tg[0].shm_path, s->bit_depth,
           s->tg[0].has_ident ? " [IDENT ignoré en mode tranche]" : "");
+  if (s->epoch_shift_us > 0)
+    fprintf(stderr, "mtl_rx[video TX SLICE] epoch-shift +%d µs (émission décalée, stamp RTP sur l'epoch nominal)\n",
+            s->epoch_shift_us);
   if (pthread_create(&s->thread, NULL, video_tx_slice_thread, s) != 0) {
     st20_tx_free(s->sl_tx); s->sl_tx = NULL;
     pthread_mutex_destroy(&s->sl_mx); pthread_cond_destroy(&s->sl_cv);
@@ -1628,12 +1642,23 @@ static int setup_video_tx(struct sess* s) {
    * narrow sur un port, wide sur un autre, simultanément. Sous TSC, la classe oriente la cible du
    * pacer logiciel. Le leg redondant (2022-7) suit la même classe (attribut de session). */
   ops.transport_pacing = resolve_profile(s->iface);
+  /* EPOCH-SHIFT TX (patch bobi patch_epoch_shift) : delta NÉGATIF ⇒ libmtl décale la grille
+   * d'émission de +epoch_shift_us APRÈS l'epoch nominal et le stamp RTP retombe sur l'epoch
+   * NOMINAL (le récepteur mesure FPT ≈ shift = TROFF). st20p_tx_ops PORTE bien le champ
+   * (st_pipeline_api.h, relayé tel quel par st20_pipeline_tx.c → st20_tx_ops) — le chemin
+   * whole-frame est donc couvert comme le chemin tranche. En entrelacé le shift s'applique
+   * par CHAMP (la grille libmtl est la grille champ). Dans le sig ⇒ changer le shift recrée
+   * la session (le pacing libmtl est figé à la création). */
+  if (s->epoch_shift_us > 0) ops.rtp_timestamp_delta_us = -(int32_t)s->epoch_shift_us;
 
   s->vth = st20p_tx_create(s->st, &ops);
   if (!s->vth) { fprintf(stderr, "mtl_rx: st20p_tx_create fail (video %s:%d)\n", s->mcast, s->udp_port); return -1; }
   fprintf(stderr, "mtl_rx[video TX] %dx%d%s fps=%.2f pt=%d ssrc=%u → %s:%d (in shm=%s bd%d ring%d)\n",
           s->width, s->height, s->interlaced ? "i" : "p", s->fps, s->payload_type, s->ssrc,
           s->mcast, s->udp_port, s->tg[0].shm_path, s->bit_depth, s->ring);
+  if (s->epoch_shift_us > 0)
+    fprintf(stderr, "mtl_rx[video TX] epoch-shift +%d µs (émission décalée, stamp RTP sur l'epoch nominal)\n",
+            s->epoch_shift_us);
   return pthread_create(&s->thread, NULL, video_tx_thread, s) == 0 ? (s->started = 1, 0) : -1;
 }
 
@@ -2013,6 +2038,8 @@ static int parse_session_into(struct json_object* j, struct sess* s) {
     s->fps=jdbl(j,"fps",25.0); s->interlaced=jint(j,"interlaced",0);
     s->tff = strcmp(jstr(j,"field_order","tff"), "bff") != 0;   /* défaut TFF ; "bff" → 0 */
     s->bit_depth=jint(j,"bit_depth",10);
+    s->epoch_shift_us=jint(j,"epoch_shift_us",0);   /* TX : émission décalée (µs, 0=off, TROFF 2110-21) */
+    if (s->epoch_shift_us < 0) s->epoch_shift_us = 0;
   } else if (s->kind == K_AUDIO) {
     s->channels=jint(j,"channels",8);
     s->a_ptime=jdbl(j,"ptime",1.0);   /* ms ; doit matcher le flux (a=ptime du SDP) */
@@ -2041,10 +2068,11 @@ static int parse_session_into(struct json_object* j, struct sess* s) {
  * on en recrée une (flow RX recyclé, device/XDP intacts ⇒ pas de faute PTP). */
 static void compute_sig(struct sess* s) {
   int n = snprintf(s->sig, sizeof(s->sig),
-                   "%d|%d|%s|%d|%d|%u|%dx%d|%.2f|i%d|f%d|bd%d|r%d|ch%d|ap%.3f|if%s|if2%s|mc2%s|p2%d|",
+                   "%d|%d|%s|%d|%d|%u|%dx%d|%.2f|i%d|f%d|bd%d|r%d|ch%d|ap%.3f|es%d|if%s|if2%s|mc2%s|p2%d|",
                    s->role, s->kind, s->mcast, s->udp_port, s->payload_type, s->ssrc,
                    s->width, s->height, s->fps, s->interlaced, s->tff, s->bit_depth, s->ring,
-                   s->channels, s->a_ptime, s->iface, s->iface_r, s->mcast_r, s->udp_port_r);
+                   s->channels, s->a_ptime, s->epoch_shift_us, s->iface, s->iface_r, s->mcast_r,
+                   s->udp_port_r);
   /* bobi.studio: pour un TX la SOURCE (tg[].shm_path) n'entre PAS dans l'identité de session → la
    * changer ne recrée plus la session (swap à chaud via tx_set_source/tx_take_source, pas de commit
    * RL / dé-lock PTP). Pour un RX les flux de SORTIE font partie de l'identité → on les garde. */

@@ -1,7 +1,13 @@
 {
-  "version": "0.40.2",
+  "version": "0.41.0",
   "date": "2026-07-11",
   "changes": {
+    "EPOCH-SHIFT TX : émission décalée après l'epoch nominal, stamp RTP nominal (TROFF 2110-21, REBUILD requis, 0.41.0)": [
+      "patch_epoch_shift.py (patch libmtl st_header.h + st_tx_video_session.c) : choix PAR SESSION TX entre le comportement historique (« attendre l'image suivante » : l'émission ne peut commencer qu'à la frontière d'epoch → une chaîne interne à ~5 ms de phase paie +1 trame) et l'« émission décalée » : la fenêtre d'émission recule de epoch_shift_us (~2000-8000 µs) APRÈS l'epoch nominal, le timestamp RTP restant sur l'epoch NOMINAL → le récepteur mesure FPT ≈ shift = TROFF ST 2110-21 (déclaré dans le SDP). Convention SANS nouveau champ d'API : ops.rtp_timestamp_delta_us NÉGATIF ⇒ shift = −delta (delta positif = sémantique amont intacte, delta 0 = logique octet-identique).",
+      "Mécanique libmtl : champ int64_t bobi_epoch_shift_ns dans st_tx_video_pacing, posé par tv_init_pacing (clamp frame_time/2), appliqué au POINT UNIQUE tai_from_frame_count → transmission_start_time (fenêtre), tv_sync_pacing (acceptation d'epoch/time_to_tx — sinon chaque trame serait « ratée »), curseurs tsc/ptp donc chemins RL (warm-up, trs_target_tsc) ET TSC/PTP, entrelacé (grille champ) suivent d'un bloc. Les chemins de stamp existants (tv_update_rtp_time_stamp, tv_build_rtp[_chain], y compris ST20_TX_FLAG_RTP_TIMESTAMP_EPOCH) ajoutent le delta négatif → stamp = (nominal+shift)−shift = nominal ; tr_offset JAMAIS grossi (frame_idle_time ~0,04 ms à 1080p50 deviendrait négatif).",
+      "mtl_rx.c : clé de session TX vidéo epoch_shift_us (int µs, défaut 0, clampée ≥0), dans compute_sig (es%d : changer le shift ⇒ recréation de session — pacing libmtl figé à la création), appliquée en whole-frame (st20p_tx_ops.rtp_timestamp_delta_us, relayé tel quel par st20_pipeline_tx) ET en mode tranche (st20_tx_ops) : ops.rtp_timestamp_delta_us = −epoch_shift_us. Log de setup dédié. Audio st30 NON concerné (delta négatif y reculerait le stamp sans décaler la grille — ne pas l'y poser).",
+      "Dockerfile + staging images.py : patch_epoch_shift.py copié/exécuté après patch_ptp_gm_export (build UI inclus). Patch vérifié sur le SHA épinglé 32b1b4e9 (ancres exactes, idempotent, fail-fast si source MTL modifiée)."
+    ],
     "Gel d'image TX tranche : source figée rejouée au pacing (0.40.2)": [
       "mtl_rx.c : un slot TX slice à source FIGÉE publiait sporadiquement (3 trames puis rien) → la lib abandonnait des trames sans frame_done → churn du watchdog anneau toutes les 2 s, sortie ~1,5 fps. Sémantique whole-frame restaurée : timeout de grain frais (~1,25 période) → REJOUE le dernier grain complet de la tête, contre-pression par le ring fb → cadence nominale, lib alimentée en continu. next_fi inchangé (reprise immédiate au grain frais). REBUILD requis."
     ],

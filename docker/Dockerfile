@@ -102,6 +102,10 @@ COPY patch_igmp_router_alert.py /tmp/patch_igmp_router_alert.py
 COPY patch_ptp_mcast_flow.py /tmp/patch_ptp_mcast_flow.py
 COPY patch_ptp_stable_getter.py /tmp/patch_ptp_stable_getter.py
 COPY patch_ptp_gm_export.py /tmp/patch_ptp_gm_export.py
+# Patch bobi.studio EPOCH-SHIFT TX (chantier latence) : ops.rtp_timestamp_delta_us NÉGATIF ⇒ la
+# fenêtre d'émission de la session est décalée de −delta APRÈS l'epoch nominal, le timestamp RTP
+# restant sur l'epoch NOMINAL (TROFF ST 2110-21, FPT ≈ shift côté récepteur). Delta ≥ 0 inchangé.
+COPY patch_epoch_shift.py /tmp/patch_epoch_shift.py
 # MTL_REF est un SHA (pas une branche) → clone + fetch ciblé (GitHub sert les SHA joignables).
 RUN mkdir -p /src/MTL && cd /src/MTL \
  && git init -q && git remote add origin https://github.com/OpenVisualCloud/Media-Transport-Library \
@@ -116,6 +120,7 @@ RUN mkdir -p /src/MTL && cd /src/MTL \
  && python3 /tmp/patch_ptp_mcast_flow.py \
  && python3 /tmp/patch_ptp_stable_getter.py \
  && python3 /tmp/patch_ptp_gm_export.py \
+ && python3 /tmp/patch_epoch_shift.py \
  && MTL_PREFIX_ARGS="-Dtests=false" ./script/build_dpdk.sh -f \
  && ./build.sh || true \
  && ldconfig \
