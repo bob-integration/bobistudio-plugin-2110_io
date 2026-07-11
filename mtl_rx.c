@@ -1435,6 +1435,8 @@ static void* video_tx_slice_thread(void* arg) {
       continue;
     }
     s->sl_wedge_ns = 0;                      /* un slot s'est libéré : anneau vivant */
+    uint8_t* fb = st20_tx_get_framebuffer(s->sl_tx, idx);
+    if (!fb) { usleep(5000); continue; }
     /* viser le grain de tête (rattrape si on est en retard ; jamais en arrière) */
     mxlFlowRuntimeInfo rt;
     mxlStatus stx = mxlFlowReaderGetRuntimeInfo(t->reader, &rt);
@@ -1446,19 +1448,43 @@ static void* video_tx_slice_thread(void* arg) {
       usleep(5000); continue;
     }
     if (!fi_init || next_fi < rt.headIndex) { next_fi = rt.headIndex; fi_init = 1; }
-    /* 1ʳᵉ tranche du grain visé (borné 2 périodes ; réveil par le commit du producteur) */
+    /* 1ʳᵉ tranche du grain visé (borné ~1 période ; réveil par le commit du producteur) */
     mxlGrainInfo gi; uint8_t* pay;
-    stx = mxlFlowReaderGetGrainSlice(t->reader, next_fi, 1, period_ns * 2, &gi, &pay);
+    stx = mxlFlowReaderGetGrainSlice(t->reader, next_fi, 1, period_ns + period_ns / 4, &gi, &pay);
     uint64_t tnow = mono_ns();
     t->alive_ns = tnow;
     if (stx != MXL_STATUS_OK) {
       if (stx == MXL_ERR_FLOW_NOT_FOUND || stx == MXL_ERR_FLOW_INVALID) {
         mxlReleaseFlowReader(g_mxl, t->reader); t->reader = NULL; continue;
       }
-      /* timeout : producteur muet OU flux périmé (redéployé sous le même nom, tête figée) —
-       * la détection stale standard voit la tête ne plus avancer → GC + réouverture par nom. */
+      /* Timeout : producteur muet/figé. SÉMANTIQUE GEL D'IMAGE (durcissement 0.40.2, iso
+       * whole-frame reader_latest) : REJOUER le dernier grain COMPLET de la tête au pacing de
+       * sortie — le ring fb fait la contre-pression (un slot ne se libère qu'à l'émission d'une
+       * trame) → cadence nominale tenue, la lib reste ALIMENTÉE en continu (l'alimentation
+       * sporadique d'un slot à source figée provoquait des trames abandonnées sans frame_done →
+       * churn du watchdog anneau toutes les 2 s, sortie à ~1,5 fps — banc 2026-07-11). La
+       * détection stale standard (tête figée) continue de tenter GC + réouverture par nom. */
+      stx = mxlFlowReaderGetGrainNonBlocking(t->reader, rt.headIndex, &gi, &pay);
+      if (stx != MXL_STATUS_OK) {               /* pas même un grain complet : slot muet */
+        tx_reopen_if_stale(t, rt.headIndex, tnow);
+        continue;
+      }
+      uint16_t total_r = gi.totalSlices ? gi.totalSlices : 1;
+      uint32_t slh_r = (uint32_t)H / total_r; if (!slh_r) { slh_r = (uint32_t)H; total_r = 1; }
+      size_t _gsr = (size_t)gi.grainSize;
+      int src8_r = (_gsr > 0 && _gsr == (size_t)2 * (size_t)W * (size_t)H);
+      s->sl_fb[idx].lines_ready = 0;
+      s->sl_fb[idx].stat = 1;
+      s->sl_fb_prod = (uint16_t)((idx + 1) % s->sl_fb_cnt);
+      for (uint16_t k = 1; k <= total_r; k++) {
+        uint32_t l0 = (uint32_t)(k - 1) * slh_r;
+        uint32_t nl = (k == total_r) ? (uint32_t)H - l0 : slh_r;
+        sl_pack_band(s, pay, src8_r, l0, nl, fb);
+        s->sl_fb[idx].lines_ready = l0 + nl;
+      }
+      t->recv++;                                /* trame (gelée) émise — fps reste nominal */
       tx_reopen_if_stale(t, rt.headIndex, tnow);
-      continue;                                 /* rien à émettre : aucune trame publiée à la lib */
+      continue;                                 /* next_fi inchangé : reprise au grain frais */
     }
     uint16_t total = gi.totalSlices ? gi.totalSlices : 1;
     uint32_t slice_h = (uint32_t)H / total;
@@ -1472,8 +1498,6 @@ static void* video_tx_slice_thread(void* arg) {
               t->shm_path, _gs, (unsigned)total, (unsigned)slice_h, src8);
       t->dbg_depth_logged = 1;
     }
-    uint8_t* fb = st20_tx_get_framebuffer(s->sl_tx, idx);
-    if (!fb) { usleep(5000); continue; }
     /* publier le framebuffer (remplissage progressif : la lib émettra au fil de lines_ready) */
     s->sl_fb[idx].lines_ready = 0;
     s->sl_fb[idx].stat = 1;

@@ -1,7 +1,10 @@
 {
-  "version": "0.40.1",
+  "version": "0.40.2",
   "date": "2026-07-11",
   "changes": {
+    "Gel d'image TX tranche : source figée rejouée au pacing (0.40.2)": [
+      "mtl_rx.c : un slot TX slice à source FIGÉE publiait sporadiquement (3 trames puis rien) → la lib abandonnait des trames sans frame_done → churn du watchdog anneau toutes les 2 s, sortie ~1,5 fps. Sémantique whole-frame restaurée : timeout de grain frais (~1,25 période) → REJOUE le dernier grain complet de la tête, contre-pression par le ring fb → cadence nominale, lib alimentée en continu. next_fi inchangé (reprise immédiate au grain frais). REBUILD requis."
+    ],
     "Durcissement TX tranche : watchdog anneau framebuffer (0.40.1)": [
       "mtl_rx.c video_tx_slice_thread : la lib peut abandonner une trame sans notify_frame_done (échec transmit sous churn de source) → slot stat=1 orphelin → au 3e, deadlock (get_next_frame -EBUSY en boucle, build ret -203, 0 fps jusqu'au restart daemon — vu au banc mv 2026-07-11). Watchdog : aucun slot libéré pendant 2 s ET tous occupés → resync de l'anneau (tous FREE, cons=prod, log) → reprise au grain de tête suivant. REBUILD requis."
     ],
