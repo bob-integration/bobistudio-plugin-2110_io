@@ -88,6 +88,9 @@ static uint64_t g_tx_add_grace_ns = 0;   /* mono_ns jusqu'auquel le backstop TX 
  * que mt_ptp_wait_stable). GM absent → le daemon attend sans churn (log « not connected » 10 s) ;
  * lock → TX démarre et le backstop se réarme pour son vrai rôle (queue morte). */
 extern bool mt_bobi_ptp_stable(void* impl, int port);
+/* bobi.studio: grandmaster PTP interne libmtl (patch_ptp_gm_export) → publié dans mtl_ports.json
+ * pour que l'orchestrateur construise a=ts-refclk:ptp du SDP TX quand ptp4l kernel est absent. */
+extern bool mt_bobi_ptp_gm(void* impl, int port, unsigned char* out_id8, int* out_domain, int* out_utc);
 static int g_engine_ptp = 0;             /* 1 = ENGINE_PTP=libmtl actif (PTP interne sur port DPDK) */
 
 static uint64_t now_ns(void) {
@@ -1703,7 +1706,21 @@ static void write_port_stats(mtl_handle st) {
       (unsigned long long)ps.rx_err_packets,        (unsigned long long)ps.tx_err_packets,
       (unsigned long long)ps.rx_hw_dropped_packets, (unsigned long long)ps.rx_nombuf_packets);
   }
-  fprintf(f, "]}\n");
+  fprintf(f, "]");
+  /* bobi.studio: grandmaster PTP libmtl (port 0) → l'orchestrateur construit a=ts-refclk:ptp du
+   * SDP TX quand ptp4l kernel est absent (socle DPDK, PTP dans le moteur). gm_identity au format
+   * SDP (XX-XX-…-XX). Absent/locked:false si le PTP interne n'est pas verrouillé. */
+  {
+    unsigned char gm[8]; int dom = 0, utc = 0;
+    if (mt_bobi_ptp_gm(st, 0, gm, &dom, &utc)) {
+      fprintf(f, ", \"ptp\": {\"locked\": true, \"domain\": %d, \"utc_offset\": %d, "
+                 "\"gm_identity\": \"%02X-%02X-%02X-%02X-%02X-%02X-%02X-%02X\"}",
+              dom, utc, gm[0], gm[1], gm[2], gm[3], gm[4], gm[5], gm[6], gm[7]);
+    } else {
+      fprintf(f, ", \"ptp\": {\"locked\": false}");
+    }
+  }
+  fprintf(f, "}\n");
   fclose(f);
   rename(tmp, "/tmp/mtl_ports.json");
 }

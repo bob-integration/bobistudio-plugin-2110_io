@@ -1184,6 +1184,11 @@ class MetricsHandler(BaseHTTPRequestHandler):
                             "hw_max_combined":     hw_q["max"]          if hw_q else None,
                             "hw_current_combined": hw_q["current"]       if hw_q else None,
                             "hw_xdp_available":    hw_q["xdp_available"] if hw_q else None}}
+        # Grandmaster PTP interne libmtl (mtl_ports.json:ptp, socle DPDK) → l'orchestrateur
+        # construit a=ts-refclk:ptp du SDP TX quand ptp4l kernel est absent. Relais brut.
+        _pj = _mtl_ports_read() or {}
+        if isinstance(_pj, dict) and _pj.get("ptp"):
+            payload["ptp"] = _pj["ptp"]
         self.wfile.write(json.dumps(payload).encode())
     def log_message(self, *a): pass
 
