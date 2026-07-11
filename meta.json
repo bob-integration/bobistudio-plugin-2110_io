@@ -1,7 +1,10 @@
 {
-  "version": "0.39.21",
+  "version": "0.40.0",
   "date": "2026-07-11",
   "changes": {
+    "Mode tranche (SLICE_MODE=1) : RX/TX raw st20 par tranches — latence sous-trame (0.40.0)": [
+      "mtl_rx.c : chemin vidéo PROGRESSIF env-gaté (SLICE_MODE=1, défaut OFF = whole-frame st20p inchangé ; entrelacé/audio/ANC inchangés). RX : ST20_TYPE_SLICE_LEVEL + notify_slice_ready (lcore, non bloquant) → worker convertit RFC4175 BE10→planar PAR BANDE (SIMD st_convert) directement dans le grain MXL (OpenGrain à la 1ʳᵉ tranche) et committe validSlices=1..N au fil des tranches reçues (SLICE_LINES lignes/tranche, défaut 36 → doit diviser height, sinon repli whole-frame). Le flowDef porte slice_height (patch mxl-planar-slices 0.39.21). Trame incomplète (perte fil) : finalisée en l'état + compteur (jamais de grain partiel bloquant). TX : ST20_TYPE_SLICE_LEVEL + query_frame_lines_ready → worker suit le grain de TÊTE source via mxlFlowReaderGetGrainSlice (réveil PAR COMMIT producteur), packe planar→BE10 par bande dans le framebuffer et publie lines_ready → l'émission démarre AVANT la fin d'écriture amont. Pas de tranche source (totalSlices=1, producteur whole-frame) → dégradation propre en trame pleine. Profondeur source par grain (8→10 up-shift via scratch). IDENT ignoré en mode tranche (overlay = espace trame). Compat lecteurs : GetGrain[NonBlocking] = GetGrainSlice(ALL) → les consommateurs whole-frame ne voient JAMAIS un grain partiel. Gain attendu ~19 ms/étage (banc slice_bench 2026-07-11 : 1ʳᵉ tranche 0,77 ms vs trame pleine 20,13 ms). REBUILD requis."
+    ],
     "Chantier tranche (Phase 3) — patch libmxl mxl-planar-slices appliqué (writer multi-slice, 0.39.21)": [
       "Dockerfile (+ _compute_runtime + staging images.py) : le patch libmxl mxl-planar-slices.patch EXISTAIT dans le repo mais n'était JAMAIS appliqué → le libmxl déployé faisait totalSlices=1 (multi-slice writer absent) malgré l'API reader GetGrainSlice présente. Appliqué après mxl-planar-type : le flowDef porte slice_height (lignes/bande) → grain planar publié en N=hauteur/slice_height tranches égales → commit progressif validSlices=1..N (latence sous-trame). Fondation du chantier mode tranche. REBUILD requis."
     ],

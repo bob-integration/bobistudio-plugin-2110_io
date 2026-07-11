@@ -36,6 +36,7 @@
 #include <mtl/st_pipeline_api.h>
 #include <mtl/st30_pipeline_api.h>
 #include <mtl/st40_pipeline_api.h>
+#include <mtl/st_convert_api.h>   /* mode tranche : conversions SIMD RFC4175↔planar PAR BANDE */
 #include <json-c/json.h>
 
 /* ── MXL (Media eXchange Layer) ── le moteur produit/consomme des FLOWS MXL (grains vidéo/data,
@@ -348,7 +349,52 @@ struct sess {
   double   tp_cinst_sum, tp_vrx_sum; /* Σ des moyennes/trame (÷ tp_cnt = moyenne de fenêtre) */
   int32_t  tp_fpt, tp_latency; /* dernières valeurs (ns) de la fenêtre */
   uint32_t tp_cnt;             /* nb de trames échantillonnées dans la fenêtre */
+  /* ── MODE TRANCHE (SLICE_MODE=1, vidéo PROGRESSIVE uniquement) — latence sous-trame ──
+   * RX : API raw st20 (ST20_TYPE_SLICE_LEVEL) → conversion RFC4175→planar PAR BANDE + commit MXL
+   * progressif (validSlices=1..N, cf. patch mxl-planar-slices) au fil des tranches reçues.
+   * TX : raw st20 aussi → lecture mxlFlowReaderGetGrainSlice (réveil PAR TRANCHE) + remplissage
+   * progressif du framebuffer, la lib interroge lines_ready (query_frame_lines_ready).
+   * Env-gaté (défaut OFF = chemin whole-frame st20p inchangé) ; entrelacé/audio/data inchangés.
+   * Convention validSlices (contrat producteur↔consommateur, cf. slice_bench) : k tranches
+   * valides ⇔ lignes image [0, k·slice_lines) écrites SUR LES 3 PLANS (Y, Cb, Cr). */
+  int slice_on;                /* session vidéo en mode tranche */
+  int slice_lines;             /* lignes par tranche (RX : SLICE_LINES, doit diviser height) */
+  st20_rx_handle sl_rx;        /* RX raw st20 (remplace vh en mode tranche) */
+  st20_tx_handle sl_tx;        /* TX raw st20 (remplace vth en mode tranche) */
+  pthread_mutex_t sl_mx; pthread_cond_t sl_cv;   /* réveil du worker par les callbacks lcore */
+#define SL_Q 8                 /* trames en vol max (= framebuff_cnt clampé) */
+  /* RX : trames en vol. Les callbacks lcore (non bloquants) posent frame+lignes reçues sous sl_mx ;
+   * le worker convertit/commit. Champs « worker » hors verrou (seul le worker y touche). */
+  struct sl_inflight {
+    void*    frame;            /* framebuffer libmtl (RFC4175 BE10 packé) ; NULL = slot libre */
+    uint64_t timestamp;        /* meta->timestamp (posé à la 1ʳᵉ tranche) */
+    enum st10_timestamp_fmt tfmt;
+    uint32_t recv_lines;       /* lignes reçues (mis à jour par les callbacks, sous sl_mx) */
+    int      complete;         /* notify_frame_ready passé (trame close côté lib) */
+    uint64_t seq;              /* ordre d'arrivée (le worker traite la plus ancienne d'abord) */
+    /* état worker */
+    uint32_t conv_lines;       /* lignes déjà converties/commitées */
+    int      opened;           /* grains MXL ouverts (à la 1ʳᵉ tranche) */
+    uint64_t fi, mts;          /* index de grain + timestamp média TAI */
+    mxlGrainInfo gi[MAX_TG]; uint8_t* payload[MAX_TG];
+  } sl_q[SL_Q];
+  uint64_t sl_seq;             /* générateur d'ordre d'arrivée */
+  uint32_t sl_drop;            /* trames jetées (pas de slot / OpenGrain KO) */
+  /* TX : framebuffers raw. Le worker remplit progressivement ; la lib consomme (get_next_frame)
+   * et interroge lines_ready. stat : 0=FREE (à remplir) 1=READY (en remplissage ou en vol). */
+  struct sl_txfb { volatile int stat; volatile uint32_t lines_ready; } sl_fb[SL_Q];
+  uint16_t sl_fb_cnt, sl_fb_prod, sl_fb_cons;
+  uint8_t* sl_scratch;         /* TX source 8-bit : bande planar10 up-shiftée avant pack SIMD */
 };
+
+/* Mode tranche demandé (SLICE_MODE=1) + géométrie de tranche (SLICE_LINES, défaut 36 lignes —
+ * divise 1080/720/2160 ; 1080p → 30 tranches, réveil consommateur toutes les ~0,6 ms à 50p). */
+static int slice_wanted(void) { const char* e = getenv("SLICE_MODE"); return e && atoi(e); }
+static int slice_lines_env(void) {
+  const char* e = getenv("SLICE_LINES");
+  int v = e ? atoi(e) : 0;
+  return v > 0 ? v : 36;
+}
 
 /* ── flowDef MXL (ressource Flow NMOS IS-04) — mêmes champs/conventions que bobimxl.build_*. ── */
 static void jcomp(struct json_object* arr, const char* nm, int w, int h, int bd) {
@@ -395,6 +441,11 @@ static char* build_video_flowdef(struct sess* s, struct target* t) {
    * field_height reste pleine (libmxl fait le /2). */
   json_object_object_add(o, "interlace_mode", json_object_new_string(
       s->interlaced ? (s->tff ? "interlaced_tff" : "interlaced_bff") : "progressive"));
+  /* MODE TRANCHE : slice_height (extension bobi.studio du patch mxl-planar-slices) → libmxl
+   * publie le grain en N = height/slice_height tranches (totalSlices) → commit progressif
+   * validSlices=1..N. Absent (whole-frame) → 1 tranche, comportement historique. */
+  if (s->slice_on && s->role == ROLE_RX)
+    json_object_object_add(o, "slice_height", json_object_new_int(s->slice_lines));
   json_object_object_add(o, "colorspace", json_object_new_string("BT709"));
   struct json_object* comps = json_object_new_array();
   jcomp(comps, "Y",  s->width,     s->height, s->bit_depth);
@@ -663,6 +714,160 @@ static void* video_rx_thread(void* arg) {
   return NULL;
 }
 
+/* ═══ VIDÉO RX MODE TRANCHE (SLICE_MODE=1, progressive) ════════════════════════
+ * API raw st20 (ST20_TYPE_SLICE_LEVEL) : libmtl notifie CHAQUE tranche reçue (notify_slice_ready,
+ * contexte lcore tasklet, non bloquant). Les callbacks ne font que poser frame+lignes sous sl_mx
+ * et signaler ; le worker (video_rx_slice_thread) convertit RFC4175 BE10 → planar PAR BANDE
+ * (SIMD libmtl) directement dans le grain MXL (OpenGrain à la 1ʳᵉ tranche) et committe
+ * validSlices=k au fil de l'eau → le consommateur get_slice se réveille PAR TRANCHE (~0,6 ms
+ * après l'arrivée fil de la bande, vs ~20 ms trame pleine — banc slice_bench 2026-07-11). */
+
+/* Slot en vol pour `frame` ; create=1 → en réclame un libre. Appelé sous sl_mx. */
+static struct sl_inflight* sl_find(struct sess* s, void* frame, int create) {
+  int n = s->sl_fb_cnt > 0 && s->sl_fb_cnt < SL_Q ? s->sl_fb_cnt : SL_Q;
+  for (int i = 0; i < n; i++) if (s->sl_q[i].frame == frame) return &s->sl_q[i];
+  if (!create) return NULL;
+  for (int i = 0; i < n; i++)
+    if (!s->sl_q[i].frame) {
+      struct sl_inflight* e = &s->sl_q[i];
+      memset(e, 0, sizeof(*e));
+      e->frame = frame; e->seq = ++s->sl_seq;
+      return e;
+    }
+  return NULL;
+}
+
+/* lcore tasklet : une tranche de plus est complète pour `frame` (meta->frame_recv_lines cumulées). */
+static int rx_sl_slice_ready(void* priv, void* frame, struct st20_rx_slice_meta* meta) {
+  struct sess* s = priv;
+  pthread_mutex_lock(&s->sl_mx);
+  struct sl_inflight* e = sl_find(s, frame, 1);
+  if (e) {
+    if (!e->timestamp) { e->timestamp = meta->timestamp; e->tfmt = meta->tfmt; }
+    if (meta->frame_recv_lines > e->recv_lines) e->recv_lines = meta->frame_recv_lines;
+    pthread_cond_signal(&s->sl_cv);
+  }
+  pthread_mutex_unlock(&s->sl_mx);
+  return 0;
+}
+
+/* lcore tasklet : trame close côté lib (ownership → app ; st20_rx_put_framebuff au finalize).
+ * Trame INCOMPLÈTE (perte fil, flag RECEIVE_INCOMPLETE_FRAME) : les tranches déjà commitées ne se
+ * dé-committent pas → on finalise telle quelle (compteur sl_drop) plutôt que bloquer les readers. */
+static int rx_sl_frame_ready(void* priv, void* frame, struct st20_rx_frame_meta* meta) {
+  struct sess* s = priv;
+  if (s->tp_enabled) accum_tp(s, meta->tp[MTL_SESSION_PORT_P]);
+  pthread_mutex_lock(&s->sl_mx);
+  struct sl_inflight* e = sl_find(s, frame, 1);
+  if (!e) { s->sl_drop++; pthread_mutex_unlock(&s->sl_mx); return -EIO; }   /* lib re-put le frame */
+  if (!e->timestamp) { e->timestamp = meta->timestamp; e->tfmt = meta->tfmt; }
+  if (st_is_frame_complete(meta->status)) e->recv_lines = (uint32_t)s->height;
+  else s->sl_drop++;                       /* incomplète : commit en l'état (jamais de blocage lecteur) */
+  e->complete = 1;
+  pthread_cond_signal(&s->sl_cv);
+  pthread_mutex_unlock(&s->sl_mx);
+  return 0;
+}
+
+/* Copie de bande planar (fan-out cible 2..N : la conversion SIMD n'est faite qu'une fois). */
+static void sl_copy_band(uint8_t* dst, const uint8_t* src, int W, int H, int conv8,
+                         uint32_t l0, uint32_t nl) {
+  size_t ybps = conv8 ? 1 : 2;                 /* octets/échantillon */
+  size_t yln = (size_t)W * ybps, cln = (size_t)(W / 2) * ybps;
+  size_t yoff = (size_t)l0 * yln, coff = (size_t)l0 * cln;
+  size_t ypl = (size_t)H * yln, cpl = (size_t)H * cln;
+  memcpy(dst + yoff, src + yoff, (size_t)nl * yln);                          /* Y  */
+  memcpy(dst + ypl + coff, src + ypl + coff, (size_t)nl * cln);              /* Cb */
+  memcpy(dst + ypl + cpl + coff, src + ypl + cpl + coff, (size_t)nl * cln);  /* Cr */
+}
+
+/* Worker : convertit les bandes disponibles de la trame en vol la plus ANCIENNE et committe
+ * progressivement. Trame complète → commit final (validSlices=totalSlices) + put_framebuff. */
+static void* video_rx_slice_thread(void* arg) {
+  struct sess* s = arg;
+  int W = s->width, H = s->height, L = s->slice_lines;
+  size_t bpl_be = ((size_t)W / 2) * 5;         /* RFC4175 422-10 : pg2 = 2 px = 5 octets */
+  while (!s->stop) {
+    /* attendre du travail : la plus ancienne trame en vol avec des lignes non converties */
+    pthread_mutex_lock(&s->sl_mx);
+    struct sl_inflight* e = NULL;
+    for (;;) {
+      uint64_t best = UINT64_MAX; e = NULL;
+      int n = s->sl_fb_cnt > 0 && s->sl_fb_cnt < SL_Q ? s->sl_fb_cnt : SL_Q;
+      for (int i = 0; i < n; i++) {
+        struct sl_inflight* q = &s->sl_q[i];
+        if (!q->frame) continue;
+        if ((q->recv_lines > q->conv_lines || q->complete) && q->seq < best) { best = q->seq; e = q; }
+      }
+      if (e || s->stop) break;
+      struct timespec tw; clock_gettime(CLOCK_REALTIME, &tw);
+      tw.tv_nsec += 50 * 1000000;
+      if (tw.tv_nsec >= 1000000000) { tw.tv_sec++; tw.tv_nsec -= 1000000000; }
+      pthread_cond_timedwait(&s->sl_cv, &s->sl_mx, &tw);
+    }
+    uint32_t recv = e ? e->recv_lines : 0;
+    int complete = e ? e->complete : 0;
+    pthread_mutex_unlock(&s->sl_mx);
+    if (s->stop) break;
+    if (!e) continue;
+
+    if (!e->opened) {                          /* 1ʳᵉ bande : index TAI + OpenGrain (sous-trame) */
+      e->mts = media_ts_to_tai(s->st, e->tfmt, e->timestamp, MEDIA_CLK_VIDEO);
+      e->fi = e->mts ? mxlTimestampToIndex(&s->mrate, e->mts) : mxlGetCurrentIndex(&s->mrate);
+      for (int ti = 0; ti < s->ntg; ti++)
+        if (mxlFlowWriterOpenGrain(s->tg[ti].writer, e->fi, &e->gi[ti], &e->payload[ti]) != MXL_STATUS_OK)
+          e->payload[ti] = NULL;
+      e->opened = 1;
+    }
+    uint32_t upto = complete ? (uint32_t)H : recv - (recv % (uint32_t)L);
+    if (upto > (uint32_t)H) upto = (uint32_t)H;
+    if (upto > e->conv_lines) {
+      uint32_t l0 = e->conv_lines, nl = upto - l0;
+      int ref = -1;
+      for (int ti = 0; ti < s->ntg; ti++) if (e->payload[ti]) { ref = ti; break; }
+      if (ref >= 0) {
+        const uint8_t* src = (const uint8_t*)e->frame + (size_t)l0 * bpl_be;
+        uint8_t* pay = e->payload[ref];
+        if (s->conv8) {
+          uint8_t* y = pay + (size_t)l0 * W;
+          uint8_t* b = pay + (size_t)W * H + (size_t)l0 * (W / 2);
+          uint8_t* r = pay + (size_t)W * H * 3 / 2 + (size_t)l0 * (W / 2);
+          st20_rfc4175_422be10_to_yuv422p8((struct st20_rfc4175_422_10_pg2_be*)src, y, b, r, W, (int)nl);
+        } else {
+          uint16_t* y = (uint16_t*)(pay + (size_t)l0 * W * 2);
+          uint16_t* b = (uint16_t*)(pay + (size_t)W * H * 2 + (size_t)l0 * W);
+          uint16_t* r = (uint16_t*)(pay + (size_t)W * H * 3 + (size_t)l0 * W);
+          st20_rfc4175_422be10_to_yuv422p10le((struct st20_rfc4175_422_10_pg2_be*)src, y, b, r,
+                                              (uint32_t)W, nl);
+        }
+        for (int ti = 0; ti < s->ntg; ti++) {
+          if (ti == ref || !e->payload[ti]) continue;
+          sl_copy_band(e->payload[ti], pay, W, H, s->conv8, l0, nl);
+        }
+        for (int ti = 0; ti < s->ntg; ti++) {
+          if (!e->payload[ti]) continue;
+          e->gi[ti].validSlices = (uint16_t)(upto / (uint32_t)L);
+          if (complete && upto >= (uint32_t)H) e->gi[ti].validSlices = e->gi[ti].totalSlices;
+          mxlFlowWriterCommitGrain(s->tg[ti].writer, &e->gi[ti]);   /* commit PROGRESSIF (1..N) */
+        }
+      }
+      e->conv_lines = upto;
+    }
+    if (complete && e->conv_lines >= (uint32_t)H) {   /* finalize */
+      for (int ti = 0; ti < s->ntg; ti++) {
+        if (!e->payload[ti]) continue;
+        accum_rx_latency(&s->tg[ti], e->mts);
+        s->tg[ti].index = e->fi; s->tg[ti].recv++;
+      }
+      st20_rx_put_framebuff(s->sl_rx, e->frame);
+      pthread_mutex_lock(&s->sl_mx);
+      e->frame = NULL;                                /* libère le slot (callbacks sous sl_mx) */
+      pthread_mutex_unlock(&s->sl_mx);
+    }
+  }
+  return NULL;
+}
+
 /* ═══ AUDIO ═══════════════════════════════════════════════════════════════════ */
 /* st30p délivre le payload L24 du fil = BIG-ENDIAN, entrelacé par échantillon (chs canaux × 3 o).
  * On le CONVERTIT en samples float32 par canal (contrat MXL audio/float32) et on l'écrit dans le
@@ -757,7 +962,87 @@ static void _abort_video_setup(struct sess* s) {
   if (s->vh) { st20p_rx_free(s->vh); s->vh = NULL; }
 }
 
+/* Setup RX vidéo MODE TRANCHE (raw st20, ST20_TYPE_SLICE_LEVEL). Prérequis vérifiés par
+ * l'appelant : SLICE_MODE=1, progressive, height divisible par SLICE_LINES. */
+static int setup_video_slice_rx(struct sess* s) {
+  s->slice_on = 1;
+  s->slice_lines = slice_lines_env();
+  s->conv8 = (s->bit_depth == 8);
+  if (s->ring < 2) s->ring = 2; if (s->ring > SL_Q) s->ring = SL_Q;
+  s->src_framesize = ((size_t)s->width / 2) * 5 * (size_t)s->height;   /* RFC4175 BE10 packé */
+  s->slotsize = (size_t)(s->conv8 ? 2 : 4) * (size_t)s->width * (size_t)s->height;  /* grain planar */
+  s->shm_slotsize = s->slotsize;
+  s->mrate = fps_to_rational(s->fps);
+  pthread_mutex_init(&s->sl_mx, NULL); pthread_cond_init(&s->sl_cv, NULL);
+  s->sl_fb_cnt = (uint16_t)s->ring;
+
+  struct st20_rx_ops ops; memset(&ops, 0, sizeof(ops));
+  ops.name = "bobi_mtl_v_sl";
+  ops.priv = s;
+  ops.num_port = s->num_leg;
+  inet_pton(AF_INET, s->mcast, ops.ip_addr[MTL_SESSION_PORT_P]);
+  snprintf(ops.port[MTL_SESSION_PORT_P], MTL_PORT_MAX_LEN, "%s", s->portname);
+  ops.udp_port[MTL_SESSION_PORT_P] = s->udp_port;
+  if (s->num_leg == 2) {   /* 2022-7 : 2ᵉ patte red/blue */
+    inet_pton(AF_INET, s->mcast_r, ops.ip_addr[MTL_SESSION_PORT_R]);
+    snprintf(ops.port[MTL_SESSION_PORT_R], MTL_PORT_MAX_LEN, "%s", s->portname_r);
+    ops.udp_port[MTL_SESSION_PORT_R] = s->udp_port_r;
+  }
+  ops.payload_type = s->payload_type;
+  ops.width = s->width; ops.height = s->height; ops.fps = to_st_fps(s->fps);
+  ops.interlaced = false;
+  ops.fmt = ST20_FMT_YUV_422_10BIT;
+  ops.type = ST20_TYPE_SLICE_LEVEL;
+  ops.slice_lines = (uint32_t)s->slice_lines;
+  ops.framebuff_cnt = (uint16_t)s->ring;
+  ops.notify_frame_ready = rx_sl_frame_ready;
+  ops.notify_slice_ready = rx_sl_slice_ready;
+  /* trame incomplète notifiée quand même : les tranches déjà commitées ne se dé-committent pas,
+   * on FINALISE en l'état plutôt que laisser un grain partiel bloquer les lecteurs whole-frame. */
+  ops.flags = ST20_RX_FLAG_RECEIVE_INCOMPLETE_FRAME;
+  if (tp_wanted()) { ops.flags |= ST20_RX_FLAG_TIMING_PARSER_META; s->tp_enabled = 1; s->tp_worst = -1; }
+
+  s->sl_rx = st20_rx_create(s->st, &ops);
+  if (!s->sl_rx) {
+    fprintf(stderr, "mtl_rx: st20_rx_create SLICE fail (video %s:%d)\n", s->mcast, s->udp_port);
+    pthread_mutex_destroy(&s->sl_mx); pthread_cond_destroy(&s->sl_cv);
+    return -1;
+  }
+  if (open_targets(s) != 0) {
+    for (int ti = 0; ti < s->ntg; ti++)
+      if (s->tg[ti].writer) { mxlReleaseFlowWriter(g_mxl, s->tg[ti].writer); s->tg[ti].writer = NULL; }
+    st20_rx_free(s->sl_rx); s->sl_rx = NULL;
+    pthread_mutex_destroy(&s->sl_mx); pthread_cond_destroy(&s->sl_cv);
+    return -1;
+  }
+  int hi = 0;
+  for (int ti = 0; ti < s->ntg; ti++) if (s->tg[ti].has_ident) hi = 1;
+  fprintf(stderr, "mtl_rx[video RX SLICE] %dx%dp fps=%.2f pt=%d mc=%s:%d tranche=%d lignes (%d/trame)"
+          " ring=%d%s → %d cible(s):", s->width, s->height, s->fps, s->payload_type, s->mcast,
+          s->udp_port, s->slice_lines, s->height / s->slice_lines, s->ring,
+          hi ? " [IDENT ignoré en mode tranche]" : "", s->ntg);
+  for (int ti = 0; ti < s->ntg; ti++) fprintf(stderr, " %s", s->tg[ti].shm_path);
+  fprintf(stderr, "\n");
+  if (pthread_create(&s->thread, NULL, video_rx_slice_thread, s) != 0) {
+    for (int ti = 0; ti < s->ntg; ti++)
+      if (s->tg[ti].writer) { mxlReleaseFlowWriter(g_mxl, s->tg[ti].writer); s->tg[ti].writer = NULL; }
+    st20_rx_free(s->sl_rx); s->sl_rx = NULL;
+    pthread_mutex_destroy(&s->sl_mx); pthread_cond_destroy(&s->sl_cv);
+    return -1;
+  }
+  s->started = 1;
+  return 0;
+}
+
 static int setup_video(struct sess* s) {
+  /* MODE TRANCHE (SLICE_MODE=1) : bascule env-gatée vers le chemin raw st20 par tranches.
+   * Éligibilité : progressive + height divisible par SLICE_LINES (le flowdef MXL exige des
+   * tranches égales). Inéligible → repli whole-frame silencieux (log). */
+  if (slice_wanted() && !s->interlaced) {
+    if (s->height % slice_lines_env() == 0) return setup_video_slice_rx(s);
+    fprintf(stderr, "mtl_rx[slice] RX %s:%d inéligible (h=%d non divisible par %d) → whole-frame\n",
+            s->mcast, s->udp_port, s->height, slice_lines_env());
+  }
   s->copy_mode = 1;   /* af_xdp/kernel uniquement dans ce contexte */
   s->out_fmt = ST_FRAME_FMT_YUV422PLANAR10LE;   /* converter présent ; conv 10→8 nous-mêmes */
   s->conv8 = (s->bit_depth == 8);
@@ -1024,7 +1309,234 @@ static void* video_tx_thread(void* arg) {
   return NULL;
 }
 
+/* ═══ VIDÉO TX MODE TRANCHE (SLICE_MODE=1, progressive) ════════════════════════
+ * API raw st20 (ST20_TYPE_SLICE_LEVEL) : le worker lit le grain SOURCE tranche par tranche
+ * (mxlFlowReaderGetGrainSlice — réveil par commit du producteur), packe planar → RFC4175 BE10
+ * PAR BANDE dans le framebuffer libmtl et publie lines_ready ; la lib émet au fil des lignes
+ * prêtes (query_frame_lines_ready) → l'émission d'une trame commence AVANT sa fin d'écriture
+ * amont (latence sous-trame). Le nombre de tranches vient du GRAIN SOURCE (totalSlices) : une
+ * source whole-frame (totalSlices=1) dégrade proprement en trame pleine. */
+
+/* lcore tasklet : la lib veut une trame à émettre → le prochain framebuffer publié (READY). */
+static int tx_sl_next_frame(void* priv, uint16_t* next_frame_idx, struct st20_tx_frame_meta* meta) {
+  struct sess* s = priv; (void)meta;
+  uint16_t c = s->sl_fb_cons;
+  if (s->sl_fb[c].stat != 1) return -EBUSY;     /* rien de prêt (slot silencieux) : la lib retente */
+  *next_frame_idx = c;
+  s->sl_fb_cons = (uint16_t)((c + 1) % s->sl_fb_cnt);
+  return 0;
+}
+
+/* lcore tasklet : trame émise → slot libre, réveil du worker. */
+static int tx_sl_frame_done(void* priv, uint16_t frame_idx, struct st20_tx_frame_meta* meta) {
+  struct sess* s = priv; (void)meta;
+  s->sl_fb[frame_idx].lines_ready = 0;
+  s->sl_fb[frame_idx].stat = 0;
+  pthread_mutex_lock(&s->sl_mx);
+  pthread_cond_signal(&s->sl_cv);
+  pthread_mutex_unlock(&s->sl_mx);
+  return 0;
+}
+
+/* lcore tasklet : combien de lignes de frame_idx sont prêtes à partir ? */
+static int tx_sl_lines_ready(void* priv, uint16_t frame_idx, struct st20_tx_slice_meta* meta) {
+  struct sess* s = priv;
+  meta->lines_ready = (uint16_t)s->sl_fb[frame_idx].lines_ready;
+  return 0;
+}
+
+/* Packe la bande [l0, l0+nl) du grain planar source vers RFC4175 BE10 dans le framebuffer.
+ * Source 8-bit : up-shift 8→10 de la bande dans sl_scratch (alloué paresseusement) puis SIMD. */
+static void sl_pack_band(struct sess* s, const uint8_t* pay, int src8,
+                         uint32_t l0, uint32_t nl, uint8_t* fb) {
+  int W = s->width, H = s->height;
+  size_t bpl_be = ((size_t)W / 2) * 5;
+  struct st20_rfc4175_422_10_pg2_be* dst =
+      (struct st20_rfc4175_422_10_pg2_be*)(fb + (size_t)l0 * bpl_be);
+  if (!src8) {
+    uint16_t* y = (uint16_t*)(pay + (size_t)l0 * W * 2);
+    uint16_t* b = (uint16_t*)(pay + (size_t)W * H * 2 + (size_t)l0 * W);
+    uint16_t* r = (uint16_t*)(pay + (size_t)W * H * 3 + (size_t)l0 * W);
+    st20_yuv422p10le_to_rfc4175_422be10(y, b, r, dst, (uint32_t)W, nl);
+    return;
+  }
+  if (!s->sl_scratch) s->sl_scratch = malloc((size_t)4 * W * H);   /* pire cas : bande = trame */
+  if (!s->sl_scratch) return;
+  const uint8_t* y8 = pay + (size_t)l0 * W;
+  const uint8_t* b8 = pay + (size_t)W * H + (size_t)l0 * (W / 2);
+  const uint8_t* r8 = pay + (size_t)W * H * 3 / 2 + (size_t)l0 * (W / 2);
+  uint16_t* ys = (uint16_t*)s->sl_scratch;
+  uint16_t* bs = ys + (size_t)W * nl;
+  uint16_t* rs = bs + (size_t)(W / 2) * nl;
+  for (size_t k = 0; k < (size_t)W * nl; k++) ys[k] = (uint16_t)y8[k] << 2;
+  for (size_t k = 0; k < (size_t)(W / 2) * nl; k++) {
+    bs[k] = (uint16_t)b8[k] << 2; rs[k] = (uint16_t)r8[k] << 2;
+  }
+  st20_yuv422p10le_to_rfc4175_422be10(ys, bs, rs, dst, (uint32_t)W, nl);
+}
+
+/* Worker TX tranche : vise toujours le grain de TÊTE du flux source (celui en cours d'écriture),
+ * le suit tranche par tranche et remplit le framebuffer au fil de l'eau. */
+static void* video_tx_slice_thread(void* arg) {
+  struct sess* s = arg;
+  struct target* t = &s->tg[0];                 /* la cible TX = l'unique flux d'entrée câblé */
+  int W = s->width, H = s->height;
+  size_t bpl_be = ((size_t)W / 2) * 5;
+  uint64_t period_ns = s->fps > 0 ? (uint64_t)(1e9 / s->fps) : 20000000ull;
+  uint64_t next_fi = 0; int fi_init = 0;
+  while (!s->stop) {
+    if (tx_take_source(t) && t->reader) {       /* source permutée à chaud → rouvrir le reader */
+      mxlReleaseFlowReader(g_mxl, t->reader); t->reader = NULL; fi_init = 0;
+    }
+    if (!t->reader) {
+      t->last_feed_ns = 0;
+      t->alive_ns = mono_ns();                  /* attendre un câblage n'est pas un wedge */
+      fi_init = 0;
+      if (open_reader(t) != 0) { usleep(20000); continue; }
+    }
+    /* attendre un framebuffer libre (la lib libère via notify_frame_done) */
+    uint16_t idx = s->sl_fb_prod;
+    if (s->sl_fb[idx].stat != 0) {
+      pthread_mutex_lock(&s->sl_mx);
+      if (s->sl_fb[idx].stat != 0 && !s->stop) {
+        struct timespec tw; clock_gettime(CLOCK_REALTIME, &tw);
+        tw.tv_nsec += 50 * 1000000;
+        if (tw.tv_nsec >= 1000000000) { tw.tv_sec++; tw.tv_nsec -= 1000000000; }
+        pthread_cond_timedwait(&s->sl_cv, &s->sl_mx, &tw);
+      }
+      pthread_mutex_unlock(&s->sl_mx);
+      t->alive_ns = mono_ns();
+      continue;
+    }
+    /* viser le grain de tête (rattrape si on est en retard ; jamais en arrière) */
+    mxlFlowRuntimeInfo rt;
+    mxlStatus stx = mxlFlowReaderGetRuntimeInfo(t->reader, &rt);
+    if (stx != MXL_STATUS_OK || rt.headIndex == MXL_UNDEFINED_INDEX) {
+      if (stx == MXL_ERR_FLOW_NOT_FOUND || stx == MXL_ERR_FLOW_INVALID) {
+        mxlReleaseFlowReader(g_mxl, t->reader); t->reader = NULL;
+      }
+      t->alive_ns = mono_ns();
+      usleep(5000); continue;
+    }
+    if (!fi_init || next_fi < rt.headIndex) { next_fi = rt.headIndex; fi_init = 1; }
+    /* 1ʳᵉ tranche du grain visé (borné 2 périodes ; réveil par le commit du producteur) */
+    mxlGrainInfo gi; uint8_t* pay;
+    stx = mxlFlowReaderGetGrainSlice(t->reader, next_fi, 1, period_ns * 2, &gi, &pay);
+    uint64_t tnow = mono_ns();
+    t->alive_ns = tnow;
+    if (stx != MXL_STATUS_OK) {
+      if (stx == MXL_ERR_FLOW_NOT_FOUND || stx == MXL_ERR_FLOW_INVALID) {
+        mxlReleaseFlowReader(g_mxl, t->reader); t->reader = NULL; continue;
+      }
+      /* timeout : producteur muet OU flux périmé (redéployé sous le même nom, tête figée) —
+       * la détection stale standard voit la tête ne plus avancer → GC + réouverture par nom. */
+      tx_reopen_if_stale(t, rt.headIndex, tnow);
+      continue;                                 /* rien à émettre : aucune trame publiée à la lib */
+    }
+    uint16_t total = gi.totalSlices ? gi.totalSlices : 1;
+    uint32_t slice_h = (uint32_t)H / total;
+    if (!slice_h) { slice_h = (uint32_t)H; total = 1; }
+    /* profondeur SOURCE dérivée du GRAIN (flux auto-descriptif, cf. chemin whole-frame) */
+    size_t _gs = (size_t)gi.grainSize;
+    size_t _exp8 = (size_t)2 * (size_t)W * (size_t)H;
+    int src8 = (_gs > 0 && (_gs == _exp8 || _gs == _exp8 * 2)) ? (_gs == _exp8) : 0;
+    if (!t->dbg_depth_logged) {
+      fprintf(stderr, "mtl_rx[video TX SLICE dbg] shm=%s grainSize=%zu totalSlices=%u slice_h=%u src8=%d\n",
+              t->shm_path, _gs, (unsigned)total, (unsigned)slice_h, src8);
+      t->dbg_depth_logged = 1;
+    }
+    uint8_t* fb = st20_tx_get_framebuffer(s->sl_tx, idx);
+    if (!fb) { usleep(5000); continue; }
+    /* publier le framebuffer (remplissage progressif : la lib émettra au fil de lines_ready) */
+    s->sl_fb[idx].lines_ready = 0;
+    s->sl_fb[idx].stat = 1;
+    s->sl_fb_prod = (uint16_t)((idx + 1) % s->sl_fb_cnt);
+    for (uint16_t k = 1; k <= total && !s->stop; k++) {
+      if (k > 1) {
+        stx = mxlFlowReaderGetGrainSlice(t->reader, next_fi, k, period_ns, &gi, &pay);
+        if (stx != MXL_STATUS_OK) {             /* producteur mort en cours de trame → noir */
+          uint32_t l0 = (uint32_t)(k - 1) * slice_h;
+          memset(fb + (size_t)l0 * bpl_be, 0, (size_t)((uint32_t)H - l0) * bpl_be);
+          s->sl_fb[idx].lines_ready = (uint32_t)H;
+          break;
+        }
+      }
+      uint32_t l0 = (uint32_t)(k - 1) * slice_h;
+      uint32_t nl = (k == total) ? (uint32_t)H - l0 : slice_h;
+      sl_pack_band(s, pay, src8, l0, nl, fb);
+      s->sl_fb[idx].lines_ready = l0 + nl;
+    }
+    if (period_ns && t->last_feed_ns) {         /* compteur late : trame source ratée */
+      uint64_t gap = tnow - t->last_feed_ns;
+      if (gap > period_ns + period_ns / 2) {
+        uint64_t missed = (gap + period_ns / 2) / period_ns;
+        t->late += missed > 1 ? missed - 1 : 1;
+      }
+    }
+    t->last_feed_ns = tnow;
+    t->index = next_fi; t->recv++;
+    tx_reopen_if_stale(t, next_fi, tnow);
+    next_fi++;
+  }
+  return NULL;
+}
+
+/* Setup TX vidéo MODE TRANCHE (raw st20, ST20_TYPE_SLICE_LEVEL). Progressive uniquement. */
+static int setup_video_slice_tx(struct sess* s) {
+  s->slice_on = 1;
+  s->slotsize = (size_t)(s->bit_depth == 8 ? 2 : 4) * (size_t)s->width * (size_t)s->height;
+  s->shm_slotsize = s->slotsize;
+  pthread_mutex_init(&s->sl_mx, NULL); pthread_cond_init(&s->sl_cv, NULL);
+  s->sl_fb_cnt = 3; s->sl_fb_prod = 0; s->sl_fb_cons = 0;
+
+  struct st20_tx_ops ops; memset(&ops, 0, sizeof(ops));
+  ops.name = "bobi_mtl_vtx_sl";
+  ops.priv = s;
+  ops.num_port = s->num_leg;
+  inet_pton(AF_INET, s->mcast, ops.dip_addr[MTL_SESSION_PORT_P]);   /* destination */
+  snprintf(ops.port[MTL_SESSION_PORT_P], MTL_PORT_MAX_LEN, "%s", s->portname);
+  ops.udp_port[MTL_SESSION_PORT_P] = s->udp_port;
+  if (s->num_leg == 2) {   /* 2022-7 : 2ᵉ patte red/blue */
+    inet_pton(AF_INET, s->mcast_r, ops.dip_addr[MTL_SESSION_PORT_R]);
+    snprintf(ops.port[MTL_SESSION_PORT_R], MTL_PORT_MAX_LEN, "%s", s->portname_r);
+    ops.udp_port[MTL_SESSION_PORT_R] = s->udp_port_r;
+  }
+  ops.payload_type = s->payload_type;
+  ops.ssrc = s->ssrc;   /* fixe (≠0) pour matcher le a=ssrc annoncé dans le SDP TX */
+  ops.width = s->width; ops.height = s->height; ops.fps = to_st_fps(s->fps);
+  ops.interlaced = false;
+  ops.fmt = ST20_FMT_YUV_422_10BIT;
+  ops.type = ST20_TYPE_SLICE_LEVEL;
+  ops.framebuff_cnt = s->sl_fb_cnt;
+  ops.get_next_frame = tx_sl_next_frame;
+  ops.notify_frame_done = tx_sl_frame_done;
+  ops.query_frame_lines_ready = tx_sl_lines_ready;
+  /* CLASSE 2110-21 PAR SESSION (#26) : même résolution que le chemin whole-frame. */
+  ops.pacing = resolve_profile(s->iface);
+
+  s->sl_tx = st20_tx_create(s->st, &ops);
+  if (!s->sl_tx) {
+    fprintf(stderr, "mtl_rx: st20_tx_create SLICE fail (video %s:%d)\n", s->mcast, s->udp_port);
+    pthread_mutex_destroy(&s->sl_mx); pthread_cond_destroy(&s->sl_cv);
+    return -1;
+  }
+  fprintf(stderr, "mtl_rx[video TX SLICE] %dx%dp fps=%.2f pt=%d ssrc=%u → %s:%d (in shm=%s bd%d)%s\n",
+          s->width, s->height, s->fps, s->payload_type, s->ssrc, s->mcast, s->udp_port,
+          s->tg[0].shm_path, s->bit_depth,
+          s->tg[0].has_ident ? " [IDENT ignoré en mode tranche]" : "");
+  if (pthread_create(&s->thread, NULL, video_tx_slice_thread, s) != 0) {
+    st20_tx_free(s->sl_tx); s->sl_tx = NULL;
+    pthread_mutex_destroy(&s->sl_mx); pthread_cond_destroy(&s->sl_cv);
+    return -1;
+  }
+  s->started = 1;
+  return 0;
+}
+
 static int setup_video_tx(struct sess* s) {
+  /* MODE TRANCHE (SLICE_MODE=1) : bascule env-gatée (progressive uniquement — l'entrelacé garde
+   * le chemin champ-natif whole-frame). Le pas de tranche vient du flux SOURCE (totalSlices). */
+  if (slice_wanted() && !s->interlaced) return setup_video_slice_tx(s);
   if (s->ring < 2) s->ring = 2;                 /* (vestige) — MXL gère le ring du flux d'entrée */
   /* Champ-natif : taille d'un GRAIN = 1 CHAMP en entrelacé (½ hauteur), 1 trame en progressif.
    * 422 planar : 8b = 2·w·h_grain, 10b = 4·w·h_grain. = grainSize du flux d'entrée. */
@@ -1499,10 +2011,12 @@ static void free_session(struct sess* s) {
   if (s->role == ROLE_TX) {
     if (s->kind == K_AUDIO)     { if (s->a_tx) st30p_tx_free(s->a_tx); }
     else if (s->kind == K_DATA) { if (s->d_tx) st40p_tx_free(s->d_tx); }
-    else                        { if (s->vth)  st20p_tx_free(s->vth); }
+    else                        { if (s->vth)  st20p_tx_free(s->vth);
+                                  if (s->sl_tx) st20_tx_free(s->sl_tx); }   /* mode tranche */
   } else if (s->kind == K_AUDIO) { if (s->ah)  st30p_rx_free(s->ah); }
   else if (s->kind == K_DATA)    { if (s->d_rx) st40p_rx_free(s->d_rx); }
-  else                           { if (s->vh)  st20p_rx_free(s->vh); }
+  else                           { if (s->vh)  st20p_rx_free(s->vh);
+                                   if (s->sl_rx) st20_rx_free(s->sl_rx); }  /* mode tranche */
   for (int ti = 0; ti < s->ntg; ti++) {
     struct target* t = &s->tg[ti];
     if (t->writer) mxlReleaseFlowWriter(g_mxl, t->writer);   /* RX/simu */
@@ -1512,6 +2026,8 @@ static void free_session(struct sess* s) {
   if (s->tx_scratch) free(s->tx_scratch);
   if (s->rx_scratch) free(s->rx_scratch);
   if (s->tx_frame)   free(s->tx_frame);
+  if (s->sl_scratch) free(s->sl_scratch);
+  if (s->slice_on) { pthread_mutex_destroy(&s->sl_mx); pthread_cond_destroy(&s->sl_cv); }
   memset(s, 0, sizeof(*s));
 }
 
