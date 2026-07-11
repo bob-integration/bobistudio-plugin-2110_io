@@ -255,6 +255,9 @@ struct target {
   uint64_t recv;           /* compteur reçu (pour le débit) */
   uint64_t late;           /* TX vidéo : trames en retard (get_frame > 1,5 période = epoch raté) */
   uint64_t last_feed_ns;   /* TX vidéo : instant (monotone) du dernier get_frame réussi */
+  uint64_t slot_wait_ns;   /* TX tranche : temps cumulé (ns) passé BLOQUÉ en attente d'un slot fb
+                            * libre depuis le dernier feed — contre-pression de l'anneau (epoch-shift :
+                            * la lib retient chaque trame `shift` plus tard), EXCLU du gap `late`. */
   uint64_t alive_ns;       /* TX (tous kinds) : dernier signe de vie du thread (get_frame OK ou
                             * attente de câblage). Figé session démarrée = queue TX morte (wedge). */
   int      dbg_depth_logged; /* TX vidéo : log one-shot grainSize/out_size/_src8 au 1er grain */
@@ -391,6 +394,9 @@ struct sess {
   struct sl_txfb { volatile int stat; volatile uint32_t lines_ready; } sl_fb[SL_Q];
   uint16_t sl_fb_cnt, sl_fb_prod, sl_fb_cons;
   uint64_t sl_wedge_ns;        /* TX : début (mono) du blocage « aucun slot libre » (watchdog anneau) */
+  uint64_t sl_wedge_log_ns;    /* TX : throttle du log wedge — instant du dernier log émis (0 = session
+                                * saine, le prochain wedge logue en entier). Reset par tx_sl_frame_done. */
+  uint32_t sl_wedge_log_n;     /* TX : resyncs wedge survenus depuis le dernier log émis (agrégat) */
   uint8_t* sl_scratch;         /* TX source 8-bit : bande planar10 up-shiftée avant pack SIMD */
 };
 
@@ -1234,6 +1240,9 @@ static void* video_tx_thread(void* arg) {
     uint64_t tnow = mono_ns();
     t->alive_ns = tnow;      /* la session transmet (frames libérées par MTL) */
     if (period_ns && t->last_feed_ns) {
+      /* NB epoch-shift : ici PAS de biais de contre-pression (contrairement au mode tranche,
+       * cf. video_tx_slice_thread) — le shift retarde chaque libération d'un offset CONSTANT,
+       * qui s'annule entre deux get_frame consécutifs ; la lecture source est non bloquante. */
       uint64_t gap = tnow - t->last_feed_ns;
       if (gap > period_ns + period_ns / 2) {
         uint64_t missed = (gap + period_ns / 2) / period_ns;   /* périodes écoulées (arrondi) */
@@ -1339,6 +1348,7 @@ static int tx_sl_frame_done(void* priv, uint16_t frame_idx, struct st20_tx_frame
   struct sess* s = priv; (void)meta;
   s->sl_fb[frame_idx].lines_ready = 0;
   s->sl_fb[frame_idx].stat = 0;
+  s->sl_wedge_log_ns = 0; s->sl_wedge_log_n = 0;   /* done reçu : session saine → réarme le throttle */
   pthread_mutex_lock(&s->sl_mx);
   pthread_cond_signal(&s->sl_cv);
   pthread_mutex_unlock(&s->sl_mx);
@@ -1396,7 +1406,7 @@ static void* video_tx_slice_thread(void* arg) {
       mxlReleaseFlowReader(g_mxl, t->reader); t->reader = NULL; fi_init = 0;
     }
     if (!t->reader) {
-      t->last_feed_ns = 0;
+      t->last_feed_ns = 0; t->slot_wait_ns = 0;
       t->alive_ns = mono_ns();                  /* attendre un câblage n'est pas un wedge */
       fi_init = 0;
       if (open_reader(t) != 0) { usleep(20000); continue; }
@@ -1404,6 +1414,7 @@ static void* video_tx_slice_thread(void* arg) {
     /* attendre un framebuffer libre (la lib libère via notify_frame_done) */
     uint16_t idx = s->sl_fb_prod;
     if (s->sl_fb[idx].stat != 0) {
+      uint64_t w0 = mono_ns();   /* chrono attente de slot (exclue du compteur `late`, cf. infra) */
       /* WATCHDOG ANNEAU (durcissement 0.40.1) : la lib peut ABANDONNER une trame sans
        * notify_frame_done (échec transmit sous churn de source, vu au banc mv 2026-07-11) →
        * le slot reste stat=1 pour toujours → au 3ᵉ, deadlock complet (get_next_frame rend
@@ -1418,9 +1429,25 @@ static void* video_tx_slice_thread(void* arg) {
         for (uint16_t k = 0; k < s->sl_fb_cnt; k++)
           if (s->sl_fb[k].stat == 0) { all_busy = 0; break; }
         if (all_busy) {
-          fprintf(stderr, "mtl_rx[video TX SLICE] %s:%d anneau fb WEDGÉ (aucun done depuis %.1fs)"
-                  " — resync (all FREE, cons=prod)\n",
-                  s->mcast, s->udp_port, (mono_ns() - s->sl_wedge_ns) / 1e9);
+          /* THROTTLE (0.41.1) : une session TX en échec permanent (ex. PKT_ALLOC_FAIL) wedge
+           * puis resynce toutes les 2 s pour toujours → spam continu qui sature docker logs.
+           * 1er wedge après une période saine : log complet ; ensuite au plus 1 log/min avec
+           * l'agrégat des occurrences. Le throttle est réarmé par tx_sl_frame_done (un done
+           * reçu = session redevenue saine), PAS par le resync lui-même (qui libère les slots). */
+          uint64_t lnow = mono_ns();
+          s->sl_wedge_log_n++;
+          if (!s->sl_wedge_log_ns) {
+            fprintf(stderr, "mtl_rx[video TX SLICE] %s:%d anneau fb WEDGÉ (aucun done depuis %.1fs)"
+                    " — resync (all FREE, cons=prod) [logs throttlés à 1/min tant que pas de done]\n",
+                    s->mcast, s->udp_port, (lnow - s->sl_wedge_ns) / 1e9);
+            s->sl_wedge_log_ns = lnow; s->sl_wedge_log_n = 0;
+          } else if (lnow - s->sl_wedge_log_ns >= 60ull * 1000000000ull) {
+            fprintf(stderr, "mtl_rx[video TX SLICE] %s:%d anneau fb toujours WEDGÉ — resync"
+                    " (×%u depuis %.0f s)\n",
+                    s->mcast, s->udp_port, (unsigned)s->sl_wedge_log_n,
+                    (lnow - s->sl_wedge_log_ns) / 1e9);
+            s->sl_wedge_log_ns = lnow; s->sl_wedge_log_n = 0;
+          }
           for (uint16_t k = 0; k < s->sl_fb_cnt; k++) {
             s->sl_fb[k].lines_ready = 0;
             s->sl_fb[k].stat = 0;
@@ -1438,6 +1465,7 @@ static void* video_tx_slice_thread(void* arg) {
       }
       pthread_mutex_unlock(&s->sl_mx);
       t->alive_ns = mono_ns();
+      t->slot_wait_ns += t->alive_ns - w0;   /* contre-pression anneau : pas un retard SOURCE */
       continue;
     }
     s->sl_wedge_ns = 0;                      /* un slot s'est libéré : anneau vivant */
@@ -1524,12 +1552,19 @@ static void* video_tx_slice_thread(void* arg) {
       s->sl_fb[idx].lines_ready = l0 + nl;
     }
     if (period_ns && t->last_feed_ns) {         /* compteur late : trame source ratée */
+      /* Le gap entre deux alimentations inclut le temps passé BLOQUÉ en attente d'un slot libre
+       * de l'anneau fb (contre-pression : avec epoch_shift_us la lib retient chaque trame `shift`
+       * plus tard → faux `late` ~1,7/min alors que la sortie fil est parfaite — banc 2026-07-10).
+       * On SOUSTRAIT cette attente pour ne mesurer que la SOURCE (seuil 1,5 période inchangé). */
       uint64_t gap = tnow - t->last_feed_ns;
+      uint64_t w = t->slot_wait_ns;
+      gap = gap > w ? gap - w : 0;
       if (gap > period_ns + period_ns / 2) {
         uint64_t missed = (gap + period_ns / 2) / period_ns;
         t->late += missed > 1 ? missed - 1 : 1;
       }
     }
+    t->slot_wait_ns = 0;
     t->last_feed_ns = tnow;
     t->index = next_fi; t->recv++;
     tx_reopen_if_stale(t, next_fi, tnow);
