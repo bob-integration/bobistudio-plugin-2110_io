@@ -1886,6 +1886,17 @@ int main(int argc, char** argv) {
       else if (_has_dpdk)              p.nb_rx_desc = 4096;
       if (p.nb_rx_desc)
         fprintf(stderr, "mtl_rx: ring RX = %u descripteurs (défaut MTL 2048)\n", p.nb_rx_desc); }
+    /* bobi.studio: scheduler RX vidéo DÉDIÉ (levier #2, banc G2 2026-07-11). Le flag public
+     * MTL_FLAG_RX_SEPARATE_VIDEO_LCORE fait demander à chaque session RX vidéo un scheduler
+     * MT_SCH_TYPE_RX_VIDEO_ONLY (mt_sch.c) — isolé du CNI (qui porte le PTP/IGMP/ARP libmtl) et de
+     * l'audio/TX. Complète le ring profond : le ring ABSORBE les stalls de polling induits par ces
+     * co-tenants, ce flag en SUPPRIME la source (le RX ne partage plus son lcore avec eux). Coûte 1
+     * lcore dédié par session RX (budget large : 16 lcores). Réglable RX_SEPARATE_LCORE ; défaut ON
+     * sur socle DPDK (là où le CNI fait le PTP interne → co-tenance la plus pénalisante). */
+    { const char* _rxs = getenv("RX_SEPARATE_LCORE");
+      int _on = _rxs ? atoi(_rxs) : _has_dpdk;
+      if (_on) { p.flags |= MTL_FLAG_RX_SEPARATE_VIDEO_LCORE;
+                 fprintf(stderr, "mtl_rx: scheduler RX vidéo DÉDIÉ (isolé CNI/PTP/audio/TX)\n"); } }
     p.log_level = MTL_LOG_LEVEL_INFO;
     p.lcores = lcores[0] ? lcores : NULL;
 
