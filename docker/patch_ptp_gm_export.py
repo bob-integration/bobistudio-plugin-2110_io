@@ -38,13 +38,17 @@ for needle in ("struct mt_ptp_impl* ptp = mt_get_ptp(impl, port);",
         sys.exit(1)
 
 c += """
-/* %s : identité du grandmaster verrouillé par le PTP interne (pour a=ts-refclk:ptp du SDP TX quand
- * le ptp4l kernel est absent — socle DPDK). Remplit out_id8[8] (clock identity), out_domain, out_utc.
- * true SSI actif + master initialisé + lockÉ. Appelé depuis mtl_rx via extern (symbole exporté). */
+/* %s : identité du grandmaster auquel le PTP interne est asservi (pour a=ts-refclk:ptp du SDP TX
+ * quand le ptp4l kernel est absent — socle DPDK). Remplit out_id8[8] (clock identity), out_domain,
+ * out_utc. true SSI actif + master initialisé (Announce reçu → GM connu). ⚠ NE PAS gater sur
+ * ptp->locked : c'est le lock SERVO (delta < 100 ns continu), distinct de la précision du system
+ * clock ; l'identité du GM est valide dès qu'on a reçu son Announce, indépendamment de la précision
+ * instantanée — le SDP doit annoncer le GM de référence (pratique standard, cf. ptp4l/pmc PARENT).
+ * Appelé depuis mtl_rx via extern (symbole exporté). */
 bool mt_bobi_ptp_gm(struct mtl_main_impl* impl, enum mtl_port port,
                     uint8_t* out_id8, int* out_domain, int* out_utc) {
   struct mt_ptp_impl* ptp = mt_get_ptp(impl, port);
-  if (!ptp || !ptp->active || !ptp->master_initialized || !ptp->locked) return false;
+  if (!ptp || !ptp->active || !ptp->master_initialized) return false;
   if (out_id8)
     for (int i = 0; i < 8; i++) out_id8[i] = ptp->master_port_id.clock_identity.id[i];
   if (out_domain) *out_domain = (int)ptp->t1_domain_number;
