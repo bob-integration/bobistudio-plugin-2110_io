@@ -1,7 +1,10 @@
 {
-  "version": "0.39.16",
+  "version": "0.39.17",
   "date": "2026-07-11",
   "changes": {
+    "Levier isolation RX/TX #1 : profondeur ring RX réglable, défaut 4096 sur DPDK (REBUILD, 0.39.17)": [
+      "mtl_rx.c : nb_rx_desc (ring de descripteurs RX) exposé via env RX_NB_DESC, défaut porté de 2048 (MT_DEV_RX_DESC) à 4096 sur socle DPDK. Banc G2 2026-07-11 : sous TX lourd co-localisé (2022-7 bi-port MÊME carte E810), rx_hw_dropped ~0,18% CORRÉLÉ sur les 2 ports (DMA/PCIe saturé par le TX → les 2 files RX débordent au même instant → non récupérable par le 2022-7). Un ring plus profond donne à la NIC plus de marge entre deux polls. rte_eth_dev_adjust_nb_rx_tx_desc clampe au max device."
+    ],
     "Fix cold-start PTP libmtl v2 : backstop TX gaté sur ptp->locked (pas delta_result_cnt) (REBUILD requis, 0.39.16)": [
       "patch_ptp_stable_getter.py + mtl_rx.c : le gate d'état du backstop « TX FIGÉ » (0.39.15) utilisait le mauvais critère de stabilité — mt_bobi_ptp_stable renvoyait connected && delta_result_cnt>5, or delta_result_cnt atteint >5 DÈS LA CONVERGENCE (offset encore ~ms), donc le backstop se réarmait avant le lock et retuait le daemon en boucle (mesuré G4 2026-07-11 03h sur 0.39.15 : offset 37 s→0,5 ms « not locked », cnt 16, TX FIGÉ à 32 s → _exit(3) → convergence PTP repart de zéro). Fix : le getter renvoie ptp->locked (libmtl le pose quand le max delta reste continûment sous 100 ns, remis à false seulement au (ré)init du port) → le backstop reste suspendu tant que le PTP n'est pas RÉELLEMENT lockÉ, le daemon survit ~3 min de convergence, locke, puis le backstop se réarme pour son vrai rôle (queue TX morte). Diag : PTP convergeait normalement (path_delay ~168 ns identique au lock réussi de 0.39.14) ; seul le backstop bloquait."
     ],

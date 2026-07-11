@@ -1875,6 +1875,17 @@ int main(int argc, char** argv) {
        * mt_bobi_ptp_stable) — pas de frame TX possible avant le lock, ce n'est pas un wedge. */
       g_engine_ptp = 1;
     }
+    /* bobi.studio: profondeur du ring de descripteurs RX (banc G2 2026-07-11). Défaut MTL =
+     * MT_DEV_RX_DESC=2048. Sous TX lourd co-localisé (2022-7 bi-port MÊME carte), la NIC droppe du RX
+     * (rx_hw_dropped CORRÉLÉ sur les 2 ports) quand le DMA/PCIe est saturé par le TX : un ring plus
+     * profond donne à la NIC plus de marge pour poser les paquets entrants entre deux polls. Réglable
+     * via RX_NB_DESC ; défaut porté à 4096 sur socle DPDK (rte_eth_dev_adjust_nb_rx_tx_desc clampe au
+     * max supporté par le device). Sans objet en AF-XDP (rx_size dérivé côté xsk). */
+    { const char* _rxd = getenv("RX_NB_DESC");
+      if (_rxd && atoi(_rxd) > 0)      p.nb_rx_desc = (uint16_t)atoi(_rxd);
+      else if (_has_dpdk)              p.nb_rx_desc = 4096;
+      if (p.nb_rx_desc)
+        fprintf(stderr, "mtl_rx: ring RX = %u descripteurs (défaut MTL 2048)\n", p.nb_rx_desc); }
     p.log_level = MTL_LOG_LEVEL_INFO;
     p.lcores = lcores[0] ? lcores : NULL;
 
