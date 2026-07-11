@@ -17,11 +17,14 @@
 #
 # ── Le fix ─────────────────────────────────────────────────────────────────────────────────────
 # Ajouter à mt_ptp.c une fonction NON statique (liée dans libmtl.so, appelée par mtl_rx via extern) :
-# `mt_bobi_ptp_stable(impl, port)` → true si le PTP interne est inactif (pas de gate) ou s'il est
-# connecté avec ≥ 6 mesures de delta (même critère de stabilité que `mt_ptp_wait_stable`,
-# `delta_result_cnt > 5`). Champs lus : `ptp->active`, `ptp->connected`, `ptp->delta_result_cnt`
-# (struct mt_ptp_impl, mt_main.h). Aucune modification du code existant : ajout pur en fin de
-# fichier.
+# `mt_bobi_ptp_stable(impl, port)` → true si le PTP interne est inactif (pas de gate) OU RÉELLEMENT
+# LOCKÉ. Critère = `ptp->locked` : libmtl le met à true quand le max delta reste continûment sous
+# 100 ns (mt_ptp.c « Be considered as locked while the max delta is continuously below 100ns »), et
+# ne le remet à false qu'au (ré)init du port. ⚠ NE PAS utiliser `delta_result_cnt > 5` (critère de
+# `mt_ptp_wait_stable`) : ce compteur atteint >5 DÈS LA CONVERGENCE (offset encore ~ms), donc le
+# backstop se réarmerait AVANT le lock et retuerait le daemon en boucle (mesuré G4 2026-07-11 03h,
+# 0.39.15 : offset 37 s→0,5 ms « not locked », cnt 16, backstop tire à 32 s). Champs lus :
+# `ptp->active`, `ptp->locked` (struct mt_ptp_impl, mt_main.h). Ajout pur en fin de fichier.
 
 import sys
 
@@ -33,19 +36,20 @@ if MARK in c:
     print("patch PTP stable getter : déjà appliqué"); sys.exit(0)
 
 for needle in ("struct mt_ptp_impl* ptp = mt_get_ptp(impl, port);",
-               "delta_result_cnt", "->connected"):
+               "ptp->locked = true", "ptp->active"):
     if needle not in c:
         print("patch PTP stable getter : ERREUR — ancre '%s' introuvable" % needle)
         sys.exit(1)
 
 c += """
 /* %s : état de synchro du PTP interne, pour le backstop « TX FIGÉ » de mtl_rx.
- * true = pas de gate (PTP interne inactif) OU synchrone (connecté + >5 mesures de delta,
- * même critère que mt_ptp_wait_stable). Appelé depuis mtl_rx via extern (symbole exporté). */
+ * true = pas de gate (PTP interne inactif) OU RÉELLEMENT lockÉ (ptp->locked : max delta < 100 ns
+ * en continu ; posé par le servo, remis à false seulement au (ré)init du port). PAS delta_result_cnt
+ * (>5 dès la convergence → réarmerait le backstop avant le lock). Appelé depuis mtl_rx via extern. */
 bool mt_bobi_ptp_stable(struct mtl_main_impl* impl, enum mtl_port port) {
   struct mt_ptp_impl* ptp = mt_get_ptp(impl, port);
   if (!ptp || !ptp->active) return true;
-  return ptp->connected && (ptp->delta_result_cnt > 5);
+  return ptp->locked;
 }
 """ % MARK
 
