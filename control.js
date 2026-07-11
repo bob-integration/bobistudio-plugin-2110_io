@@ -149,14 +149,16 @@ window.MXLPlugins["2110_io"] = {
       const isAudio = r.essence === 'audio';
       const isAnc   = r.essence === 'anc';
       const ess = isAudio ? 'audio' : 'video';
-      // Nommage : « Vidéo 1 » ; « Audio 1-1 » = vidéo 1, 1ʳᵉ piste audio de cette vidéo ; « ANC 1 ».
+      // Nommage d'AFFICHAGE uniforme avec les slots TX (« TX #n ») : « RX #1 » ; « RX #1 AUD 1 » =
+      // RX 1, 1ʳᵉ piste audio ; « RX #1 ANC ». Index 1-based. Le nom technique du flux (shm) reste
+      // visible dans la colonne MXL — jamais comme nom du flux.
       const tag = isAnc
-        ? `ANC ${(r.video_idx != null ? r.video_idx : r.idx) + 1}`
+        ? `RX #${(r.video_idx != null ? r.video_idx : r.idx) + 1} ANC`
         : isAudio
         ? ((r.video_idx != null && r.audio_sub_idx != null)
-            ? `Audio ${r.video_idx + 1}-${r.audio_sub_idx + 1}`
-            : `Audio ${r.idx + 1}`)
-        : `Vidéo ${r.idx + 1}`;
+            ? `RX #${r.video_idx + 1} AUD ${r.audio_sub_idx + 1}`
+            : `RX AUD #${r.idx + 1}`)
+        : `RX #${r.idx + 1}`;
       // Bouton générateur : data-* lus par délégation (pas d'onclick global). Pas de GÉN pour l'ANC.
       // Placeholder vide quand absent : la grille .flow-row place par position → sans cet espace
       // réservé, le badge SDP se décalerait dans une colonne de gauche (désalignement audio/ANC vs vidéo).

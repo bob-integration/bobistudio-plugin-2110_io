@@ -190,6 +190,30 @@ def topology_ports(hostname, params, ctx):
     # (services/nmos:_propagate_sdp_format, lu du SDP). On surcharge le format global par-port pour
     # que la page Câbles affiche le i/p correct par entrée (repli sur le global si absent).
     rx_fmt = params.get("rx_fmt") or {}
+    # Labels d'AFFICHAGE « RX #n » (1-based, symétriques des « TX #n ») : le nom technique du
+    # flux (shm mtlrx<vmid>_<idx>) ne doit plus fuiter dans l'UI (Câbles/dashboard/monitoring).
+    # Le label utilisateur d'un flux (f['label']) prime s'il est posé. Affichage SEULEMENT :
+    # shm/wiring/NMOS inchangés. Audio/ANC attachés : « RX #n AUD k » / « RX #n ANC » (même
+    # convention que les slots TX) via grouping_maps ; flux indépendant → son propre idx.
+    _vid_of, _sub_of = _iof.grouping_maps(rx_flows)
+    _aud_counts = {}
+    for _f in rx_flows:
+        if _f["essence"] == "audio":
+            _vi = _vid_of.get(("audio", _f["idx"]))
+            _aud_counts[_vi] = _aud_counts.get(_vi, 0) + 1
+    def _rx_label(f):
+        if f.get("label"):
+            return str(f["label"])
+        ess, idx = f["essence"], f["idx"]
+        if ess == "video":
+            return f"RX #{idx + 1}"
+        vi = _vid_of.get((ess, idx))
+        if vi is None:
+            return f"RX AUD #{idx + 1}" if ess == "audio" else f"RX ANC #{idx + 1}"
+        if ess == "audio":
+            sub = _sub_of.get((ess, idx), 0)
+            return f"RX #{vi + 1} AUD" + (f" {sub + 1}" if _aud_counts.get(vi, 0) > 1 else "")
+        return f"RX #{vi + 1} ANC"
     produces = []
     for f in rx_flows:
         ess = f["essence"]
@@ -202,7 +226,7 @@ def topology_ports(hostname, params, ctx):
                     if sf.get(k) not in (None, ""):
                         pfmt[k] = sf[k]
         produces.append({"shm": _shmf[ess].format(f["idx"]), "kind": _kindf[ess],
-                         "format": pfmt,
+                         "format": pfmt, "label": _rx_label(f),
                          "group": f["id"] if ess == "video" else (f.get("attached_to") or f["id"])})
     # Slots TX (émetteurs) = ports d'ENTRÉE câblables → destinations MXL à droite sur la page Câbles.
     # Pilotés par tx_flows : par slot vidéo, le port vidéo + ses audios attachés (N) + son ANC.
