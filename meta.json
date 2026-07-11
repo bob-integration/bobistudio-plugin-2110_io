@@ -1,7 +1,10 @@
 {
-  "version": "0.40.0",
+  "version": "0.40.1",
   "date": "2026-07-11",
   "changes": {
+    "Durcissement TX tranche : watchdog anneau framebuffer (0.40.1)": [
+      "mtl_rx.c video_tx_slice_thread : la lib peut abandonner une trame sans notify_frame_done (échec transmit sous churn de source) → slot stat=1 orphelin → au 3e, deadlock (get_next_frame -EBUSY en boucle, build ret -203, 0 fps jusqu'au restart daemon — vu au banc mv 2026-07-11). Watchdog : aucun slot libéré pendant 2 s ET tous occupés → resync de l'anneau (tous FREE, cons=prod, log) → reprise au grain de tête suivant. REBUILD requis."
+    ],
     "Mode tranche (SLICE_MODE=1) : RX/TX raw st20 par tranches — latence sous-trame (0.40.0)": [
       "mtl_rx.c : chemin vidéo PROGRESSIF env-gaté (SLICE_MODE=1, défaut OFF = whole-frame st20p inchangé ; entrelacé/audio/ANC inchangés). RX : ST20_TYPE_SLICE_LEVEL + notify_slice_ready (lcore, non bloquant) → worker convertit RFC4175 BE10→planar PAR BANDE (SIMD st_convert) directement dans le grain MXL (OpenGrain à la 1ʳᵉ tranche) et committe validSlices=1..N au fil des tranches reçues (SLICE_LINES lignes/tranche, défaut 36 → doit diviser height, sinon repli whole-frame). Le flowDef porte slice_height (patch mxl-planar-slices 0.39.21). Trame incomplète (perte fil) : finalisée en l'état + compteur (jamais de grain partiel bloquant). TX : ST20_TYPE_SLICE_LEVEL + query_frame_lines_ready → worker suit le grain de TÊTE source via mxlFlowReaderGetGrainSlice (réveil PAR COMMIT producteur), packe planar→BE10 par bande dans le framebuffer et publie lines_ready → l'émission démarre AVANT la fin d'écriture amont. Pas de tranche source (totalSlices=1, producteur whole-frame) → dégradation propre en trame pleine. Profondeur source par grain (8→10 up-shift via scratch). IDENT ignoré en mode tranche (overlay = espace trame). Compat lecteurs : GetGrain[NonBlocking] = GetGrainSlice(ALL) → les consommateurs whole-frame ne voient JAMAIS un grain partiel. Gain attendu ~19 ms/étage (banc slice_bench 2026-07-11 : 1ʳᵉ tranche 0,77 ms vs trame pleine 20,13 ms). REBUILD requis."
     ],

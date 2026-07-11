@@ -384,6 +384,7 @@ struct sess {
    * et interroge lines_ready. stat : 0=FREE (à remplir) 1=READY (en remplissage ou en vol). */
   struct sl_txfb { volatile int stat; volatile uint32_t lines_ready; } sl_fb[SL_Q];
   uint16_t sl_fb_cnt, sl_fb_prod, sl_fb_cons;
+  uint64_t sl_wedge_ns;        /* TX : début (mono) du blocage « aucun slot libre » (watchdog anneau) */
   uint8_t* sl_scratch;         /* TX source 8-bit : bande planar10 up-shiftée avant pack SIMD */
 };
 
@@ -1397,6 +1398,31 @@ static void* video_tx_slice_thread(void* arg) {
     /* attendre un framebuffer libre (la lib libère via notify_frame_done) */
     uint16_t idx = s->sl_fb_prod;
     if (s->sl_fb[idx].stat != 0) {
+      /* WATCHDOG ANNEAU (durcissement 0.40.1) : la lib peut ABANDONNER une trame sans
+       * notify_frame_done (échec transmit sous churn de source, vu au banc mv 2026-07-11) →
+       * le slot reste stat=1 pour toujours → au 3ᵉ, deadlock complet (get_next_frame rend
+       * -EBUSY en boucle, build ret -203, 0 fps jusqu'au restart daemon). Si AUCUN slot ne se
+       * libère pendant SL_WEDGE_NS alors que tous sont occupés, la lib n'en tient plus aucun :
+       * RESYNC — tout FREE + cons recalé sur prod (écritures u16/u32 alignées, la lib ne fait
+       * que LIRE ces champs dans cet état). Le worker reprend au grain de tête suivant. */
+#define SL_WEDGE_NS (2ull * 1000000000ull)
+      if (!s->sl_wedge_ns) s->sl_wedge_ns = mono_ns();
+      else if (mono_ns() - s->sl_wedge_ns > SL_WEDGE_NS) {
+        int all_busy = 1;
+        for (uint16_t k = 0; k < s->sl_fb_cnt; k++)
+          if (s->sl_fb[k].stat == 0) { all_busy = 0; break; }
+        if (all_busy) {
+          fprintf(stderr, "mtl_rx[video TX SLICE] %s:%d anneau fb WEDGÉ (aucun done depuis %.1fs)"
+                  " — resync (all FREE, cons=prod)\n",
+                  s->mcast, s->udp_port, (mono_ns() - s->sl_wedge_ns) / 1e9);
+          for (uint16_t k = 0; k < s->sl_fb_cnt; k++) {
+            s->sl_fb[k].lines_ready = 0;
+            s->sl_fb[k].stat = 0;
+          }
+          s->sl_fb_cons = s->sl_fb_prod;
+        }
+        s->sl_wedge_ns = mono_ns();          /* ré-arme (resync fait, ou faux positif re-mesuré) */
+      }
       pthread_mutex_lock(&s->sl_mx);
       if (s->sl_fb[idx].stat != 0 && !s->stop) {
         struct timespec tw; clock_gettime(CLOCK_REALTIME, &tw);
@@ -1408,6 +1434,7 @@ static void* video_tx_slice_thread(void* arg) {
       t->alive_ns = mono_ns();
       continue;
     }
+    s->sl_wedge_ns = 0;                      /* un slot s'est libéré : anneau vivant */
     /* viser le grain de tête (rattrape si on est en retard ; jamais en arrière) */
     mxlFlowRuntimeInfo rt;
     mxlStatus stx = mxlFlowReaderGetRuntimeInfo(t->reader, &rt);
