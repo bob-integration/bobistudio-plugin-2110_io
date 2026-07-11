@@ -1,7 +1,10 @@
 {
-  "version": "0.41.2",
-  "date": "2026-07-11",
+  "version": "0.42.0",
+  "date": "2026-07-12",
   "changes": {
+    "Fusion des lignes slice (0.41.x) + narrow (0.39.16) — REBUILD requis (0.42.0)": [
+      "Merge feat/mxl-slice (mode tranche, epoch-shift TX, watchdog/late) + supervision RL du socle DPDK narrow. controller.py /status porte a la fois le relais PTP grandmaster et le bloc rl (sessions RL/cap, files RSS). Une seule image porte desormais les deux chantiers."
+    ],
     "Affichage : RX #n + badge « 2110 » (UI/hooks seulement, PAS de rebuild moteur, 0.41.2)": [
       "hooks.py topology_ports : labels d'affichage « RX #1 », « RX #1 AUD 1/2 », « RX #1 ANC » (1-based, symétriques des TX #n) — page Câbles, dashboard, moniteur, /api/sources ; un label utilisateur posé sur le flux prime ; AUCUN renommage interne (shm/wiring/NMOS).",
       "control.js (Sources 2110) : tags de lignes alignés RX #n ; la colonne MXL (nom technique) est conservée.",
@@ -468,6 +471,13 @@
     ],
     "Bugs connus": [
       "Audio st30 câblé dans mtl_rx mais réception non encore activée côté contrôleur (Phase B). Entrelacé : 1 champ/slot. Tout (re)lancement de mtl_rx (changement d'abonnement) refaute ptp4l ~15 s (purge XDP, auto-recovery)."
+    ],
+    "Supervision DPDK narrow sur :8080 : bloc `rl` + ventilation RX/TX par port (REBUILD requis, 0.39.16)": [
+      "controller.py : nouveau bloc top-level `rl` sur :8080 — {active, pacing, tx_cap_per_port (=RL_TX_QUEUES_CAP si pacing RL effectif), tx_sessions, rx_sessions, tx_dropped, rx_queues_alloc, tx_queues_alloc}. `tx_dropped` = sessions TX demandées AU-DELÀ du cap RL et IGNORÉES par la boucle de réconciliation (avant : seulement loggé) → l'UI Sources/Destinations peut afficher un badge SUR-CAPACITÉ honnête. `active` gaté comme le clamp de _write_config (≥1 port dpdk ET MTL_PACING rl/auto) — un nœud af_xdp/tsc émet active=false et l'UI garde la barre « Queues XDP » historique.",
+      "nic.ports[] (ports dpdk) : clés additives rl_tx_cap (cap RL du port — la limite dure de senders, DPDK_NARROW.md §7), tx_sessions_active, rx_sessions_active (ventilation RX/TX des sessions live PAR PORT, legs 2022-7 comptés sur leur NIC comme dans _write_config). Remplace côté UI la barre « Queues XDP » (hw_max_combined=None sous vfio) par « Sessions TX (RL) » et « Files RX (RSS) »."
+    ],
+    "Fix démarrage à FROID PTP libmtl : backstop « TX FIGÉ » suspendu pendant la stabilisation (REBUILD requis, 0.39.15)": [
+      "mtl_rx.c : au boot à froid (G4 2026-07-10, reboot dl360-1), libmtl n'émet AUCUNE frame TX tant que son PTP interne n'est pas stable (mt_ptp_wait_stable, jusqu'à 180 s — le PHC est loin du GM après reboot). Le backstop process-wide « TX FIGÉ » (5 s + grâce add 20 s) redémarrait le daemon en BOUCLE avant la convergence (mesuré : cycle ~100 s, sync cnt 16-19 puis _exit(3), le PTP ne locke jamais ; le banc passait car le PHC restait discipliné entre les runs). Fix : quand ENGINE_PTP=libmtl est actif, g_tx_add_grace_ns est armé à +200 s au démarrage (couvre la fenêtre mt_ptp_wait_stable), et les writes au create TX passent en MAX MONOTONE (un create ne peut plus RACCOURCIR une grâce en cours). Le vrai détecteur de wedge reste actif dès la grâce écoulée."
     ]
   }
 }

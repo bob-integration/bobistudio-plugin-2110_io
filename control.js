@@ -397,9 +397,13 @@ window.MXLPlugins["2110_io"] = {
           const col = _netColor(p.network);
           const cap = p.port_capacity_gbps || 100;
           const rxBar = _nicBar(p.rx_gbps, p.rx_estimated_gbps, cap, 'RX');
-          const xdpBar = (p.xdp_hw && p.xdp_reserved != null)
-            ? _xdpBar(p.xdp_active || 0, p.xdp_planned, p.xdp_reserved, p.xdp_hw)
-            : '';
+          // Port DPDK (PF vfio, socle narrow) : plus de plafond AF-XDP (xdp_hw=null) — la métrique
+          // pertinente = files RSS RX + sessions RL TX / cap RL du port. Sinon barre XDP historique.
+          const xdpBar = (p.pmd === 'dpdk')
+            ? (_rssRow(p.rx_queues) + (p.rl_tx_cap ? _rlBar(p.tx_sessions_active || 0, p.rl_tx_cap, 0) : ''))
+            : ((p.xdp_hw && p.xdp_reserved != null)
+               ? _xdpBar(p.xdp_active || 0, p.xdp_planned, p.xdp_reserved, p.xdp_hw)
+               : '');
           const flows = p.rx_flow_count != null ? `<span class="pc-meta">Flux RX : ${p.rx_flow_count}</span>` : '';
           return `<div class="io2110-portcard" style="border-left-color:${col}">
             <h5><span style="color:${col}">${esc(p.iface)}</span>${p.primary ? '<span class="pc-prim">PRIM</span>' : ''}
@@ -494,6 +498,38 @@ window.MXLPlugins["2110_io"] = {
           <div class="nic-xdp-active"  style="width:${aPct}%;background:${col}"></div>
           <div class="nic-xdp-mark"    style="left:${rPct}%" title="Plafond à chaud : ${reserved} files réservées à mtl_init — au-delà, redéploiement requis"></div>
         </div>
+      </div>`;
+    }
+
+    // Barre « Sessions TX (RL) » — socle DPDK narrow : budget TX = sessions sur le rate-limiter
+    // matériel (cap RL par port, limite dure de la carte — DPDK_NARROW.md §7). `dropped` =
+    // sessions au-delà du cap IGNORÉES par le moteur → badge SUR-CAPACITÉ. Identique io2110.js.
+    function _rlBar(active, cap, dropped, scope){
+      active  = Math.max(0, active || 0);
+      cap     = Math.max(1, cap || 1);
+      dropped = Math.max(0, dropped || 0);
+      const pct  = Math.min(100, Math.round(active / cap * 100));
+      const over = dropped > 0 || active > cap;
+      const col  = over ? 'var(--status-stopped-fg,#f87171)'
+                 : (active >= cap ? '#e8a33d' : 'var(--status-running-fg,#22c55e)');
+      let txt = window.t('js.io2110.rl_val').replace('{act}', active).replace('{cap}', cap)
+                + ` (${pct}%)`;
+      if (over) txt = window.t('js.io2110.rl_overcap').replace('{n}', dropped || (active - cap))
+                      + ' — ' + txt;
+      return `<div class="nic-bar-wrap">
+        <span class="nic-bar-lbl" title="${esc(window.t('js.io2110.rl_tip'))}">${esc(window.t('js.io2110.rl_sessions'))}</span>
+        <span class="nic-bar-val" style="color:${col}">${esc(txt + (scope || ''))}</span>
+        <div class="nic-bar-track"><div class="nic-bar-fill" style="width:${pct}%;background:${col}"></div></div>
+      </div>`;
+    }
+
+    // Ligne « Files RX (RSS) » (socle DPDK) : files de réception réservées, dimensionnées à la
+    // demande (pas de plafond AF-XDP sous vfio) — informatif, sans barre de saturation.
+    function _rssRow(n, scope){
+      if (n == null) return '';
+      return `<div class="nic-bar-wrap">
+        <span class="nic-bar-lbl" title="${esc(window.t('js.io2110.rx_rss_tip'))}">${esc(window.t('js.io2110.rx_rss'))}</span>
+        <span class="nic-bar-val">${esc(window.t('js.io2110.rx_rss_val').replace('{n}', n) + (scope || ''))}</span>
       </div>`;
     }
 
@@ -645,10 +681,16 @@ window.MXLPlugins["2110_io"] = {
       // backend (xdp_hw_max_combined agrégé) — plus de rustine × _nPorts ici. Barre « toutes NIC ».
       const _nPorts      = ((c && c.nic_ports) || []).length;
       const _xdpHwMax    = c && c.xdp_hw_max_combined;
-      const _xdpScope    = _nPorts > 1 ? ' · toutes NIC' : '';
+      const _xdpScope    = _nPorts > 1 ? ' · ' + window.t('js.io2110.all_nics') : '';
       const _hasB2 = (_xdpReserved != null) && (_xdpHwMax != null) && _xdpHwMax > 0;
+      // Socle DPDK narrow (rl_active) : la barre « Queues XDP » n'a plus de sens (PF vfio, pas de
+      // plafond AF-XDP) → files RX (RSS) réservées + « Sessions TX (RL) » sur le cap RL agrégé.
+      const _hasRL = !!(c && c.rl_active && c.rl_tx_cap_total);
       let _nicXdpBar = '';
-      if (_hasB2) {
+      if (_hasRL) {
+        _nicXdpBar = _rssRow(c.rl_rx_queues, _xdpScope)
+                   + _rlBar(c.rl_tx_sessions, c.rl_tx_cap_total, c.rl_tx_dropped, _xdpScope);
+      } else if (_hasB2) {
         _nicXdpBar = _xdpBar(_xdpAct, _xdpPlanned, _xdpReserved, _xdpHwMax, _xdpScope);
       } else if (_xdpAlloc != null) {
         // Repli image pré-A2 (pas de `reserved`) : ancien rendu allocated/HW.

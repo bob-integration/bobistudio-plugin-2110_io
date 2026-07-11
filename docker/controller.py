@@ -70,6 +70,15 @@ _xdp_sessions_active = 0
 # compte par port : une session libmtl = une file, MÊME en fan-out (1 multicast → N slots = 1 session).
 # Compter les flux côté orchestrateur sur-compterait. Mis à jour avec _xdp_sessions_active.
 _xdp_active_per_iface = {}
+# Ventilation RX/TX des sessions actives PAR PORT ({iface: count}) — socle DPDK narrow : le budget
+# TX pertinent devient les sessions RL par port (cap RL_TX_QUEUES_CAP), le RX les files RSS. Mis à
+# jour avec _xdp_active_per_iface (même règle role=='tx' que _write_config). Exposés :8080 (bloc
+# `rl` + nic.ports[].{rx,tx}_sessions_active) pour la supervision Sources/Destinations.
+_tx_active_per_iface = {}
+_rx_active_per_iface = {}
+# Sessions TX IGNORÉES au-delà du cap RL (cf. _emit_tx dans la boucle de réconciliation) — sur-
+# capacité surfacée à l'UI (badge SUR-CAPACITÉ) au lieu d'un simple log.
+_tx_sessions_dropped = 0
 # Files RÉSERVÉES au dernier mtl_init (rx_queues/tx_queues passés au lancement). Distinct de
 # `_rx/_tx_queues_alloc` qui suit la DEMANDE courante (recalculée à chaque _write_config) : le daemon
 # ne relit PAS rx_queues après mtl_init → la réservation est FIGÉE jusqu'au prochain (re)lancement.
@@ -339,6 +348,14 @@ _HAS_DPDK = any(p == "dpdk" for p in PORT_PMDS)
 def _port_pmd(ifn):
     """PMD du port `ifn` : 'af_xdp' (défaut, chemin actuel) ou 'dpdk' (vfio-pci)."""
     return PORT_PMDS[IFACES.index(ifn)] if ifn in IFACES else "af_xdp"
+
+def _rl_is_active():
+    """Vrai si le pacing RL (rate-limiter matériel, socle narrow) est le mécanisme TX effectif :
+    ≥1 port dpdk ET MTL_PACING rl/auto (auto → RL sur E810 dpdk). MÊME gate que le clamp
+    RL_TX_QUEUES_CAP de _write_config — tsc/tsc_narrow ne construisent aucune hiérarchie TM
+    donc ne sont jamais bornés (le cap ne les concerne pas)."""
+    _pacing = (os.environ.get("MTL_PACING") or "auto").strip().lower()
+    return _HAS_DPDK and _pacing in ("rl", "auto")
 
 def _port_bdf(ifn):
     """BDF PCI du port `ifn` ('' si af_xdp / inconnu)."""
@@ -1163,6 +1180,11 @@ class MetricsHandler(BaseHTTPRequestHandler):
                 _pent["pmd"] = "dpdk"
                 _pent["bdf"] = _port_bdf(_if)
                 _pent["budget"] = "dpdk"
+                # Supervision socle narrow : sessions RL TX live / cap RL du port (la limite dure,
+                # cf. DPDK_NARROW.md §7) + sessions RX (files RSS dimensionnées à la demande).
+                _pent["rl_tx_cap"] = RL_TX_QUEUES_CAP if _rl_is_active() else None
+                _pent["tx_sessions_active"] = _tx_active_per_iface.get(_if, 0)
+                _pent["rx_sessions_active"] = _rx_active_per_iface.get(_if, 0)
                 _ment = _mtl_port_entry(_if)
                 if _ment:
                     _pent["mtl_stats"] = _ment
@@ -1183,7 +1205,21 @@ class MetricsHandler(BaseHTTPRequestHandler):
                             "active":              _xdp_sessions_active,
                             "hw_max_combined":     hw_q["max"]          if hw_q else None,
                             "hw_current_combined": hw_q["current"]       if hw_q else None,
-                            "hw_xdp_available":    hw_q["xdp_available"] if hw_q else None}}
+                            "hw_xdp_available":    hw_q["xdp_available"] if hw_q else None},
+                   # Socle DPDK narrow : le budget TX pertinent = sessions RL par port (cap
+                   # RL_TX_QUEUES_CAP, la limite dure de la carte — DPDK_NARROW.md §7), le RX = files
+                   # RSS (rx_queues_alloc). tx_dropped = sessions demandées au-delà du cap, IGNORÉES
+                   # par la boucle de réconciliation → sur-capacité à surfacer côté UI. Bloc émis
+                   # inconditionnellement (active=False sur un nœud af_xdp/tsc → l'UI garde la barre
+                   # « Queues XDP » historique).
+                   "rl": {"active":          _rl_is_active(),
+                           "pacing":          (os.environ.get("MTL_PACING") or "auto").strip().lower(),
+                           "tx_cap_per_port": RL_TX_QUEUES_CAP if _rl_is_active() else None,
+                           "tx_sessions":     sum(_tx_active_per_iface.values()),
+                           "rx_sessions":     sum(_rx_active_per_iface.values()),
+                           "tx_dropped":      _tx_sessions_dropped,
+                           "rx_queues_alloc": _rx_queues_alloc,
+                           "tx_queues_alloc": _tx_queues_alloc}}
         # Grandmaster PTP interne libmtl (mtl_ports.json:ptp, socle DPDK) → l'orchestrateur
         # construit a=ts-refclk:ptp du SDP TX quand ptp4l kernel est absent. Relais brut.
         _pj = _mtl_ports_read() or {}
@@ -2620,7 +2656,7 @@ def _manager_loop():
     dernier mtl_init (sinon plafond muet ~8 = 2 files/port × 4 ports) — relance DEBOUNCÉE (config
     stable depuis _RELAUNCH_SETTLE_S) pour regrouper une rafale d'abonnements en une seule réinit."""
     global _mtl_proc, _cur_sig, _fail_streak, _xdp_sessions_active, _xdp_active_per_iface, _sig_changed_at, _ip_check_at
-    global _tx_budget_warned
+    global _tx_budget_warned, _tx_sessions_dropped, _tx_active_per_iface, _rx_active_per_iface
     while True:
         groups = {}        # (mcast, port) → {"info": sdp, "idxs": [..]} — fan-out même-source
         for idx in range(N_VIDEO):
@@ -2753,6 +2789,7 @@ def _manager_loop():
                     if not dshm.startswith("/"):
                         dshm = "/dev/shm/" + dshm
                     _emit_tx(_anc_tx_session(i, t, dshm, _tx_iface(i, t.get("iface"))))
+        _tx_sessions_dropped = _tx_dropped   # sur-capacité RL surfacée :8080 (bloc rl.tx_dropped)
         if _tx_dropped and not _tx_budget_warned:
             _tx_budget_warned = True
             print("mtl_rx: {} session(s) TX au-delà du cap RL de la carte ({} sessions/port, "
@@ -2769,11 +2806,23 @@ def _manager_loop():
             _cur_sig = sig
             _sig_changed_at = time.time()
             _xdp_sessions_active = len(sessions)
-            _api = {}
+            _api, _tpi, _rpi = {}, {}, {}
             for _s in sessions:
                 _ifc = _s.get("iface") or IFACE
                 _api[_ifc] = _api.get(_ifc, 0) + 1
+                # Ventilation RX/TX par port (même règle role=='tx' que _write_config) — le TX est
+                # la métrique bornée par le cap RL (socle narrow), le RX consomme des files RSS.
+                _d = _tpi if _s.get("role") == "tx" else _rpi
+                _d[_ifc] = _d.get(_ifc, 0) + 1
+                # 2022-7 : le leg redondant consomme sa file/feuille RL sur SA NIC (cf. _write_config)
+                # → compté dans les ventilations RX/TX (comparées au cap PAR PORT). `_api` (compteur
+                # AF-XDP historique) garde sa sémantique existante (sessions, pas legs).
+                _ifc2 = _s.get("iface2")
+                if _ifc2 and _ifc2 != _ifc:
+                    _d[_ifc2] = _d.get(_ifc2, 0) + 1
             _xdp_active_per_iface = _api
+            _tx_active_per_iface = _tpi
+            _rx_active_per_iface = _rpi
             print("mtl_rx config: {} session(s)".format(len(sessions)), flush=True)
 
         # 2) cycle de vie : lancé 1× au 1er besoin, maintenu en vie ; relancé si crash OU si la demande
