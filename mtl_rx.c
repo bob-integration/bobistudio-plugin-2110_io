@@ -36,6 +36,7 @@
 #include <mtl/st_pipeline_api.h>
 #include <mtl/st30_pipeline_api.h>
 #include <mtl/st40_pipeline_api.h>
+#include <mtl/st40_api.h>         /* ANC RFC 8331 : st40_set/get_udw, add_parity_bits, calc_checksum */
 #include <mtl/st_convert_api.h>   /* mode tranche : conversions SIMD RFC4175↔planar PAR BANDE */
 #include <json-c/json.h>
 
@@ -58,11 +59,143 @@
 #define MAX_SESS  128
 #define MAX_TG    16   /* cibles (shm de sortie) par session : fan-out même-source → N slots */
 
-/* ── ANC / ST 2110-40 (data) ── un slot shm ANC sérialise un frame st40 (meta + udw). */
+/* ── ANC / ST 2110-40 (data) ── le grain MXL porte une charge utile ANC.
+ *
+ * FORMAT NORMATIF (depuis 2026-07-12) : **RFC 8331** → interopérable. Le format MAISON
+ * historique ([u32 meta_num][u32 udw_fill][meta×16][udw]) n'était compris QUE de nous : un
+ * consommateur MXL stock le parsait comme du RFC 8331, en déduisait « ANC count: 0 » et
+ * concluait SANS ERREUR que le flux ne portait aucun ANC → PERTE SILENCIEUSE du timecode/tally
+ * (banc croisé, cf. MXL_INTEROP.md). Contrairement au planar (vrai gain CPU sur des trames de
+ * plusieurs Mo), ce format maison n'achetait RIEN : un grain ANC fait 4 Ko.
+ *
+ * Layout du grain (identique à bobimxl.anc_pack_rfc8331, validé octet pour octet contre libmtl) :
+ *   [u16 Length BE][u8 ANC_Count][2 b F + 6 b rsvd][u16 rsvd]      ← en-tête 6 o (pas d'ESN :
+ *                                                                     c'est un champ RTP)
+ *   puis les paquets, chacun multiple de 4 o (l'alignement 32 b du RFC se compte depuis le
+ *   payload RTP, qui portait 2 o d'ESN de plus → dans le grain : octets 6, 10, 14…) :
+ *     [1 b C][11 b Line][12 b Hori][1 b S][7 b StreamNum]   (32 b)
+ *     puis un flux de mots de 10 bits : DID, SDID, Data_Count, UDW×DC, Checksum_Word
+ *     (parité SMPTE 291 + checksum via les primitives libmtl), bourré à 32 b.
+ *
+ * On LIT encore l'ancien format (ANC_FMT_BOBI_V1) le temps que la flotte se migre : le codage
+ * est ANNONCÉ par le producteur dans son flowDef (`bobi_anc_format`). */
 #define ANC_SLOT     8192u    /* taille d'un slot ANC (sérialisation bornée) */
 #define ANC_MAX_UDW  4000u    /* buffer UDW max par frame (octets, 1 o = 1 UDW low8) */
-/* En-tête de slot : [u32 meta_num][u32 udw_fill], puis meta_num × anc_meta_rec, puis udw_fill octets. */
+#define ANC_HDR_BYTES 6u      /* en-tête du grain RFC 8331 (Length + ANC_Count + F/rsvd) */
+/* Ancien format maison — LECTURE SEULE (compat flotte mixte, ne plus produire). */
 struct anc_meta_rec { uint16_t did, sdid, line, hori, udw_size, udw_offset, c, s; };  /* 16 o */
+
+/* Taille (octets) d'un paquet ANC RFC 8331 : 1er chunk 32 b + (3 + udw + checksum) mots de
+ * 10 bits, arrondi au multiple de 4 o. */
+static inline size_t anc_elem_bytes(uint16_t udw_size) {
+  uint32_t bits = (uint32_t)(3 + udw_size + 1) * 10u;
+  return 4u + ((bits + 31u) / 32u) * 4u;
+}
+
+/* Sérialise un frame st40 (meta[] + udw) en un grain RFC 8331. Renvoie les octets écrits, ou 0
+ * si ça ne tient pas (le grain est alors laissé « 0 paquet », jamais de débordement). */
+static size_t anc_pack_rfc8331(uint8_t* dst, size_t dst_size, const struct st40_frame_info* f) {
+  if (dst_size < ANC_HDR_BYTES) return 0;
+  uint32_t mn = f->meta_num; if (mn > ST40_MAX_META) mn = ST40_MAX_META;
+  size_t off = ANC_HDR_BYTES;
+  uint32_t written = 0;
+  for (uint32_t m = 0; m < mn; m++) {
+    const struct st40_meta* md = &f->meta[m];
+    uint16_t n = md->udw_size;
+    size_t need = anc_elem_bytes(n);
+    if (off + need > dst_size) break;                  /* tronque proprement plutôt que déborder */
+    memset(dst + off, 0, need);
+    struct st40_rfc8331_payload_hdr* p = (struct st40_rfc8331_payload_hdr*)(dst + off);
+    p->first_hdr_chunk.c = md->c;
+    p->first_hdr_chunk.line_number = md->line_number;
+    p->first_hdr_chunk.horizontal_offset = md->hori_offset;
+    p->first_hdr_chunk.s = md->s;
+    p->first_hdr_chunk.stream_num = md->stream_num;    /* enfin porté (l'ancien format le PERDAIT) */
+    p->second_hdr_chunk.did = st40_add_parity_bits(md->did);
+    p->second_hdr_chunk.sdid = st40_add_parity_bits(md->sdid);
+    p->second_hdr_chunk.data_count = st40_add_parity_bits(n);
+    p->swapped_first_hdr_chunk = htonl(p->swapped_first_hdr_chunk);
+    p->swapped_second_hdr_chunk = htonl(p->swapped_second_hdr_chunk);
+    /* UDW à partir de l'index 3 DANS second_hdr_chunk (0,1,2 = DID/SDID/DC) → bit 62, contigu. */
+    const uint8_t* udw = f->udw_buff_addr + md->udw_offset;
+    for (uint16_t i = 0; i < n; i++)
+      st40_set_udw(i + 3, st40_add_parity_bits(udw[i]), (uint8_t*)&p->second_hdr_chunk);
+    st40_set_udw(n + 3, st40_calc_checksum(3 + n, (uint8_t*)&p->second_hdr_chunk),
+                 (uint8_t*)&p->second_hdr_chunk);
+    off += need; written++;
+  }
+  size_t body = off - ANC_HDR_BYTES;
+  dst[0] = (uint8_t)(body >> 8); dst[1] = (uint8_t)(body & 0xff);   /* Length (BE) */
+  dst[2] = (uint8_t)written;                                        /* ANC_Count */
+  dst[3] = 0; dst[4] = 0; dst[5] = 0;                               /* F=0 + réservés */
+  return off;
+}
+
+/* Décode un grain RFC 8331 → meta[] + udw du frame st40 de TX. Renvoie le nombre de paquets. */
+static uint32_t anc_unpack_rfc8331(const uint8_t* src, size_t src_size,
+                                   struct st40_frame_info* f, uint32_t max_udw) {
+  if (src_size < ANC_HDR_BYTES) return 0;
+  size_t body = ((size_t)src[0] << 8) | src[1];
+  uint32_t count = src[2];
+  if (count > ST40_MAX_META) count = ST40_MAX_META;
+  if (ANC_HDR_BYTES + body > src_size) return 0;                    /* Length incohérent */
+  size_t off = ANC_HDR_BYTES;
+  uint32_t fill = 0, n_out = 0;
+  for (uint32_t m = 0; m < count; m++) {
+    if (off + 8 > src_size) break;
+    struct st40_rfc8331_payload_hdr p;
+    memcpy(&p, src + off, sizeof(p));
+    p.swapped_first_hdr_chunk = ntohl(p.swapped_first_hdr_chunk);
+    p.swapped_second_hdr_chunk = ntohl(p.swapped_second_hdr_chunk);
+    uint16_t n = p.second_hdr_chunk.data_count & 0xff;              /* 8 bits utiles (b8/b9=parité) */
+    size_t need = anc_elem_bytes(n);
+    if (off + need > src_size || fill + n > max_udw) break;
+    struct st40_meta* md = &f->meta[n_out];
+    md->c = p.first_hdr_chunk.c;
+    md->line_number = p.first_hdr_chunk.line_number;
+    md->hori_offset = p.first_hdr_chunk.horizontal_offset;
+    md->s = p.first_hdr_chunk.s;
+    md->stream_num = p.first_hdr_chunk.stream_num;                  /* préservé */
+    md->did = p.second_hdr_chunk.did & 0xff;
+    md->sdid = p.second_hdr_chunk.sdid & 0xff;
+    md->udw_size = n;
+    md->udw_offset = fill;
+    /* Relire les UDW depuis le buffer SOURCE (l'en-tête local `p` a été byte-swappé). */
+    const uint8_t* chunk = src + off + 4;                           /* &second_hdr_chunk */
+    for (uint16_t i = 0; i < n; i++)
+      f->udw_buff_addr[fill + i] = (uint8_t)(st40_get_udw(i + 3, (uint8_t*)chunk) & 0xff);
+    fill += n; n_out++; off += need;
+  }
+  f->meta_num = n_out;
+  f->udw_buffer_fill = fill;
+  return n_out;
+}
+
+/* (anc_flow_is_rfc8331 est défini plus bas : il a besoin de l'instance MXL globale g_mxl.) */
+
+/* Décodage de l'ANCIEN grain maison (lecture seule, flotte en migration). */
+static uint32_t anc_unpack_bobi_v1(const uint8_t* src, size_t src_size,
+                                   struct st40_frame_info* f, uint32_t max_udw) {
+  if (src_size < 8) return 0;
+  uint32_t mn = ((const uint32_t*)src)[0];
+  uint32_t fill = ((const uint32_t*)src)[1];
+  if (mn > ST40_MAX_META) return 0;
+  if (fill > max_udw) fill = max_udw;
+  if (8 + (size_t)mn * sizeof(struct anc_meta_rec) + fill > src_size) return 0;
+  const struct anc_meta_rec* mr = (const struct anc_meta_rec*)(src + 8);
+  for (uint32_t m = 0; m < mn; m++) {
+    struct st40_meta* md = &f->meta[m];
+    md->did = mr[m].did; md->sdid = mr[m].sdid;
+    md->line_number = mr[m].line; md->hori_offset = mr[m].hori;
+    md->udw_size = mr[m].udw_size; md->udw_offset = mr[m].udw_offset;
+    md->c = mr[m].c; md->s = mr[m].s; md->stream_num = 0;   /* perdu par ce format */
+  }
+  if (fill && f->udw_buff_addr)
+    memcpy(f->udw_buff_addr, src + 8 + (size_t)mn * sizeof(struct anc_meta_rec), fill);
+  f->meta_num = mn;
+  f->udw_buffer_fill = fill;
+  return mn;
+}
 
 enum sess_kind { K_VIDEO, K_AUDIO, K_DATA };   /* DATA = ST 2110-40 ANC (passthrough + timecode) */
 enum sess_role { ROLE_RX, ROLE_TX };           /* RX = wire→shm (receiver) ; TX = shm→wire (sender) */
@@ -129,6 +262,20 @@ static uint64_t media_ts_to_tai(mtl_handle st, enum st10_timestamp_fmt tfmt,
 /* ═══ MXL ═══ instance globale (un domaine = un sous-rép. tmpfs partagé avec les consommateurs).
  * Domaine surchargeable par MXL_DOMAIN (isole un banc). Créée dans main(), à vie. */
 static mxlInstance g_mxl = NULL;
+
+/* Codage ANC ANNONCÉ par le producteur (`bobi_anc_format` du flowDef) → flotte MIXTE pendant la
+ * migration. Champ absent = producteur pas encore migré → ancien format maison. (Défini ici et
+ * pas dans le bloc ANC plus haut : a besoin de g_mxl.) */
+static int anc_flow_is_rfc8331(const char* flow_id) {
+  char buf[8192];
+  size_t sz = sizeof(buf);
+  if (mxlGetFlowDef(g_mxl, flow_id, buf, &sz) != MXL_STATUS_OK) return 0;
+  buf[sizeof(buf) - 1] = 0;
+  const char* k = strstr(buf, "bobi_anc_format");
+  if (!k) return 0;
+  const char* v = strstr(k, "rfc8331");
+  return (v && (size_t)(v - k) < 40) ? 1 : 0;
+}
 
 /* ── Ports MTL (NIC) du device ── un mtl_init unique peut déclarer plusieurs NIC média
  * (MTL_PORT_MAX). Remplis à l'init, puis résolus PAR SESSION via le nom d'iface (multi-NIC :
@@ -264,6 +411,8 @@ struct target {
   uint64_t tx_src_idx;     /* TX vidéo : dernier index de grain SOURCE lu (détection flux figé) */
   uint64_t tx_src_idx_ns;  /* TX vidéo : instant (monotone) où tx_src_idx a changé pour la dernière fois */
   int      tx_src_idx_init; /* TX vidéo : tx_src_idx amorcé ? (0 au (ré)ouverture du reader) */
+  int      anc_fmt_init;   /* TX ANC : codage du producteur déjà résolu ? (0 au (ré)ouverture) */
+  int      anc_rfc8331;    /* TX ANC : 1 = producteur RFC 8331 (normatif), 0 = ancien format maison */
   uint64_t field_base;     /* TX entrelacé : index du 1er champ de la trame émise (MÊME trame pour les
                             * 2 champs → anti-peigne). Parité = TOP(pair) en TFF, BOTTOM(impair) en BFF. */
   /* RX vidéo : latence de réception (segment A = capture média → écriture shm), moyenne glissante
@@ -489,12 +638,16 @@ static char* build_audio_flowdef(struct sess* s, struct target* t) {
   return out;
 }
 
-/* Data/ANC (video/smpte291) : grain = payload ANC sérialisée (meta+udw). */
+/* Data/ANC (video/smpte291) : grain = payload ANC **RFC 8331** (normatif, interopérable).
+ * `bobi_anc_format` (champ NON standard, ignoré par un SDK stock — même vecteur que slice_height)
+ * ANNONCE le codage aux consommateurs → un lecteur pas encore migré, ou un producteur legacy
+ * encore en vol, restent gérés (flotte MIXTE). Cf. bobimxl.build_data_flow_def. */
 static char* build_data_flowdef(struct sess* s, struct target* t) {
   const char* name = flow_name(t->shm_path);
   char id[37]; flow_id_str(name, id);
   struct json_object* o = json_object_new_object();
   json_object_object_add(o, "id", json_object_new_string(id));
+  json_object_object_add(o, "bobi_anc_format", json_object_new_string("rfc8331"));
   json_object_object_add(o, "tags", jgrouphint(name, "Data"));
   json_object_object_add(o, "format", json_object_new_string("urn:x-nmos:format:data"));
   json_object_object_add(o, "label", json_object_new_string(name));
@@ -1136,6 +1289,7 @@ static int open_reader(struct target* t) {
   char id[37]; flow_id_str(flow_name(t->shm_path), id);
   if (mxlCreateFlowReader(g_mxl, id, NULL, &t->reader) != MXL_STATUS_OK) { t->reader = NULL; return -1; }
   t->tx_src_idx_init = 0;   /* nouveau reader → ré-amorce la détection de flux figé */
+  t->anc_fmt_init = 0;      /* …et la résolution du codage ANC (le producteur a pu être migré) */
   return 0;
 }
 
@@ -1868,29 +2022,16 @@ static void* data_rx_thread(void* arg) {
   while (!s->stop) {
     struct st40_frame_info* frame = st40p_rx_get_frame(s->d_rx);
     if (!frame) { usleep(1000); continue; }
-    uint32_t mn = frame->meta_num; if (mn > ST40_MAX_META) mn = ST40_MAX_META;
-    uint32_t fill = frame->udw_buffer_fill; if (fill > s->max_udw) fill = s->max_udw;
-    size_t need = 8 + (size_t)mn * sizeof(struct anc_meta_rec) + fill;
     char tc[16]; int df = 0; int got_tc = decode_atc(frame, tc, &df);
     uint64_t idx = mxlGetCurrentIndex(&s->mrate);   /* grille trame TAI (ANC ~1 grain/trame) */
     for (int ti = 0; ti < s->ntg; ti++) {
       struct target* t = &s->tg[ti];
       mxlGrainInfo gi; uint8_t* dst;
       if (mxlFlowWriterOpenGrain(t->writer, idx, &gi, &dst) != MXL_STATUS_OK) continue;
-      if (need <= gi.grainSize) {
-        ((uint32_t*)dst)[0] = mn; ((uint32_t*)dst)[1] = fill;
-        struct anc_meta_rec* mr = (struct anc_meta_rec*)(dst + 8);
-        for (uint32_t m = 0; m < mn; m++) {
-          struct st40_meta* md = &frame->meta[m];
-          mr[m].did = md->did; mr[m].sdid = md->sdid;
-          mr[m].line = md->line_number; mr[m].hori = md->hori_offset;
-          mr[m].udw_size = md->udw_size; mr[m].udw_offset = md->udw_offset;
-          mr[m].c = md->c; mr[m].s = md->s;
-        }
-        if (fill) memcpy(dst + 8 + (size_t)mn * sizeof(struct anc_meta_rec), frame->udw_buff_addr, fill);
-      } else {   /* frame anormalement gros → grain vide (on ne déborde jamais) */
-        ((uint32_t*)dst)[0] = 0; ((uint32_t*)dst)[1] = 0;
-      }
+      /* Sérialisation NORMATIVE RFC 8331 (interopérable). Tronque proprement si le grain est
+       * trop petit — jamais de débordement ; un frame vide donne un grain « 0 paquet ». */
+      memset(dst, 0, ANC_HDR_BYTES);
+      anc_pack_rfc8331(dst, gi.grainSize, frame);
       if (got_tc) { memcpy(t->tc, tc, sizeof(t->tc)); t->tc_df = df; t->tc_valid = 1; }
       gi.validSlices = gi.totalSlices;
       mxlFlowWriterCommitGrain(t->writer, &gi);
@@ -1919,20 +2060,17 @@ static void* data_tx_thread(void* arg) {
     t->alive_ns = mono_ns();     /* la session transmet (frames libérées par MTL) */
     mxlGrainInfo gi; uint8_t* src;
     if (reader_latest(t, &gi, &src) == 0) {
-      uint32_t mn = ((const uint32_t*)src)[0]; if (mn > ST40_MAX_META) mn = 0;
-      uint32_t fill = ((const uint32_t*)src)[1]; if (fill > s->max_udw) fill = s->max_udw;
-      const struct anc_meta_rec* mr = (const struct anc_meta_rec*)(src + 8);
-      frame->meta_num = mn;
-      for (uint32_t m = 0; m < mn; m++) {
-        struct st40_meta* md = &frame->meta[m];
-        md->did = mr[m].did; md->sdid = mr[m].sdid;
-        md->line_number = mr[m].line; md->hori_offset = mr[m].hori;
-        md->udw_size = mr[m].udw_size; md->udw_offset = mr[m].udw_offset;
-        md->c = mr[m].c; md->s = mr[m].s; md->stream_num = 0;
+      /* Aiguillage sur le codage ANNONCÉ par le producteur (flotte MIXTE pendant la migration).
+       * Résolu UNE fois par reader (le flowDef est immuable) — pas de mxlGetFlowDef par trame. */
+      if (!t->anc_fmt_init) {
+        char id[37]; flow_id_str(flow_name(t->shm_path), id);
+        t->anc_rfc8331 = anc_flow_is_rfc8331(id);
+        t->anc_fmt_init = 1;
       }
-      if (fill && frame->udw_buff_addr)
-        memcpy(frame->udw_buff_addr, src + 8 + (size_t)mn * sizeof(struct anc_meta_rec), fill);
-      frame->udw_buffer_fill = fill;
+      if (t->anc_rfc8331)
+        anc_unpack_rfc8331(src, gi.grainSize, frame, s->max_udw);
+      else
+        anc_unpack_bobi_v1(src, gi.grainSize, frame, s->max_udw);
       t->index = gi.index;
     } else {
       frame->meta_num = 0; frame->udw_buffer_fill = 0;   /* pas de grain → ANC vide */

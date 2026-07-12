@@ -1,7 +1,13 @@
 {
-  "version": "0.42.0",
+  "version": "0.40.0",
   "date": "2026-07-12",
   "changes": {
+    "ANC RFC 8331 (0.40.0) — interopérabilité": [
+      "Le grain ANC (video/smpte291) est désormais sérialisé en RFC 8331 (normatif) au lieu du format maison [u32 meta_num][u32 udw_fill][meta×16][udw], qui provoquait une PERTE SILENCIEUSE chez un consommateur tiers (« ANC count: 0 », aucune erreur) — cf. MXL_INTEROP.md. Le flowDef annonce bobi_anc_format:rfc8331.",
+      "Le TX aiguille sur le codage ANNONCÉ par le producteur (flowDef) → une source ANC pas encore migrée (player/moteur legacy) reste émise correctement : flotte MIXTE supportée, migration sans flag day.",
+      "stream_num est enfin porté de bout en bout (l'ancien format le PERDAIT : 8 champs de méta sérialisés là où libmtl en expose 9).",
+      "Codec validé octet pour octet contre les primitives libmtl (st40_set_udw/add_parity_bits/calc_checksum) ET contre bobimxl. REBUILD bobi-mtl requis."
+    ],
     "Fusion des lignes slice (0.41.x) + narrow (0.39.16) — REBUILD requis (0.42.0)": [
       "Merge feat/mxl-slice (mode tranche, epoch-shift TX, watchdog/late) + supervision RL du socle DPDK narrow. controller.py /status porte a la fois le relais PTP grandmaster et le bloc rl (sessions RL/cap, files RSS). Une seule image porte desormais les deux chantiers."
     ],
