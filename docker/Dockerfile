@@ -125,6 +125,20 @@ COPY patch_ptp_gm_export.py /tmp/patch_ptp_gm_export.py
 # fenêtre d'émission de la session est décalée de −delta APRÈS l'epoch nominal, le timestamp RTP
 # restant sur l'epoch NOMINAL (TROFF ST 2110-21, FPT ≈ shift côté récepteur). Delta ≥ 0 inchangé.
 COPY patch_epoch_shift.py /tmp/patch_epoch_shift.py
+# Patch bobi.studio ICE TM MOVE RETRY (0.46.0, fix RACINE des sessions TX mortes en cold-batch,
+# cf. patch_tm_hierarchy.py + patch_tx_burst_rendezvous.py) : ce patch cible le driver DPDK ice
+# (ice_tm.c), PAS libmtl — il dépose un .patch dans patches/dpdk/<ver>/ du clone MTL, appliqué
+# par le mécanisme natif de ./script/build_dpdk.sh (comme les 8 patches Intel/MTL officiels de ce
+# dossier). Cause racine : à chaque restart de port déclenché par un commit RL, ice_tm_setup_txq_node()
+# reparente CHAQUE queue déjà en hiérarchie vers notre arbre RL via un aller-retour admin-queue
+# firmware (ice_aq_move_recfg_lan_txq) — structurel, a lieu à chaque restart, pas évitable en
+# ajustant le fan-out côté libmtl. Cet aller-retour peut échouer transitoirement sous rafale de
+# commits ; non retenté, l'échec faisait échouer LE PORT ENTIER (pas juste la queue en cause) ⇒
+# plus aucune queue TX ne draine ⇒ mempools vidés ⇒ build ret -207 permanent. Fix : retry borné
+# (5×20ms) puis, si toujours en échec, dégrader (queue laissée sur son nœud actuel, port maintenu
+# en vie) au lieu de tuer le port — auto-guérison au commit suivant. DOIT s'appliquer avant
+# build_dpdk.sh (dépose le .patch dans le clone, pas de modif du dossier patches/dpdk en place).
+COPY patch_ice_tm_move_retry.py /tmp/patch_ice_tm_move_retry.py
 # MTL_REF est un SHA (pas une branche) → clone + fetch ciblé (GitHub sert les SHA joignables).
 RUN mkdir -p /src/MTL && cd /src/MTL \
  && git init -q && git remote add origin https://github.com/OpenVisualCloud/Media-Transport-Library \
@@ -142,6 +156,7 @@ RUN mkdir -p /src/MTL && cd /src/MTL \
  && python3 /tmp/patch_ptp_stable_getter.py \
  && python3 /tmp/patch_ptp_gm_export.py \
  && python3 /tmp/patch_epoch_shift.py \
+ && python3 /tmp/patch_ice_tm_move_retry.py \
  && MTL_PREFIX_ARGS="-Dtests=false" ./script/build_dpdk.sh -f \
  && ./build.sh || true \
  && ldconfig \
