@@ -93,10 +93,18 @@ RUN ln -sf /usr/include/x86_64-linux-gnu/asm /usr/include/asm
 #    Patch bobi.studio TM hierarchy (lève le mur des 8 files TX RL : arbre traffic-manager RAMIFIÉ
 #    — plusieurs nœuds queue-group au lieu d'un seul — pour >8 senders RL/port ET création en rafale ;
 #    nb_qps = P_parents × fan-out 8 côté PMD ice, jusqu'à MT_MAX_RL_ITEMS=128).
+#    Patch bobi.studio builder famine recovery (vidéo+audio) : une session TX déjà vivante qui perd
+#    les mbufs de son mempool hdr au commit RL d'UNE AUTRE session TX (cf. patch RX/TX hang resetting
+#    guard ci-dessus) échoue à l'ALLOC dans le builder, AVANT le chemin burst où vit le hang detector
+#    natif — celui-ci ne se déclenche donc jamais (ring vide, plus aucun paquet construit). Ce patch
+#    track la durée de famine (hors fenêtre resetting) et déclenche st20_tx_queue_fatal_error /
+#    st_audio_queue_fatal_error (récupération EXISTANTE : purge rings + nouvelle queue + reset
+#    mempool + WAIT_FRAME) après 2 s de famine confirmée.
 COPY patch_st40_afxdp_port.py /tmp/patch_st40_afxdp_port.py
 COPY patch_afxdp_tx_link_drop.py /tmp/patch_afxdp_tx_link_drop.py
 COPY patch_rx_resetting_guard.py /tmp/patch_rx_resetting_guard.py
 COPY patch_tx_hang_resetting_guard.py /tmp/patch_tx_hang_resetting_guard.py
+COPY patch_tx_builder_famine_recovery.py /tmp/patch_tx_builder_famine_recovery.py
 COPY patch_tm_hierarchy.py /tmp/patch_tm_hierarchy.py
 COPY patch_igmp_router_alert.py /tmp/patch_igmp_router_alert.py
 COPY patch_ptp_mcast_flow.py /tmp/patch_ptp_mcast_flow.py
@@ -115,6 +123,7 @@ RUN mkdir -p /src/MTL && cd /src/MTL \
  && python3 /tmp/patch_afxdp_tx_link_drop.py \
  && python3 /tmp/patch_rx_resetting_guard.py \
  && python3 /tmp/patch_tx_hang_resetting_guard.py \
+ && python3 /tmp/patch_tx_builder_famine_recovery.py \
  && python3 /tmp/patch_tm_hierarchy.py \
  && python3 /tmp/patch_igmp_router_alert.py \
  && python3 /tmp/patch_ptp_mcast_flow.py \
