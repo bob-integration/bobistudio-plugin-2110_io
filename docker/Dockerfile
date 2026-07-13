@@ -90,6 +90,16 @@ RUN ln -sf /usr/include/x86_64-linux-gnu/asm /usr/include/asm
 #    Patch bobi.studio RX resetting guard (RX+TX pacing RL même port : le commit TM du shaper RL
 #    stoppe brièvement le port ; le burst RX doit respecter inf->resetting sinon SIGSEGV « rx_pkt_burst
 #    for not ready port » — narrow matériel mono-port réparable).
+#    Patch bobi.studio TX burst rendezvous (0.45.0, fix RACINE des morts silencieuses de sessions
+#    TX au commit RL) : la garde resetting ci-dessus empêche un NOUVEAU burst de démarrer une fois
+#    resetting vu à true, mais rien n'empêchait un burst DÉJÀ ENGAGÉ d'écrire encore dans le
+#    sw_ring pendant que rte_tm_hierarchy_commit stoppe le port (ice_tx_queue_stop → memset SANS
+#    free) — ces mbufs tardifs étaient perdus en silence (mempool vidé, build ret -207 permanent,
+#    hang detector natif jamais atteint puisqu'il ne vit que dans le chemin burst). Compteur
+#    atomique per-port bobi_burst_inflight (mt_main.h) autour des 2 points de choke burst
+#    (mt_rxq_burst/mt_txq_burst, mt_queue.c) + spin-wait borné (80 ms) dans
+#    dev_tx_queue_set_rl_rate (mt_dev.c) APRÈS resetting=true et AVANT le commit. DOIT s'appliquer
+#    après patch_rx_resetting_guard (ancres = son état de sortie).
 #    Patch bobi.studio TM hierarchy (lève le mur des 8 files TX RL : arbre traffic-manager RAMIFIÉ
 #    — plusieurs nœuds queue-group au lieu d'un seul — pour >8 senders RL/port ET création en rafale ;
 #    nb_qps = P_parents × fan-out 8 côté PMD ice, jusqu'à MT_MAX_RL_ITEMS=128).
@@ -103,6 +113,7 @@ RUN ln -sf /usr/include/x86_64-linux-gnu/asm /usr/include/asm
 COPY patch_st40_afxdp_port.py /tmp/patch_st40_afxdp_port.py
 COPY patch_afxdp_tx_link_drop.py /tmp/patch_afxdp_tx_link_drop.py
 COPY patch_rx_resetting_guard.py /tmp/patch_rx_resetting_guard.py
+COPY patch_tx_burst_rendezvous.py /tmp/patch_tx_burst_rendezvous.py
 COPY patch_tx_hang_resetting_guard.py /tmp/patch_tx_hang_resetting_guard.py
 COPY patch_tx_builder_famine_recovery.py /tmp/patch_tx_builder_famine_recovery.py
 COPY patch_tm_hierarchy.py /tmp/patch_tm_hierarchy.py
@@ -122,6 +133,7 @@ RUN mkdir -p /src/MTL && cd /src/MTL \
  && python3 /tmp/patch_st40_afxdp_port.py \
  && python3 /tmp/patch_afxdp_tx_link_drop.py \
  && python3 /tmp/patch_rx_resetting_guard.py \
+ && python3 /tmp/patch_tx_burst_rendezvous.py \
  && python3 /tmp/patch_tx_hang_resetting_guard.py \
  && python3 /tmp/patch_tx_builder_famine_recovery.py \
  && python3 /tmp/patch_tm_hierarchy.py \
