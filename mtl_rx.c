@@ -2740,12 +2740,19 @@ int main(int argc, char** argv) {
           struct sess* s2 = &reg[i];
           if (!s2->used || s2->role != ROLE_TX || !s2->started || !s2->tg[0].alive_ns) continue;
           if (ptp_gate) { s2->tg[0].alive_ns = wnow; continue; }   /* re-tare : pas de tir différé au lock */
-          if (wnow - s2->tg[0].alive_ns > 5ull * 1000000000ull) {
+          /* bobi.studio: ÂGE SIGNÉ obligatoire — alive_ns est posé par les threads TX (get_frame)
+           * SANS synchro avec cette boucle : une mise à jour juste APRÈS le snapshot `wnow` donne
+           * alive_ns > wnow, et la soustraction non signée wrappe à ~2^64 ns (« aucune frame depuis
+           * 18446744073.7s ») → _exit(3) alors que la session est VIVANTE. Vu en prod 2026-07-13 :
+           * 31 relances daemon en 3 h sur mtlrx141 (coupure de TOUS les flux à chaque fois). Une
+           * session réellement figée donne un âge positif franc ; un delta négatif = signe de vie. */
+          int64_t age_ns = (int64_t)(wnow - s2->tg[0].alive_ns);
+          if (age_ns > 5ll * 1000000000ll) {
             /* bobi.studio: un ajout TX récent a stoppé le port (commit RL) → le stall n'est pas un
              * wedge, l'émission reprend seule à la fin du commit. Ne pas redémarrer pendant la grâce. */
             if (wnow < g_tx_add_grace_ns) continue;
             fprintf(stderr, "mtl_rx: TX FIGÉ %s:%d (aucune frame depuis %.1fs) — restart du daemon\n",
-                    s2->mcast, s2->udp_port, (wnow - s2->tg[0].alive_ns) / 1e9);
+                    s2->mcast, s2->udp_port, age_ns / 1e9);
             fflush(stderr);
             _exit(3);
           }

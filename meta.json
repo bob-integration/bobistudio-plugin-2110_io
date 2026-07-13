@@ -1,7 +1,11 @@
 {
-  "version": "0.40.0",
-  "date": "2026-07-12",
+  "version": "0.40.1",
+  "date": "2026-07-13",
   "changes": {
+    "FIX backstop « TX FIGÉ » : underflow uint64 → relances daemon en boucle (0.40.1)": [
+      "alive_ns est posé par les threads TX (get_frame) sans synchro avec la boucle de surveillance : une mise à jour juste après le snapshot wnow donnait alive_ns > wnow → soustraction NON SIGNÉE wrappée à ~2^64 ns (« aucune frame depuis 18446744073.7s ») → _exit(3) et relance COMPLÈTE du daemon (ré-init DPDK, coupure de TOUS les flux RX+TX) alors que la session était vivante. Vu en prod 2026-07-13 sur mtlrx141 : 31 relances en 3 h = micro-coupures récurrentes sur les murs consommateurs.",
+      "Fix : âge signé int64 au point de comparaison — un delta négatif = signe de vie, un vrai wedge donne un âge positif franc. REBUILD bobi-mtl requis (0.40.1)."
+    ],
     "ANC RFC 8331 (0.40.0) — interopérabilité": [
       "Le grain ANC (video/smpte291) est désormais sérialisé en RFC 8331 (normatif) au lieu du format maison [u32 meta_num][u32 udw_fill][meta×16][udw], qui provoquait une PERTE SILENCIEUSE chez un consommateur tiers (« ANC count: 0 », aucune erreur) — cf. MXL_INTEROP.md. Le flowDef annonce bobi_anc_format:rfc8331.",
       "Le TX aiguille sur le codage ANNONCÉ par le producteur (flowDef) → une source ANC pas encore migrée (player/moteur legacy) reste émise correctement : flotte MIXTE supportée, migration sans flag day.",
