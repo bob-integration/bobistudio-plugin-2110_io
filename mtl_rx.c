@@ -22,6 +22,7 @@
 #include <getopt.h>
 #include <math.h>
 #include <pthread.h>
+#include <sched.h>
 #include <signal.h>
 #include <stdbool.h>
 #include <stdint.h>
@@ -240,6 +241,29 @@ static uint64_t mono_ns(void) {
   return (uint64_t)ts.tv_sec * 1000000000ULL + ts.tv_nsec;
 }
 
+/* bobi.studio (0.44.2, volet 4) : les threads qui drainent le RX temps réel (audio_rx_thread en
+ * particulier, mais aussi vidéo/ANC) partagent le CPU avec le controller Python + les lcores
+ * busy-poll MTL sur un cpuset étroit → des hoquets d'ordonnancement CFS ≥4 ms font déborder le
+ * pool RX audio (framebuff_cnt=4, cf. volet 2). SCHED_FIFO leur donne priorité sur le CFS (les
+ * lcores busy-poll DPDK ne sont, eux, PAS gérés par ce processus — pur user-space EAL). Nécessite
+ * CAP_SYS_NICE (conteneur --privileged l'a déjà, cf. docker_driver._build_run_cmd) ; sans elle,
+ * pthread_setschedparam échoue EPERM → on continue en CFS (dégradé, pas fatal) et on logue UNE
+ * SEULE fois pour tout le process (pas par session/thread, pour ne pas spammer si plusieurs
+ * sessions RX démarrent sans la capacité). */
+static volatile int g_schedfifo_warned = 0;
+static void rt_thread_priority(const char* who) {
+  struct sched_param sp; memset(&sp, 0, sizeof(sp));
+  sp.sched_priority = 10;
+  int e = pthread_setschedparam(pthread_self(), SCHED_FIFO, &sp);   /* renvoie l'erreur, ne pose PAS errno */
+  if (e != 0) {
+    if (__sync_bool_compare_and_swap(&g_schedfifo_warned, 0, 1)) {
+      fprintf(stderr, "mtl_rx: SCHED_FIFO refusé (%s, errno=%d %s) — threads en CFS, "
+                       "prévoir CAP_SYS_NICE (+ ulimit rtprio) sur le conteneur moteur\n",
+              who, e, strerror(e));
+    }
+  }
+}
+
 /* Timestamp média de la frame → TAI ns ABSOLU (instant de capture, horloge PTP commune A/V).
  * Le RX libmtl fournit en pratique tfmt=MEDIA_CLK : un compteur 32 bits qui WRAPPE (~47721 s à
  * 90 kHz, ~89478 s à 48 kHz). st10_media_clk_to_ns ne donne que la position DANS la fenêtre →
@@ -418,6 +442,13 @@ struct target {
   /* RX vidéo : latence de réception (segment A = capture média → écriture shm), moyenne glissante
    * sur la fenêtre de stats. lat_sum en ns, lat_cnt = nb d'échantillons ; reset à chaque write_stats. */
   uint64_t lat_sum; uint32_t lat_cnt;
+  /* RX audio (bobi.studio 0.44.2) : gap-fill silence quand le RX a droppé des trames (famine CPU
+   * des threads de service, cf. volet 1 / CLAUDE.md). a_end = fin (index+n) du dernier chunk
+   * RÉELLEMENT écrit (t->index reste le DÉBUT, pour compat stats) ; a_primed = 0 tant qu'aucun
+   * chunk n'a encore été écrit (pas de gap-fill au tout premier chunk : rien à combler). */
+  uint64_t a_end; int a_primed;
+  uint64_t a_silence_filled;   /* échantillons de silence comblés (cumulatif, exposé si besoin) */
+  uint64_t a_silence_log_ns;   /* throttle log gap-fill (mono_ns du dernier log, 0=jamais loggé) */
   char     ident_file[300]; int has_ident;
   uint8_t* ident_patch; int id_bw, id_bh; long id_mtime;
   /* timecode ATC (data/ANC) — dernier TC décodé, publié dans les stats */
@@ -832,6 +863,7 @@ static void accum_tp(struct sess* s, const struct st20_rx_tp_meta* tp) {
 
 static void* video_rx_thread(void* arg) {
   struct sess* s = arg;
+  rt_thread_priority("video_rx_thread");
   uint64_t frame_idx_latch = 0;   /* entrelacé : index TRAME latché sur le 1er champ (→ index champ = ×2+sf) */
   while (!s->stop) {
     struct st_frame* frame = st20p_rx_get_frame(s->vh);
@@ -951,6 +983,7 @@ static void sl_copy_band(uint8_t* dst, const uint8_t* src, int W, int H, int con
  * progressivement. Trame complète → commit final (validSlices=totalSlices) + put_framebuff. */
 static void* video_rx_slice_thread(void* arg) {
   struct sess* s = arg;
+  rt_thread_priority("video_rx_slice_thread");
   int W = s->width, H = s->height, L = s->slice_lines;
   size_t bpl_be = ((size_t)W / 2) * 5;         /* RFC4175 422-10 : pg2 = 2 px = 5 octets */
   while (!s->stop) {
@@ -1039,8 +1072,42 @@ static void* video_rx_slice_thread(void* arg) {
  * On le CONVERTIT en samples float32 par canal (contrat MXL audio/float32) et on l'écrit dans le
  * flux continu MXL, à l'INDEX SAMPLE TAI (mxlTimestampToIndex sur la grille 48 kHz) → MÊME grille
  * PTP que la vidéo (phase-lock A/V structurel). */
+/* bobi.studio (0.44.2) : comble par du SILENCE (samples float32 = 0.0) le trou laissé par une
+ * ou plusieurs trames RX droppées (framebuff pool empty, cf. volet 2/RX_AUDIO_SESSION back-
+ * pressure) — sinon le span sauté reste LISIBLE côté consommateur avec du VIEUX contenu d'anneau
+ * (bouillie audio). Écrit [t->a_end, idx) AVANT le chunk réel. Borné à ~250 ms : au-delà, le trou
+ * dépasse la marge utile de l'anneau → pas de comblement (ré-ancrage franc sur idx, le trou reste
+ * un vrai trou plutôt qu'un mur de silence disproportionné). No-op au tout premier chunk
+ * (a_primed=0) et si aucun trou (idx <= a_end, cas normal). */
+static void audio_gapfill_silence(struct sess* s, struct target* t, uint64_t idx) {
+  if (!t->a_primed || idx <= t->a_end) return;
+  uint64_t gap = idx - t->a_end;
+  uint64_t max_gap_samples = (uint64_t)(0.25 * (double)s->srate.numerator / (double)s->srate.denominator);
+  if (gap > max_gap_samples) return;   /* trou > ~250 ms : pas de comblement, ré-ancrage franc */
+  mxlMutableWrappedMultiBufferSlice gslc; memset(&gslc, 0, sizeof(gslc));
+  if (mxlFlowWriterOpenSamples(t->writer, t->a_end, gap, &gslc) != MXL_STATUS_OK) return;
+  for (size_t c = 0; c < gslc.count; c++) {
+    for (int f = 0; f < 2; f++) {          /* 2 fragments (wrap d'anneau), même modèle que le chunk réel */
+      size_t fb = gslc.base.fragments[f].size;
+      if (!fb) continue;
+      void* dst = (uint8_t*)gslc.base.fragments[f].pointer + c * gslc.stride;
+      memset(dst, 0, fb);                 /* 0x00000000 == 0.0f en IEEE754 : memset(0) valide */
+    }
+  }
+  mxlFlowWriterCommitSamples(t->writer);
+  t->a_silence_filled += gap;
+  uint64_t tnow = mono_ns();
+  if (!t->a_silence_log_ns || tnow - t->a_silence_log_ns > 60000000000ULL) {   /* throttle 1/min */
+    fprintf(stderr, "mtl_rx[audio] %s: gap-fill silence %llu échantillon(s) (RX drop) — "
+                     "total comblé=%llu\n",
+            t->shm_path, (unsigned long long)gap, (unsigned long long)t->a_silence_filled);
+    t->a_silence_log_ns = tnow;
+  }
+}
+
 static void* audio_rx_thread(void* arg) {
   struct sess* s = arg;
+  rt_thread_priority("audio_rx_thread");
   int chs = s->channels;
   while (!s->stop) {
     struct st30_frame* frame = st30p_rx_get_frame(s->ah);
@@ -1053,6 +1120,7 @@ static void* audio_rx_thread(void* arg) {
       struct target* t = &s->tg[ti];
       uint64_t idx = mts ? mxlTimestampToIndex(&s->srate, mts)
                          : mxlGetCurrentIndex(&s->srate) - n;
+      audio_gapfill_silence(s, t, idx);
       mxlMutableWrappedMultiBufferSlice slc; memset(&slc, 0, sizeof(slc));
       if (mxlFlowWriterOpenSamples(t->writer, idx, n, &slc) != MXL_STATUS_OK) continue;
       size_t stride = slc.stride;
@@ -1074,6 +1142,7 @@ static void* audio_rx_thread(void* arg) {
       }
       mxlFlowWriterCommitSamples(t->writer);
       t->index = idx; t->recv++;
+      t->a_end = idx + n; t->a_primed = 1;
     }
     st30p_rx_put_frame(s->ah, frame);
   }
@@ -1875,7 +1944,13 @@ static int setup_audio(struct sess* s) {
   ops.sampling = ST30_SAMPLING_48K;
   ops.ptime = to_st30_ptime(s->a_ptime);   /* AUTO depuis le SDP (a=ptime) / défaut réglage */
   ops.framebuff_size = (uint32_t)s->slotsize;   /* 1 chunk = 1 ms */
-  ops.framebuff_cnt = 4;
+  /* bobi.studio: 4 → 32 (0.44.2). Le pool de 4 trames de 1 ms débordait dès qu'un hoquet
+   * d'ordonnancement du thread audio_rx_thread (famine CPU sur cpuset étroit, cf. volet 1)
+   * dépassait ~4 ms : « RX_AUDIO_SESSION back-pressure: framebuff pool empty (4/4 free) »,
+   * 1,5-2,4 % de trames droppées en continu → trous silencieux dans le flux MXL, comblés en
+   * VIEUX contenu d'anneau côté lecture (bouillie audio). 32 trames = 32 ms de marge d'absorption,
+   * coût mémoire négligeable (32 × 1152 o/canal en 8ch). */
+  ops.framebuff_cnt = 32;
 
   s->ah = st30p_rx_create(s->st, &ops);
   if (!s->ah) { fprintf(stderr, "mtl_rx: st30p_rx_create fail (audio %s:%d)\n", s->mcast, s->udp_port); return -1; }
@@ -2019,6 +2094,7 @@ static int decode_atc(struct st40_frame_info* f, char* out, int* df) {
  * + extraction du timecode ATC publié dans les stats. */
 static void* data_rx_thread(void* arg) {
   struct sess* s = arg;
+  rt_thread_priority("data_rx_thread");
   while (!s->stop) {
     struct st40_frame_info* frame = st40p_rx_get_frame(s->d_rx);
     if (!frame) { usleep(1000); continue; }
