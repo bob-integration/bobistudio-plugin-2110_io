@@ -128,6 +128,19 @@ COPY patch_tx_builder_famine_recovery.py /tmp/patch_tx_builder_famine_recovery.p
 #    → ZÉRO commit TM, zéro nouvelle victime. DOIT s'appliquer APRÈS patch_tx_builder_famine_recovery
 #    (ancres = son état de sortie).
 COPY patch_tx_frame_inflight_reclaim.py /tmp/patch_tx_frame_inflight_reclaim.py
+#    Patch bobi.studio TX reset no-drop (0.50.0) : LA FUITE DE MBUFS DU COMMIT TM, À LA SOURCE.
+#    L'hypothèse « ice_reset_tx_queue memset le sw_ring sans free » est FAUSSE sur DPDK 26.03
+#    (ice_rxtx.c:1196 ci_txq_release_all_mbufs AVANT ice_reset_tx_queue:1197 ; common/tx.h:360
+#    libère TOUT le sw_ring ; ice_ethdev.c:2886 stoppe chaque queue) — le PMD libère bien. La
+#    fuite venait de NOTRE patch_tx_hang_resetting_guard : pendant la fenêtre de commit il
+#    retournait nb_pkts (« émis ») aux transmetteurs vidéo/audio, qui lâchaient donc les mbufs
+#    SANS free (video_burst_packet ne ré-empile que si tx < bulk ; l'audio fait
+#    trs->inflight = NULL). D'où les DEUX morts collatérales : mempool vidé (-207) et ref extbuf
+#    jamais rendue sur la trame en vol (-203 permanent). Fix : retourner 0 (= « queue pleine »,
+#    sémantique déjà gérée par tous les appelants, cf. le transmetteur ANC qui n'a jamais fui) —
+#    les paquets restent en inflight et sont ré-émis au redémarrage du port. Zéro mbuf perdu.
+#    DOIT s'appliquer APRÈS patch_tx_hang_resetting_guard / famine / inflight_reclaim.
+COPY patch_tx_reset_no_drop.py /tmp/patch_tx_reset_no_drop.py
 COPY patch_tm_hierarchy.py /tmp/patch_tm_hierarchy.py
 COPY patch_igmp_router_alert.py /tmp/patch_igmp_router_alert.py
 COPY patch_ptp_mcast_flow.py /tmp/patch_ptp_mcast_flow.py
@@ -163,6 +176,7 @@ RUN mkdir -p /src/MTL && cd /src/MTL \
  && python3 /tmp/patch_tx_hang_resetting_guard.py \
  && python3 /tmp/patch_tx_builder_famine_recovery.py \
  && python3 /tmp/patch_tx_frame_inflight_reclaim.py \
+ && python3 /tmp/patch_tx_reset_no_drop.py \
  && python3 /tmp/patch_tm_hierarchy.py \
  && python3 /tmp/patch_igmp_router_alert.py \
  && python3 /tmp/patch_ptp_mcast_flow.py \
