@@ -52,6 +52,24 @@ A_RING     = max(2, int(os.environ.get("AUDIO_RING") or 100))   # ring shm audio
 # Ptime audio (ST 2110-30) par DÉFAUT (ms) — repli quand le SDP n'a pas d'a=ptime. Réglable par
 # installation (setting mtl_audio_ptime → env AUDIO_PTIME). Le SDP a=ptime PRIME (auto par entrée).
 A_PTIME_DEF = float(os.environ.get("AUDIO_PTIME") or 1.0)
+# Ptime audio autorisés (ST 2110-30 → enum ST30_PTIME_*, cf. mtl_rx.c:to_st30_ptime). Une sortie TX
+# peut déclarer le SIEN (par-sortie) ; toute valeur hors de ce set retombe sur A_PTIME_DEF (le global).
+A_PTIME_VALID = (0.125, 0.25, 0.333, 1.0, 4.0)
+def _coerce_ptime(v):
+    """ptime (ms) validé contre le set ST30 → valeur canonique, ou None si absent/invalide
+    (l'appelant replie alors sur A_PTIME_DEF). Rétro-compatible : une sortie sans ptime → None → défaut."""
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return None
+    for p in A_PTIME_VALID:
+        if abs(f - p) < 0.01:
+            return p
+    return None
+def _tx_ptime(acfg):
+    """ptime effectif d'une sortie audio TX : acfg['ptime'] si valide, sinon défaut global A_PTIME_DEF."""
+    p = _coerce_ptime((acfg or {}).get("ptime"))
+    return p if p is not None else A_PTIME_DEF
 ACTIVE_RX   = int(os.environ.get("ACTIVE_RX_COUNT") or min(6, max(1, N_VIDEO)))
 ACTIVE_TX_C = int(os.environ.get("ACTIVE_TX_COUNT") or min(6, max(0, N_TX)))
 _tx_budget_warned = False
@@ -1145,6 +1163,9 @@ class MetricsHandler(BaseHTTPRequestHandler):
                     if acfg.get("mcast") and acfg.get("port"):
                         senders.append({"tx_idx": i, "idx": i, "essence": "audio", "audio_idx": ai,
                                         "sdp": _aud_sdp(i, ai, acfg),
+                                        # ptime effectif de CETTE sortie (par-sortie ou défaut) — l'UI
+                                        # peut l'offrir par-sortie ; ptime_default reste le repli global.
+                                        "ptime": _tx_ptime(acfg), "ptime_default": A_PTIME_DEF,
                                         "inputs_latency_ms": inputs_lat})
                 if t.get("anc_mcast") and t.get("anc_port"):
                     senders.append({"tx_idx": i, "idx": i, "essence": "anc",
@@ -1341,7 +1362,9 @@ class AgentHandler(BaseHTTPRequestHandler):
                                     "port": int(a.get("port") or 0),
                                     "pt": int(a.get("pt") or 97),
                                     "mcast2": a.get("mcast2") or None,
-                                    "port2": int(a.get("port2") or 0)}
+                                    "port2": int(a.get("port2") or 0),
+                                    # ptime PAR-SORTIE (ms) : None si non fourni → repli A_PTIME_DEF au rendu.
+                                    "ptime": _coerce_ptime(a.get("ptime"))}
                                    for a in (body.get("audios") or [])[:2]]
                 if "anc_mcast"   in body: t["anc_mcast"]   = body.get("anc_mcast") or None
                 if "anc_port"    in body: t["anc_port"]    = int(body.get("anc_port") or 0)
@@ -1423,6 +1446,10 @@ class ControlHandler(BaseHTTPRequestHandler):
                     for ai in range(N_AUD_PER_TX):
                         st["tx_audio{}_shm".format(i * N_AUD_PER_TX + ai)] = (
                             (_tx[i]["audio_cable_shm"] or [None] * N_AUD_PER_TX)[ai] or "")
+                        # ptime effectif par sortie audio (par-sortie si déclaré, sinon défaut global).
+                        _acfg = (_tx[i].get("audios") or [])
+                        st["tx_audio{}_ptime".format(i * N_AUD_PER_TX + ai)] = (
+                            _tx_ptime(_acfg[ai]) if ai < len(_acfg) else A_PTIME_DEF)
                     st["tx_anc{}_shm".format(i)] = (_tx[i].get("anc_cable_shm") or "")
             return self._json(200, st)
         return self._json(404, {"error": "not found"})
@@ -1746,7 +1773,7 @@ def _audio_tx_session(idx, acfg, shm_in, iface=IFACE):
     return _leg2({"kind": "audio", "role": "tx", "iface": iface,
             "mcast": acfg["mcast"], "udp_port": acfg["port"], "payload_type": acfg.get("pt", 97),
             "ssrc": _ssrc("{}:tx:a:{}".format(HOSTNAME, idx)),
-            "channels": A_CHANNELS, "ptime": A_PTIME_DEF, "ring": A_RING, "hdr": HDR,
+            "channels": A_CHANNELS, "ptime": _tx_ptime(acfg), "ring": A_RING, "hdr": HDR,
             "targets": [{"idx": idx, "shm": shm_in, "stats": "/tmp/mtl_atx{}.json".format(idx)}]},
             iface, acfg.get("mcast2"), acfg.get("port2"))
 
@@ -2222,7 +2249,9 @@ def _aud_sdp(i, ai, acfg):
     présents (SMPTE 2022-7 : group:DUP + a=mid:). ts-refclk:localmac (upgrade PTP côté orchestrateur)."""
     sip, sip1 = _tx_leg_sips(i, _tx[i] if 0 <= i < len(_tx) else {})
     pt  = int(acfg.get("pt") or 97)
-    ptime = A_PTIME_DEF if A_PTIME_DEF in (0.125, 0.25, 1.0, 4.0) else 1.0
+    # ptime PAR-SORTIE (acfg['ptime']) prime ; repli sur le défaut global. Le SDP émis doit matcher
+    # exactement la session TX (mtl_rx.c:to_st30_ptime) sinon le récepteur droppe (« pkt len mismatch »).
+    ptime = _tx_ptime(acfg)
     ptime_s = ("%g" % ptime)
     dual = bool(acfg.get("mcast2") and acfg.get("port2"))
     ssrc = _ssrc("{}:tx:a:{}".format(HOSTNAME, i * 2 + ai))
