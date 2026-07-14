@@ -116,6 +116,18 @@ COPY patch_rx_resetting_guard.py /tmp/patch_rx_resetting_guard.py
 COPY patch_tx_burst_rendezvous.py /tmp/patch_tx_burst_rendezvous.py
 COPY patch_tx_hang_resetting_guard.py /tmp/patch_tx_hang_resetting_guard.py
 COPY patch_tx_builder_famine_recovery.py /tmp/patch_tx_builder_famine_recovery.py
+#    Patch bobi.studio TX inflight frame reclaim (0.49.0) : 2ᵉ mode de mort collatérale du commit RL,
+#    DISTINCT de la famine mempool ci-dessus. Les mbufs perdus sans free au stop de port (memset de
+#    ice_reset_tx_queue) tiennent encore une ref extbuf sur la TRAME en vol → tv_frame_free_cb n'est
+#    jamais appelé → la trame n'est JAMAIS rendue à l'app → l'app n'a plus de slot libre → plus rien
+#    à donner → get_next_frame rend -EBUSY à chaque passe = `build ret -203`
+#    (STI_FRAME_APP_GET_FRAME_BUSY) PERMANENT, sur une session qui n'échoue JAMAIS à allouer (donc
+#    invisible du filet famine, dont les points d'appel sont les branches d'échec d'ALLOC). Le patch
+#    détecte -203 continu > 2 s hors resetting et RÉCUPÈRE les trames à refcnt non nul (impossible à
+#    50 fps) exactement comme st20_tx_queue_fatal_error le fait déjà, mais SANS récupération de queue
+#    → ZÉRO commit TM, zéro nouvelle victime. DOIT s'appliquer APRÈS patch_tx_builder_famine_recovery
+#    (ancres = son état de sortie).
+COPY patch_tx_frame_inflight_reclaim.py /tmp/patch_tx_frame_inflight_reclaim.py
 COPY patch_tm_hierarchy.py /tmp/patch_tm_hierarchy.py
 COPY patch_igmp_router_alert.py /tmp/patch_igmp_router_alert.py
 COPY patch_ptp_mcast_flow.py /tmp/patch_ptp_mcast_flow.py
@@ -150,6 +162,7 @@ RUN mkdir -p /src/MTL && cd /src/MTL \
  && python3 /tmp/patch_tx_burst_rendezvous.py \
  && python3 /tmp/patch_tx_hang_resetting_guard.py \
  && python3 /tmp/patch_tx_builder_famine_recovery.py \
+ && python3 /tmp/patch_tx_frame_inflight_reclaim.py \
  && python3 /tmp/patch_tm_hierarchy.py \
  && python3 /tmp/patch_igmp_router_alert.py \
  && python3 /tmp/patch_ptp_mcast_flow.py \

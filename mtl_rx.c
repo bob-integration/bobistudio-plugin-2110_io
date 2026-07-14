@@ -1640,44 +1640,57 @@ static void* video_tx_slice_thread(void* arg) {
       uint64_t w0 = mono_ns();   /* chrono attente de slot (exclue du compteur `late`, cf. infra) */
       /* WATCHDOG ANNEAU (durcissement 0.40.1) : la lib peut ABANDONNER une trame sans
        * notify_frame_done (échec transmit sous churn de source, vu au banc mv 2026-07-11) →
-       * le slot reste stat=1 pour toujours → au 3ᵉ, deadlock complet (get_next_frame rend
-       * -EBUSY en boucle, build ret -203, 0 fps jusqu'au restart daemon). Si AUCUN slot ne se
-       * libère pendant SL_WEDGE_NS alors que tous sont occupés, la lib n'en tient plus aucun :
-       * RESYNC — tout FREE + cons recalé sur prod (écritures u16/u32 alignées, la lib ne fait
-       * que LIRE ces champs dans cet état). Le worker reprend au grain de tête suivant. */
+       * le slot reste stat=1 pour toujours → deadlock (get_next_frame rend -EBUSY en boucle,
+       * build ret -203, 0 fps jusqu'au restart daemon). RESYNC — tout FREE + cons recalé sur
+       * prod (écritures u16/u32 alignées, la lib ne fait que LIRE ces champs dans cet état).
+       *
+       * ★ 0.49.0 — LE GATE `all_busy` ÉTAIT AVEUGLE AU MODE DE MORT DOMINANT (banc 2026-07-14,
+       * moteur 140 : `bobi_mtl_vtx_sl` à 0 fps DÉFINITIF, `build ret -203` toutes les 10 s,
+       * source fraîche). Quand le commit TM d'une AUTRE session stoppe le port, les mbufs de la
+       * trame en vol sont perdus SANS free (ice_reset_tx_queue memset le sw_ring) → la ref
+       * extbuf sur la trame n'est jamais rendue → libmtl n'appelle JAMAIS notify_frame_done pour
+       * ce slot → il reste stat=1 pour toujours. Les AUTRES slots, eux, finissent d'être émis et
+       * repassent stat=0 : `all_busy` est donc FAUX, le watchdog ne se déclenchait JAMAIS, et le
+       * worker restait bloqué à vie sur ce seul slot (prod == slot piégé) — plus rien n'était
+       * produit, donc la lib finissait par ne plus avoir un seul slot prêt : -203 permanent.
+       * Le bon critère n'est PAS « la lib ne tient plus rien », c'est « MON slot de production
+       * ne se libère pas » : à 50 fps un slot doit être rendu en ~20 ms, 2 s = anomalie certaine.
+       * (Le filet libmtl `bobi_get_frame_busy_check` — patch_tx_frame_inflight_reclaim — traite
+       * la CAUSE en rendant la trame piégée ; ce watchdog reste le filet de dernier recours côté
+       * app, pour toute perte de notify_frame_done qui ne laisserait PAS de refcnt derrière.) */
 #define SL_WEDGE_NS (2ull * 1000000000ull)
       if (!s->sl_wedge_ns) s->sl_wedge_ns = mono_ns();
       else if (mono_ns() - s->sl_wedge_ns > SL_WEDGE_NS) {
-        int all_busy = 1;
+        unsigned busy = 0;
         for (uint16_t k = 0; k < s->sl_fb_cnt; k++)
-          if (s->sl_fb[k].stat == 0) { all_busy = 0; break; }
-        if (all_busy) {
-          /* THROTTLE (0.41.1) : une session TX en échec permanent (ex. PKT_ALLOC_FAIL) wedge
-           * puis resynce toutes les 2 s pour toujours → spam continu qui sature docker logs.
-           * 1er wedge après une période saine : log complet ; ensuite au plus 1 log/min avec
-           * l'agrégat des occurrences. Le throttle est réarmé par tx_sl_frame_done (un done
-           * reçu = session redevenue saine), PAS par le resync lui-même (qui libère les slots). */
-          uint64_t lnow = mono_ns();
-          s->sl_wedge_log_n++;
-          if (!s->sl_wedge_log_ns) {
-            fprintf(stderr, "mtl_rx[video TX SLICE] %s:%d anneau fb WEDGÉ (aucun done depuis %.1fs)"
-                    " — resync (all FREE, cons=prod) [logs throttlés à 1/min tant que pas de done]\n",
-                    s->mcast, s->udp_port, (lnow - s->sl_wedge_ns) / 1e9);
-            s->sl_wedge_log_ns = lnow; s->sl_wedge_log_n = 0;
-          } else if (lnow - s->sl_wedge_log_ns >= 60ull * 1000000000ull) {
-            fprintf(stderr, "mtl_rx[video TX SLICE] %s:%d anneau fb toujours WEDGÉ — resync"
-                    " (×%u depuis %.0f s)\n",
-                    s->mcast, s->udp_port, (unsigned)s->sl_wedge_log_n,
-                    (lnow - s->sl_wedge_log_ns) / 1e9);
-            s->sl_wedge_log_ns = lnow; s->sl_wedge_log_n = 0;
-          }
-          for (uint16_t k = 0; k < s->sl_fb_cnt; k++) {
-            s->sl_fb[k].lines_ready = 0;
-            s->sl_fb[k].stat = 0;
-          }
-          s->sl_fb_cons = s->sl_fb_prod;
+          if (s->sl_fb[k].stat != 0) busy++;
+        /* THROTTLE (0.41.1) : une session TX en échec permanent (ex. PKT_ALLOC_FAIL) wedge
+         * puis resynce toutes les 2 s pour toujours → spam continu qui sature docker logs.
+         * 1er wedge après une période saine : log complet ; ensuite au plus 1 log/min avec
+         * l'agrégat des occurrences. Le throttle est réarmé par tx_sl_frame_done (un done
+         * reçu = session redevenue saine), PAS par le resync lui-même (qui libère les slots). */
+        uint64_t lnow = mono_ns();
+        s->sl_wedge_log_n++;
+        if (!s->sl_wedge_log_ns) {
+          fprintf(stderr, "mtl_rx[video TX SLICE] %s:%d anneau fb WEDGÉ — slot prod %u jamais"
+                  " libéré depuis %.1fs (%u/%u slots occupés) → resync (all FREE, cons=prod)"
+                  " [logs throttlés à 1/min tant que pas de done]\n",
+                  s->mcast, s->udp_port, (unsigned)idx, (lnow - s->sl_wedge_ns) / 1e9,
+                  busy, (unsigned)s->sl_fb_cnt);
+          s->sl_wedge_log_ns = lnow; s->sl_wedge_log_n = 0;
+        } else if (lnow - s->sl_wedge_log_ns >= 60ull * 1000000000ull) {
+          fprintf(stderr, "mtl_rx[video TX SLICE] %s:%d anneau fb toujours WEDGÉ — resync"
+                  " (×%u depuis %.0f s, %u/%u slots occupés)\n",
+                  s->mcast, s->udp_port, (unsigned)s->sl_wedge_log_n,
+                  (lnow - s->sl_wedge_log_ns) / 1e9, busy, (unsigned)s->sl_fb_cnt);
+          s->sl_wedge_log_ns = lnow; s->sl_wedge_log_n = 0;
         }
-        s->sl_wedge_ns = mono_ns();          /* ré-arme (resync fait, ou faux positif re-mesuré) */
+        for (uint16_t k = 0; k < s->sl_fb_cnt; k++) {
+          s->sl_fb[k].lines_ready = 0;
+          s->sl_fb[k].stat = 0;
+        }
+        s->sl_fb_cons = s->sl_fb_prod;
+        s->sl_wedge_ns = mono_ns();          /* ré-arme (resync fait) */
       }
       pthread_mutex_lock(&s->sl_mx);
       if (s->sl_fb[idx].stat != 0 && !s->stop) {
