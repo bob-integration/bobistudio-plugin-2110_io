@@ -2771,6 +2771,28 @@ int main(int argc, char** argv) {
       int _on = _rxs ? atoi(_rxs) : _has_dpdk;
       if (_on) { p.flags |= MTL_FLAG_RX_SEPARATE_VIDEO_LCORE;
                  fprintf(stderr, "mtl_rx: scheduler RX vidéo DÉDIÉ (isolé CNI/PTP/audio/TX)\n"); } }
+    /* bobi.studio: lcore DÉDIÉ au CNI (levier #2 bis, banc 2026-07-14). Le flag ci-dessus NE SUFFIT
+     * PAS : `sch_is_capable()` (mt_sch.c:399-408) PROMEUT un scheduler DEFAULT à quota NUL en
+     * RX_VIDEO_ONLY — et le scheduler du CNI est exactement cela (mt_dev.c:1853-1855 crée
+     * `main_sch` en MT_SCH_TYPE_DEFAULT avec quota 0 ; mt_cni.c:618 et mt_ptp.c:1379 y enregistrent
+     * leurs tasklets). La PREMIÈRE session RX vidéo est donc acceptée SUR LE SCHEDULER DU CNI : le
+     * levier d'isolation la rate. Mesuré : sch0 (CNI + RX vidéo #0) = 49,81-49,91 fps, 3 à 6 trames
+     * incomplètes / 10 s, 0,07-0,25 % de paquets perdus non récupérés ; sch1/2/3 (RX vidéo seules) =
+     * 50,000 fps, ZÉRO perte. Le CNI ne coûte pourtant que ~1 µs de boucle — ce microgramme suffit à
+     * faire perdre une RX vidéo lourde (corollaire : tout tasklet de ~1 µs posé sur le scheduler
+     * d'une RX vidéo lourde = perte mesurable).
+     *
+     * MTL_FLAG_DEDICATED_SYS_LCORE (flag PUBLIC, mtl_api.h:422) fait créer `main_sch` en
+     * MT_SCH_TYPE_SYSTEM : sch_is_capable() ne promeut QUE les DEFAULT (mt_sch.c:399) et rejette
+     * ensuite sur `sch->type != type` (mt_sch.c:409) → le scheduler du CNI devient INÉLIGIBLE aux
+     * RX vidéo, sans patch libmtl et SANS toucher au CNI (qui garde son scheduler, ses tasklets
+     * PTP/IGMP/ARP et son lcore — il ne le partage simplement plus). Coût : 1 lcore (comptabilisé
+     * dans _auto_lcores côté orchestrateur). Réglable CNI_DEDICATED_LCORE ; défaut ON sur socle
+     * DPDK (l'AF-XDP n'a pas le PTP interne dans le CNI et reste au comportement historique). */
+    { const char* _cds = getenv("CNI_DEDICATED_LCORE");
+      int _on = _cds ? atoi(_cds) : _has_dpdk;
+      if (_on) { p.flags |= MTL_FLAG_DEDICATED_SYS_LCORE;
+                 fprintf(stderr, "mtl_rx: lcore DÉDIÉ au CNI (scheduler système inéligible aux RX vidéo)\n"); } }
     p.log_level = MTL_LOG_LEVEL_INFO;
     p.lcores = lcores[0] ? lcores : NULL;
 
