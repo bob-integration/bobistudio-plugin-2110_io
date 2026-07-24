@@ -146,6 +146,11 @@ COPY patch_igmp_router_alert.py /tmp/patch_igmp_router_alert.py
 COPY patch_ptp_mcast_flow.py /tmp/patch_ptp_mcast_flow.py
 COPY patch_ptp_stable_getter.py /tmp/patch_ptp_stable_getter.py
 COPY patch_ptp_gm_export.py /tmp/patch_ptp_gm_export.py
+COPY patch_ptp_offset_getter.py /tmp/patch_ptp_offset_getter.py
+# Patch bobi.studio DEV LINK WAIT : sur E810 100G DPDK le lien met ~60-90s à ré-entraîner autoneg+FEC
+# après passage sous vfio-pci ; dev_detect_link abandonnait à 90s (fail -5 → mtl_init fail → crash-loop
+# bruyant du wrapper). Bumpe MT_DEV_LINK_POLL_COUNT 300->400 (budget strict 90s->120s). Indépendant.
+COPY patch_dev_link_wait.py /tmp/patch_dev_link_wait.py
 # Patch bobi.studio EPOCH-SHIFT TX (chantier latence) : ops.rtp_timestamp_delta_us NÉGATIF ⇒ la
 # fenêtre d'émission de la session est décalée de −delta APRÈS l'epoch nominal, le timestamp RTP
 # restant sur l'epoch NOMINAL (TROFF ST 2110-21, FPT ≈ shift côté récepteur). Delta ≥ 0 inchangé.
@@ -182,6 +187,8 @@ RUN mkdir -p /src/MTL && cd /src/MTL \
  && python3 /tmp/patch_ptp_mcast_flow.py \
  && python3 /tmp/patch_ptp_stable_getter.py \
  && python3 /tmp/patch_ptp_gm_export.py \
+ && python3 /tmp/patch_ptp_offset_getter.py \
+ && python3 /tmp/patch_dev_link_wait.py \
  && python3 /tmp/patch_epoch_shift.py \
  && python3 /tmp/patch_ice_tm_move_retry.py \
  && MTL_PREFIX_ARGS="-Dtests=false" ./script/build_dpdk.sh -f \

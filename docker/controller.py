@@ -187,26 +187,57 @@ def _mtl_port_entry(iface):
 
 
 def _nic_bps_mtl(iface):
-    """Débit RX/TX d'un port PMD DPDK : deltas sur les compteurs cumulés du contrat
-    mtl_ports.json (même mécanique de cache/delta par port que _nic_bps, état _bw_last)."""
-    now = time.monotonic()
+    """Débit RX/TX d'un port PMD DPDK : delta sur les compteurs CUMULÉS du contrat mtl_ports.json.
+
+    Le data-plane écrit ce fichier ~toutes les 2 s (compteurs + un `ts` en SECONDES, même horloge que
+    les octets). Le piège à éviter : recalculer le débit au rythme des requêtes :8080 (0,5 s) donne un
+    aliasing — la plupart des lectures tombent sur un fichier inchangé (Δoctets=0 → 0 Gbps) et celle
+    juste après une écriture voit ~2 s de trafic divisées par ~0,5 s (débit ×4). D'où le débit qui
+    « saute » 0 / pic sur une sortie 2110 pourtant CBR.
+
+    Correctif : on ne recalcule QUE lorsqu'une NOUVELLE écriture est apparue (`ts` avancé), avec
+    Δt = Δts. Comme les octets et `ts` viennent du MÊME snapshot, `Δoctets/Δts` est le débit moyen
+    RÉEL de l'intervalle, indépendant du rythme de poll. Entre deux écritures on conserve le dernier
+    débit (jamais 0 fantôme). Un intervalle réellement sans trafic (ts avance, octets non) → 0 correct.
+    Lissage EMA léger pour absorber la quantification de `ts` (±1 s). État partagé `_bw_last[iface]`."""
     cap = 100.0   # vfio : /sys/class/net/<if>/speed n'existe plus → capacité E810 par défaut
-    last = _bw_last.get(iface)
-    if last and now < last.get("t", 0) + 0.5:
-        return last.get("rx_gbps"), last.get("tx_gbps"), cap
-    ent = _mtl_port_entry(iface)
+    data = _mtl_ports_read()          # lecture cachée (~0,5 s) du contrat, atomique côté data-plane
+    ent = None
+    if data:
+        for p in (data.get("ports") or []):
+            if p.get("port") in (iface, _port_bdf(iface)):
+                ent = p; break
     if ent is None:
-        _bw_last[iface] = {"rx": None, "tx": None, "t": now, "rx_gbps": None, "tx_gbps": None}
+        _bw_last[iface] = {"ts": None, "rx": None, "tx": None, "rx_gbps": None, "tx_gbps": None}
         return None, None, cap
+    ts = data.get("ts")
     rx = int(ent.get("rx_bytes") or 0)
     tx = int(ent.get("tx_bytes") or 0)
-    rx_gbps = tx_gbps = None
-    if last and last.get("rx") is not None and now > last.get("t", 0) + 0.5:
-        dt = now - last["t"]
-        if dt > 0 and rx >= last["rx"] and tx >= last["tx"]:   # redémarrage daemon → compteurs à 0
-            rx_gbps = round((rx - last["rx"]) * 8 / dt / 1e9, 2)
-            tx_gbps = round((tx - last["tx"]) * 8 / dt / 1e9, 2)
-    _bw_last[iface] = {"rx": rx, "tx": tx, "t": now, "rx_gbps": rx_gbps, "tx_gbps": tx_gbps}
+    last = _bw_last.get(iface)
+    # Par défaut : CONSERVER le dernier débit (ni 0 fantôme, ni pic dû à un Δt d'échantillonnage court).
+    rx_gbps = (last or {}).get("rx_gbps")
+    tx_gbps = (last or {}).get("tx_gbps")
+    have_ref = bool(last and last.get("rx") is not None and last.get("ts") is not None and ts is not None)
+    if have_ref and (ts < last["ts"] or rx < last["rx"] or tx < last["tx"]):
+        # ts/compteurs qui reculent = redémarrage du daemon (remis à 0) → ré-armer, pas de débit.
+        _bw_last[iface] = {"ts": ts, "rx": rx, "tx": tx, "rx_gbps": None, "tx_gbps": None}
+        return None, None, cap
+    if have_ref and ts > last["ts"]:
+        # Nouvelle écriture du data-plane : Δt = Δts (débit vrai, poll-indépendant). Octets figés sur
+        # l'intervalle → 0 (flux à l'arrêt). EMA α=0.5 : lisse la quantification de ts sans masquer un
+        # vrai changement (se stabilise en ~1-2 intervalles).
+        dts = ts - last["ts"]
+        inst_rx = (rx - last["rx"]) * 8 / dts / 1e9
+        inst_tx = (tx - last["tx"]) * 8 / dts / 1e9
+        rx_gbps = round(inst_rx if rx_gbps is None else 0.5 * inst_rx + 0.5 * rx_gbps, 2)
+        tx_gbps = round(inst_tx if tx_gbps is None else 0.5 * inst_tx + 0.5 * tx_gbps, 2)
+        _bw_last[iface] = {"ts": ts, "rx": rx, "tx": tx, "rx_gbps": rx_gbps, "tx_gbps": tx_gbps}
+        return rx_gbps, tx_gbps, cap
+    if not have_ref:
+        # Première mesure (ou ts/octets indisponibles) : poser la référence, débit pas encore calculable.
+        _bw_last[iface] = {"ts": ts, "rx": rx, "tx": tx, "rx_gbps": rx_gbps, "tx_gbps": tx_gbps}
+        return rx_gbps, tx_gbps, cap
+    # Même écriture relue (ts inchangé) → garder référence ET dernier débit.
     return rx_gbps, tx_gbps, cap
 
 
@@ -1241,11 +1272,20 @@ class MetricsHandler(BaseHTTPRequestHandler):
                            "tx_dropped":      _tx_sessions_dropped,
                            "rx_queues_alloc": _rx_queues_alloc,
                            "tx_queues_alloc": _tx_queues_alloc}}
-        # Grandmaster PTP interne libmtl (mtl_ports.json:ptp, socle DPDK) → l'orchestrateur
-        # construit a=ts-refclk:ptp du SDP TX quand ptp4l kernel est absent. Relais brut.
+        # État PTP interne libmtl (mtl_ports.json:ptp, socle DPDK) → l'orchestrateur (1) construit
+        # a=ts-refclk:ptp du SDP TX quand ptp4l kernel est absent (gm_identity/domain/locked) et
+        # (2) alimente l'onglet « Réseau 2110 - PTP » (synced/locked + offset_ns CORRIGÉ +
+        # path_delay_ns + raw_delta_ns + grandmaster).
+        # Relais du dict COMPLET (synced/locked/offset_ns/path_delay_ns/raw_delta_ns/domain/
+        # gm_identity) + alias gm_id (hex clock id,
+        # "" si inconnu). Bloc ABSENT si le moteur ne fait pas de PTP (ENGINE_PTP off / af_xdp) →
+        # payload sans "ptp" (rétro-compat : l'orchestrateur retombe sur pmc/ptp4l kernel).
         _pj = _mtl_ports_read() or {}
-        if isinstance(_pj, dict) and _pj.get("ptp"):
-            payload["ptp"] = _pj["ptp"]
+        _ptp = _pj.get("ptp") if isinstance(_pj, dict) else None
+        if isinstance(_ptp, dict):
+            _ptp = dict(_ptp)
+            _ptp.setdefault("gm_id", _ptp.get("gm_identity", ""))
+            payload["ptp"] = _ptp
         self.wfile.write(json.dumps(payload).encode())
     def log_message(self, *a): pass
 
@@ -1474,6 +1514,7 @@ class ControlHandler(BaseHTTPRequestHandler):
                     return self._json(400, {"error": "slot audio TX hors limites"})
                 with _tx_lock:
                     _tx[i]["audio_cable_shm"][ai] = (body.get("shm") or "").strip() or None
+                _tx_gen_apply(i)   # câbler/décâbler l'audio (ré)active un slot audio-seul (enabled)
                 return self._json(200, {"ok": True})
             if essence == "data":
                 # Câblage ANC indépendant : slot = index du slot TX. shm vide = décâble.
@@ -1483,6 +1524,7 @@ class ControlHandler(BaseHTTPRequestHandler):
                     return self._json(400, {"error": "slot ANC TX hors limites"})
                 with _tx_lock:
                     _tx[i]["anc_cable_shm"] = (body.get("shm") or "").strip() or None
+                _tx_gen_apply(i)   # câbler/décâbler l'ANC (ré)active un slot ANC-seul (enabled)
                 return self._json(200, {"ok": True})
             try: slot = int(body.get("slot", 0))
             except Exception: slot = -1
@@ -2546,9 +2588,16 @@ def _tx_gen_apply(idx):
             _tx_gen[idx]["enabled"] = True
             _tx_gen[idx]["pattern"] = fallback   # le repli impose sa mire
     else:
+        # Pas de source VIDÉO (ni câble, ni gen, ni repli). Le slot reste néanmoins ACTIF s'il porte
+        # une source AUDIO ou ANC câblée : c'est un slot audio-seul / ANC-seul. `enabled` gouverne les
+        # gates d'émission audio/ANC (cf. boucle de build TX) — sans ce test, un slot sans vidéo ne
+        # pourrait JAMAIS émettre d'audio ni d'ANC seuls. La session VIDÉO, elle, exige toujours une
+        # destination + un shm vidéo (elle n'est donc pas créée ici : shm_in reste None).
         with _tx_lock:
             _tx[idx]["shm_in"] = None
-            _tx[idx]["enabled"] = False
+            has_aud = any(_tx[idx].get("audio_cable_shm") or [])
+            has_anc = bool(_tx[idx].get("anc_cable_shm"))
+            _tx[idx]["enabled"] = bool(has_aud or has_anc)
         with _tx_gen_lock:
             _tx_gen[idx]["enabled"] = False
 

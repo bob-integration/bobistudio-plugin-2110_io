@@ -58,7 +58,18 @@ def before_deploy(params, context):
     # synchrones car le budget de queues/lcores (docker_driver._auto_lcores, _mtl_active_caps) les lit.
     params["active_rx_count"] = min(nv, len([f for f in params["rx_flows"] if f["essence"] == "video"])) if nv else \
         len([f for f in params["rx_flows"] if f["essence"] == "video"])
-    params["active_tx_count"] = min(n_tx, len([f for f in tx_flows if f["essence"] == "video"]))
+    # active_tx_count = nombre de SLOTS TX actifs (ce que le contrôleur itère : range(active_tx_count)),
+    # PAS le nombre de flux vidéo — sinon un slot audio-seul / ANC-seul (sans flux vidéo) ne serait pas
+    # compté et jamais émis, et appliquer un modèle à N sorties retomberait au défaut. On prend l'étendue
+    # des indices de slot couverts par les flux vidéo, ANC, et audio rattachés à une vidéo. (Un slot
+    # PUREMENT audio-seul en fin de liste — sans vidéo ni ANC — reste un angle mort connu du modèle de flux.)
+    _slot_idxs = {f["idx"] for f in tx_flows if f["essence"] in ("video", "anc")}
+    for _f in tx_flows:
+        if _f["essence"] == "audio":
+            _vi = _iof.video_idx_of(tx_flows, _f)
+            if _vi is not None:
+                _slot_idxs.add(_vi)
+    params["active_tx_count"] = min(n_tx, (max(_slot_idxs) + 1) if _slot_idxs else 0)
     n_aud_per_tx = max(1, (int(params.get("audio_count") or 0) // n_tx) if n_tx else 1)  # défaut pool
     slots = [dict(t or {}) for t in (params.get("tx_slots") or [])]
     while len(slots) < n_tx:

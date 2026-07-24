@@ -226,6 +226,14 @@ extern bool mt_bobi_ptp_stable(void* impl, int port);
 /* bobi.studio: grandmaster PTP interne libmtl (patch_ptp_gm_export) → publié dans mtl_ports.json
  * pour que l'orchestrateur construise a=ts-refclk:ptp du SDP TX quand ptp4l kernel est absent. */
 extern bool mt_bobi_ptp_gm(void* impl, int port, unsigned char* out_id8, int* out_domain, int* out_utc);
+/* bobi.studio: métriques PTP internes libmtl en ns (patch_ptp_offset_getter) → publiées dans
+ * mtl_ports.json pour l'onglet « Réseau 2110 - PTP » quand ptp4l kernel est absent (socle DPDK).
+ * TROIS mesures distinctes : offset BRUT (stat_delta, pilote ptp->locked, ~1,3 µs sur E810 DPDK car
+ * discipline HW non convergente), offset CORRIGÉ (correct_delta ~31 ns = « offset from master » à
+ * afficher) et mean path delay (~168 ns, le champ qui manquait). true SSI mesuré. */
+extern bool mt_bobi_ptp_offset(void* impl, int port, long long* out_ns);
+extern bool mt_bobi_ptp_correct_offset(void* impl, int port, long long* out_ns);
+extern bool mt_bobi_ptp_path_delay(void* impl, int port, long long* out_ns);
 static int g_engine_ptp = 0;             /* 1 = ENGINE_PTP=libmtl actif (PTP interne sur port DPDK) */
 
 static uint64_t now_ns(void) {
@@ -2564,18 +2572,44 @@ static void write_port_stats(mtl_handle st) {
       (unsigned long long)ps.rx_hw_dropped_packets, (unsigned long long)ps.rx_nombuf_packets);
   }
   fprintf(f, "]");
-  /* bobi.studio: grandmaster PTP libmtl (port 0) → l'orchestrateur construit a=ts-refclk:ptp du
-   * SDP TX quand ptp4l kernel est absent (socle DPDK, PTP dans le moteur). gm_identity au format
-   * SDP (XX-XX-…-XX). Absent/locked:false si le PTP interne n'est pas verrouillé. */
-  {
+  /* bobi.studio: état PTP interne libmtl (port 0) — socle DPDK (ENGINE_PTP=libmtl). Publié dans
+   * mtl_ports.json pour DEUX consommateurs orchestrateur : (1) a=ts-refclk:ptp du SDP TX quand
+   * ptp4l kernel est absent (gm_identity/domain, cf. app/ptp.refclk_for_node) ; (2) l'onglet
+   * « Réseau 2110 - PTP » — verrouillage servo + offset (ns)/dérive + grandmaster (:8080 payload.ptp
+   * relayé par controller.py). Bloc ÉMIS seulement quand le PTP interne tourne (g_engine_ptp) :
+   * sinon absent → rétro-compat af_xdp (l'orchestrateur retombe sur pmc/ptp4l kernel, l'AF-XDP
+   * n'est pas cassé). locked = lock SERVO RÉEL (mt_bobi_ptp_stable = max delta < 100 ns en continu),
+   * conjugué à un GM connu (mt_bobi_ptp_gm : Announce reçu) — évite le piège « !active ⇒ stable=true »
+   * du getter (dédié au backstop TX) et « le grandmaster que le PTP interne a VERROUILLÉ » côté SDP.
+   * offset_ns = max delta de la fenêtre courante (null tant qu'aucune mesure) — trace la convergence
+   * MÊME avant le lock. gm_identity au format SDP (XX-XX-…-XX), "" si Announce pas encore reçu. */
+  if (g_engine_ptp) {
     unsigned char gm[8]; int dom = 0, utc = 0;
-    if (mt_bobi_ptp_gm(st, 0, gm, &dom, &utc)) {
-      fprintf(f, ", \"ptp\": {\"locked\": true, \"domain\": %d, \"utc_offset\": %d, "
-                 "\"gm_identity\": \"%02X-%02X-%02X-%02X-%02X-%02X-%02X-%02X\"}",
-              dom, utc, gm[0], gm[1], gm[2], gm[3], gm[4], gm[5], gm[6], gm[7]);
-    } else {
-      fprintf(f, ", \"ptp\": {\"locked\": false}");
-    }
+    long long raw = 0, corr = 0, pd = 0;
+    int have_gm   = mt_bobi_ptp_gm(st, 0, gm, &dom, &utc) ? 1 : 0;
+    int have_raw  = mt_bobi_ptp_offset(st, 0, &raw) ? 1 : 0;         /* delta brut (diag, pilote locked) */
+    int have_corr = mt_bobi_ptp_correct_offset(st, 0, &corr) ? 1 : 0;/* offset corrigé = « offset from master » */
+    int have_pd   = mt_bobi_ptp_path_delay(st, 0, &pd) ? 1 : 0;      /* mean path delay */
+    /* locked = lock servo STRICT de libmtl (delta brut < 100 ns en continu) ; sur E810 DPDK il ne
+     * se déclenche jamais (delta brut ~1,3 µs) même quand la synchro est bonne, à conserver comme
+     * signal technique. synced = synchro RÉELLE au GM = GM connu + offset corrigé disponible (le
+     * servo suit le maître, timestamps média justes) → c'est CE flag qui pilote le badge de l'onglet. */
+    int locked = (have_gm && mt_bobi_ptp_stable(st, 0)) ? 1 : 0;
+    int synced = (have_gm && have_corr) ? 1 : 0;
+    fprintf(f, ", \"ptp\": {\"engine\": true, \"locked\": %s, \"synced\": %s, \"domain\": %d, \"utc_offset\": %d",
+            locked ? "true" : "false", synced ? "true" : "false", dom, utc);
+    /* offset_ns = offset CORRIGÉ (à afficher) ; raw_delta_ns = delta brut (diagnostic du non-lock strict) */
+    if (have_corr) fprintf(f, ", \"offset_ns\": %lld", corr);
+    else           fprintf(f, ", \"offset_ns\": null");
+    if (have_raw)  fprintf(f, ", \"raw_delta_ns\": %lld", raw);
+    else           fprintf(f, ", \"raw_delta_ns\": null");
+    if (have_pd)   fprintf(f, ", \"path_delay_ns\": %lld", pd);
+    else           fprintf(f, ", \"path_delay_ns\": null");
+    if (have_gm)
+      fprintf(f, ", \"gm_identity\": \"%02X-%02X-%02X-%02X-%02X-%02X-%02X-%02X\"}",
+              gm[0], gm[1], gm[2], gm[3], gm[4], gm[5], gm[6], gm[7]);
+    else
+      fprintf(f, ", \"gm_identity\": \"\"}");
   }
   fprintf(f, "}\n");
   fclose(f);
