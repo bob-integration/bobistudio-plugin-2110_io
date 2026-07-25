@@ -29,6 +29,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>   /* strcasecmp (POSIX) — parse de MTL_LOG_LEVEL (mtl_log_level_env) */
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <time.h>
@@ -595,6 +596,33 @@ static int slice_lines_env(void) {
   const char* e = getenv("SLICE_LINES");
   int v = e ? atoi(e) : 0;
   return v > 0 ? v : 36;
+}
+
+/* Niveau de log libmtl configurable (env MTL_LOG_LEVEL, posé par l'orchestrateur depuis
+ * Réglages → MXL). DÉFAUT "warning" (silencieux) : à INFO, libmtl émet périodiquement un dump de
+ * stats volumineux (bloc « END STATE » + SCH/xdp_queue) qui noie les logs du moteur et rend le
+ * diagnostic illisible. Valeur absente ou inconnue → warning (sûr). Remonter à info/debug pour un
+ * diagnostic ponctuel seulement. */
+static enum mtl_log_level mtl_log_level_env(void) {
+  const char* e = getenv("MTL_LOG_LEVEL");
+  if (!e || !*e)                                            return MTL_LOG_LEVEL_WARNING;
+  if (!strcasecmp(e, "debug"))                              return MTL_LOG_LEVEL_DEBUG;
+  if (!strcasecmp(e, "info"))                               return MTL_LOG_LEVEL_INFO;
+  if (!strcasecmp(e, "notice"))                             return MTL_LOG_LEVEL_NOTICE;
+  if (!strcasecmp(e, "warning") || !strcasecmp(e, "warn"))  return MTL_LOG_LEVEL_WARNING;
+  if (!strcasecmp(e, "error")   || !strcasecmp(e, "err"))   return MTL_LOG_LEVEL_ERR;
+  if (!strcasecmp(e, "crit"))                               return MTL_LOG_LEVEL_CRIT;
+  return MTL_LOG_LEVEL_WARNING;
+}
+
+/* Période du dump de stats libmtl (env MTL_STAT_DUMP_PERIOD, en secondes ; 0 ou hors bornes =
+ * défaut de la lib). Bobi ne consomme PAS ce dump : en mode silencieux l'orchestrateur pose une
+ * très grande période (dump neutralisé, plus aucune collecte périodique inutile), et en mode
+ * diagnostic (info/debug/notice) il laisse 0 pour que le dump serve. */
+static uint16_t mtl_dump_period_env(void) {
+  const char* e = getenv("MTL_STAT_DUMP_PERIOD");
+  int v = e ? atoi(e) : 0;
+  return (v > 0 && v < 65536) ? (uint16_t)v : 0;
 }
 
 /* ── flowDef MXL (ressource Flow NMOS IS-04) — mêmes champs/conventions que bobimxl.build_*. ── */
@@ -2827,7 +2855,8 @@ int main(int argc, char** argv) {
       int _on = _cds ? atoi(_cds) : _has_dpdk;
       if (_on) { p.flags |= MTL_FLAG_DEDICATED_SYS_LCORE;
                  fprintf(stderr, "mtl_rx: lcore DÉDIÉ au CNI (scheduler système inéligible aux RX vidéo)\n"); } }
-    p.log_level = MTL_LOG_LEVEL_INFO;
+    p.log_level = mtl_log_level_env();          /* Réglages → MXL (défaut warning = logs lisibles) */
+    p.dump_period_s = mtl_dump_period_env();    /* 0 = défaut lib ; grande valeur = dump neutralisé */
     p.lcores = lcores[0] ? lcores : NULL;
 
     mtl_handle st = mtl_init(&p);
@@ -2842,7 +2871,14 @@ int main(int argc, char** argv) {
     struct timespec cfg_mt = {0, 0}; struct stat cst;
     reconcile(reg, config, st, portname);                 /* état initial */
     if (stat(config, &cst) == 0) cfg_mt = cst.st_mtim;
-    time_t last_t = time(NULL);
+    /* Fenêtre de stats : horloge MONOTONE nanoseconde. NE JAMAIS revenir à time_t/difftime — le
+     * dt serait quantifié à la seconde ENTIÈRE (toujours 2.0) alors que la boucle tique à ~0.5s+ε
+     * (overshoot usleep + stat() + iface_carrier() + write_stats). La phase du tic dérive contre la
+     * grille de la seconde ; périodiquement le seuil dt>=2.0 est franchi après ~1.4s RÉELLES (3 tics
+     * au lieu de 4) → fps = (1.4×50)/2.0 = 38 alors que le moteur n'a PAS ralenti. C'était le faux
+     * « hoquet ~60 s » (= battement de la dérive, pas un événement) : creux toujours à 3/4 du
+     * nominal, 0 frame perdue, invariant à tout (PTP, log, dump libmtl, orchestrateur arrêté). */
+    uint64_t last_t = mono_ns();
     int carrier[MTL_PORT_MAX];
     for (int k = 0; k < g_nports; k++) carrier[k] = iface_carrier(g_ports[k].iface);
     while (!g_stop) {
@@ -2865,8 +2901,8 @@ int main(int argc, char** argv) {
           carrier[k] = c;
         }
       }
-      time_t now = time(NULL); double dt = difftime(now, last_t);
-      if (dt >= 2.0) { write_stats(reg, last, dt); last_t = now;
+      uint64_t now_mono = mono_ns(); double dt = (double)(now_mono - last_t) / 1e9;
+      if (dt >= 2.0) { write_stats(reg, last, dt); last_t = now_mono;
         write_port_stats(st);            /* contrat /tmp/mtl_ports.json (stats I/O par NIC) */
         mxlGarbageCollectFlows(g_mxl);   /* récupère les flux orphelins (producteurs morts) */
         /* Backstop wedge TX (ultime filet — le lien mort est normalement absorbé par le patch
@@ -2922,7 +2958,8 @@ int main(int argc, char** argv) {
   p.flags |= MTL_FLAG_DEV_AUTO_START_STOP;
   p.flags |= MTL_FLAG_TX_VIDEO_MIGRATE | MTL_FLAG_RX_VIDEO_MIGRATE;
   p.data_quota_mbs_per_sch = 5000;
-  p.log_level = MTL_LOG_LEVEL_INFO;
+  p.log_level = mtl_log_level_env();            /* idem site principal (Réglages → MXL) */
+  p.dump_period_s = mtl_dump_period_env();
   p.lcores = lcores[0] ? lcores : NULL;
   p.rx_queues_cnt[MTL_PORT_P] = 1;
   p.tx_queues_cnt[MTL_PORT_P] = 1;
@@ -2942,11 +2979,11 @@ int main(int argc, char** argv) {
   if (setup_video(s) != 0) { fprintf(stderr,"mtl_rx: setup échoué\n"); mtl_uninit(st); mxlDestroyInstance(g_mxl); return 1; }
   s->used = 1;
 
-  time_t last_t = time(NULL);
+  uint64_t last_t = mono_ns();       /* dt monotone ns — cf. boucle principale (jamais time_t) */
   while (!g_stop) {
     for (int z = 0; z < 20 && !g_stop; z++) usleep(100000);
     if (g_stop) break;
-    time_t now = time(NULL); double dt = difftime(now, last_t); last_t = now;
+    uint64_t now_mono = mono_ns(); double dt = (double)(now_mono - last_t) / 1e9; last_t = now_mono;
     write_stats(reg, last, dt);
   }
   free_session(s);

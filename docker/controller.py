@@ -2931,8 +2931,13 @@ def _manager_loop():
             elif dead:
                 _mtl_proc = None                            # mort sans rien à servir → relance au besoin
         # Contrôle périodique des IP de ports (dérive à chaud : IP retirée/dupliquée par l'hôte).
+        # 600 s et non 60 : une dérive d'IP de port est RARE (elle vient d'une action hôte), et ce
+        # contrôle lance un subprocess `ip -4 -o addr show`. 10 min suffisent largement. Historique :
+        # cette période était le suspect n°1 du « hoquet ~60 s » du moteur — innocentée (le hoquet
+        # était un artefact de mesure, cf. mtl_rx.c write_stats / dt monotone), mais l'allègement
+        # reste bon à prendre.
         if time.time() >= _ip_check_at:
-            _ip_check_at = time.time() + 60.0
+            _ip_check_at = time.time() + 600.0
             _check_port_ips()
         time.sleep(0.5)
 
