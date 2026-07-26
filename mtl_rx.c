@@ -2573,14 +2573,25 @@ static void write_stats(struct sess* reg, uint64_t last[][MAX_TG], double dt) {
  * a disparu en vfio). Source = mtl_get_port_stats() (mtl_api.h) : compteurs CUMULÉS depuis
  * mtl_init (struct mtl_port_status). Écrit pour TOUS les ports (af_xdp compris — le contrôleur
  * n'y bascule ses débits que pour pmd=dpdk). Écriture atomique (tmp + rename) : le contrôleur
- * peut lire à tout instant sans lire un JSON tronqué. Cadence = celle de write_stats (~2 s). */
+ * peut lire à tout instant sans lire un JSON tronqué. Cadence = celle de write_stats (~2 s).
+ *
+ * `ts` = HORODATAGE DU SNAPSHOT, en **secondes flottantes de l'horloge MONOTONE** (0.59.0).
+ * C'est le dénominateur du calcul de débit du contrôleur (Δoctets/Δts, cf. controller.py
+ * `_nic_bps_mtl`), donc deux exigences :
+ *   - **monotone** (CLOCK_MONOTONIC, PAS now_ns/CLOCK_REALTIME) : un saut NTP/PTP de l'horloge
+ *     système fausserait — voire ferait reculer — le Δt d'un débit ;
+ *   - **sous-seconde** : jusqu'en 0.58.0 on publiait now_ns()/1e9 en entier, donc un ts quantifié
+ *     à ±1 s sur une fenêtre de ~2 s = jusqu'à ±50 % d'erreur sur le débit (d'où le lissage EMA
+ *     de contournement, retiré en 0.59.0). %.6f (µs) : largement sous le bruit de la fenêtre.
+ * L'unité (secondes) est inchangée — seule l'ÉPOQUE change (uptime, plus l'epoch UNIX) ; aucun
+ * consommateur ne lit ce champ comme une date murale (seul `_nic_bps_mtl` en fait des deltas). */
 static void write_port_stats(mtl_handle st) {
   if (g_nports <= 0) return;
   const char* tmp = "/tmp/mtl_ports.json.tmp";
   FILE* f = fopen(tmp, "w");
   if (!f) return;
-  fprintf(f, "{\"ts\": %llu, \"ports\": [",
-          (unsigned long long)(now_ns() / 1000000000ULL));
+  fprintf(f, "{\"ts\": %.6f, \"ports\": [",
+          (double)mono_ns() / 1e9);
   for (int k = 0; k < g_nports; k++) {
     struct mtl_port_status ps; memset(&ps, 0, sizeof(ps));
     if (mtl_get_port_stats(st, (enum mtl_port)k, &ps) != 0)

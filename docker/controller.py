@@ -189,17 +189,22 @@ def _mtl_port_entry(iface):
 def _nic_bps_mtl(iface):
     """Débit RX/TX d'un port PMD DPDK : delta sur les compteurs CUMULÉS du contrat mtl_ports.json.
 
-    Le data-plane écrit ce fichier ~toutes les 2 s (compteurs + un `ts` en SECONDES, même horloge que
-    les octets). Le piège à éviter : recalculer le débit au rythme des requêtes :8080 (0,5 s) donne un
-    aliasing — la plupart des lectures tombent sur un fichier inchangé (Δoctets=0 → 0 Gbps) et celle
-    juste après une écriture voit ~2 s de trafic divisées par ~0,5 s (débit ×4). D'où le débit qui
-    « saute » 0 / pic sur une sortie 2110 pourtant CBR.
+    Le data-plane écrit ce fichier ~toutes les 2 s (compteurs + un `ts` en SECONDES FLOTTANTES de
+    l'horloge monotone, même snapshot que les octets — cf. mtl_rx.c:write_port_stats). Le piège à
+    éviter : recalculer le débit au rythme des requêtes :8080 (0,5 s) donne un aliasing — la plupart
+    des lectures tombent sur un fichier inchangé (Δoctets=0 → 0 Gbps) et celle juste après une
+    écriture voit ~2 s de trafic divisées par ~0,5 s (débit ×4). D'où le débit qui « saute » 0 / pic
+    sur une sortie 2110 pourtant CBR.
 
     Correctif : on ne recalcule QUE lorsqu'une NOUVELLE écriture est apparue (`ts` avancé), avec
     Δt = Δts. Comme les octets et `ts` viennent du MÊME snapshot, `Δoctets/Δts` est le débit moyen
     RÉEL de l'intervalle, indépendant du rythme de poll. Entre deux écritures on conserve le dernier
     débit (jamais 0 fantôme). Un intervalle réellement sans trafic (ts avance, octets non) → 0 correct.
-    Lissage EMA léger pour absorber la quantification de `ts` (±1 s). État partagé `_bw_last[iface]`."""
+
+    0.59.0 : PLUS D'EMA. Le lissage α=0,5 ne compensait que la quantification de l'ancien `ts`
+    entier (±1 s sur ~2 s = ±50 % d'erreur) ; avec un Δts exact la valeur instantanée EST le débit
+    moyen de l'intervalle — lisser ne ferait plus que retarder l'affichage d'un vrai changement.
+    État partagé `_bw_last[iface]`."""
     cap = 100.0   # vfio : /sys/class/net/<if>/speed n'existe plus → capacité E810 par défaut
     data = _mtl_ports_read()          # lecture cachée (~0,5 s) du contrat, atomique côté data-plane
     ent = None
@@ -223,14 +228,11 @@ def _nic_bps_mtl(iface):
         _bw_last[iface] = {"ts": ts, "rx": rx, "tx": tx, "rx_gbps": None, "tx_gbps": None}
         return None, None, cap
     if have_ref and ts > last["ts"]:
-        # Nouvelle écriture du data-plane : Δt = Δts (débit vrai, poll-indépendant). Octets figés sur
-        # l'intervalle → 0 (flux à l'arrêt). EMA α=0.5 : lisse la quantification de ts sans masquer un
-        # vrai changement (se stabilise en ~1-2 intervalles).
+        # Nouvelle écriture du data-plane : Δt = Δts (débit vrai, poll-indépendant, sans lissage).
+        # Octets figés sur l'intervalle → 0 (flux à l'arrêt), affiché tel quel.
         dts = ts - last["ts"]
-        inst_rx = (rx - last["rx"]) * 8 / dts / 1e9
-        inst_tx = (tx - last["tx"]) * 8 / dts / 1e9
-        rx_gbps = round(inst_rx if rx_gbps is None else 0.5 * inst_rx + 0.5 * rx_gbps, 2)
-        tx_gbps = round(inst_tx if tx_gbps is None else 0.5 * inst_tx + 0.5 * tx_gbps, 2)
+        rx_gbps = round((rx - last["rx"]) * 8 / dts / 1e9, 2)
+        tx_gbps = round((tx - last["tx"]) * 8 / dts / 1e9, 2)
         _bw_last[iface] = {"ts": ts, "rx": rx, "tx": tx, "rx_gbps": rx_gbps, "tx_gbps": tx_gbps}
         return rx_gbps, tx_gbps, cap
     if not have_ref:
