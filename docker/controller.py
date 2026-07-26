@@ -1121,8 +1121,17 @@ def _signal_loop():
                     else:
                         _signal_rx.pop(idx, None)
             with _tx_lock:
-                tx_in = {i: (_tx[i].get("shm_in") or "") for i in range(N_TX)
-                         if _tx[i]["enabled"] and _tx[i].get("shm_in")}
+                # SUR LE CÂBLE RÉEL, PAS SUR `shm_in`. Un slot provisionné sans câble bascule en GÉN
+                # et `shm_in` pointe alors vers le générateur INTERNE (`*_txgen_<i>`) : sonder ça
+                # revient à mesurer notre propre repli, dont le noir constant est noir et figé PAR
+                # CONSTRUCTION → « image noire/figée détectée » en permanence sur une sortie que
+                # personne n'a câblée (12 alertes le 2026-07-26, dont une par oscillation).
+                # `cable_shm` est justement le câblage réel, tenu à part de `shm_in` pour cette
+                # raison. Pas de câble ⇒ pas de sortie à surveiller ⇒ aucun champ `signal` publié
+                # (l'orchestrateur traite l'absence comme « inconnu » : il n'alerte ni ne résout).
+                # Le RX a toujours eu sa garde équivalente (`_live[idx]`) ; seul le TX en manquait.
+                tx_in = {i: (_tx[i].get("cable_shm") or "") for i in range(N_TX)
+                         if _tx[i]["enabled"] and _tx[i].get("cable_shm")}
             for i in range(N_TX):
                 key = ("tx", i)
                 name = (tx_in.get(i) or "").rsplit("/", 1)[-1]

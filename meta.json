@@ -1,7 +1,13 @@
 {
-  "version": "0.60.0",
+  "version": "0.61.0",
   "date": "2026-07-26",
   "changes": {
+    "Présence signal TX : ne plus surveiller notre PROPRE générateur de repli (0.61.0)": [
+      "SYMPTÔME : un slot TX provisionné mais NON CÂBLÉ émettait « image noire détectée » puis « image figée détectée », en boucle et par mail — jusqu'à un aller-retour « rétabli »/« détectée » en 6 secondes. L'exploitant n'avait activé aucune sortie.",
+      "CAUSE RACINE : sans câble, un slot provisionné bascule en GÉN et son `shm_in` pointe vers le générateur INTERNE du moteur (`*_txgen_<i>`), qui produit le fallback noir. Or la sonde de présence signal se branchait sur `shm_in` : elle mesurait donc NOTRE PROPRE repli, dont le noir constant est noir et figé PAR CONSTRUCTION. Une alarme ne doit pas comparer l'observé à un idéal absolu, mais à ce que l'exploitant a DEMANDÉ — et personne n'avait demandé d'image sur cette sortie.",
+      "FIX (controller.py:_signal_loop) : la sonde TX se branche sur `cable_shm` — le câblage RÉEL, que le contrôleur tenait déjà à part de `shm_in` exactement pour cette raison, et qui fait déjà autorité dans `_tx_gen_apply`. Pas de câble ⇒ aucun champ `signal` publié ⇒ l'orchestrateur traite l'absence comme « inconnu » (il n'alerte ni ne résout, comportement déjà en place). Le RX avait toujours eu sa garde équivalente (`_live[idx]`) : seul le TX en manquait.",
+      "CÔTÉ ORCHESTRATEUR (même journée) : les alertes de présence signal exigent désormais 3 observations CONSÉCUTIVES avant de basculer, dans LES DEUX SENS (`metrics.SIGNAL_CONFIRM_POLLS`) — une présence signal oscille par nature (fondu, seuil, mire quasi statique) et chaque bascule partait en notification."
+    ],
     "Horloge AU REPOS : le moteur DPDK garde son client PTP même sans session (0.60.0)": [
       "SYMPTÔME : sur un nœud full-PF DPDK dont le moteur n'a aucun flux câblé, le fil d'alertes répétait « PTP <nœud>/<réseau> : déverrouillé depuis 30 s — holdover, dérive libre ». Le nœud n'avait en réalité AUCUNE référence de temps (ce n'était pas un holdover), et le premier flux câblé devait attendre la convergence PTP au lieu de trouver une horloge déjà disciplinée.",
       "CAUSE RACINE : sur un port full-PF DPDK il n'y a plus de netdev kernel, donc plus de ptp4l — la SEULE horloge du nœud est le client PTP interne de libmtl, qui n'existe que tant que `mtl_rx` tourne (c'est `mtl_init` qui l'arme). Or le manager ne lançait le daemon qu'au PREMIER abonnement (`if _mtl_proc is None and sessions`). Moteur au repos ⇒ pas de mtl_init ⇒ pas de /tmp/mtl_ports.json ⇒ pas de bloc `ptp` sur :8080 ⇒ nœud sans horloge, en silence.",
