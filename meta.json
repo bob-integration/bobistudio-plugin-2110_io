@@ -1,7 +1,16 @@
 {
-  "version": "0.64.0",
+  "version": "0.65.0",
   "date": "2026-07-26",
   "changes": {
+    "Sampler de présence signal : reconnexion d'un lecteur MXL DÉCROCHÉ (0.65.0)": [
+      "ANGLE MORT DE SUPERVISION MESURÉ EN PROD (Horace, 2026-07-26) : changer la source d'un slot RX fait fusionner/dégrouper les sessions mtl_rx (deux slots sur le même multicast = UNE session à N cibles) et DÉTRUIT/RECRÉE les flux MXL concernés sous le même nom. Le sampler, lecteur longue durée, restait collé à la génération MORTE de 3 slots pendant des heures — sans aucune exception : les grains de l'orphelin restent LISIBLES, index figé. La réouverture n'existait que « sur exception » : elle ne se déclenchait donc JAMAIS.",
+      "Conséquence : `_sig_video_probe` renvoyait « inconnu » à vie sur ces slots (index identique au précédent) → plus aucune alerte noir/gel, ni résolution. L'image restait parfaite à l'écran : seule la supervision était aveugle.",
+      "FIX vidéo : détection par `now_tai − lastWriteTime` (la primitive de la spec MXL, maintenue par mtl_rx sur la vidéo), testée AVANT la lecture — au-delà de SIGNAL_STALE_MS (5 s, réglable par variable d'environnement) : close de NOS handles → garbage_collect() → réouverture au passage suivant.",
+      "FIX audio : l'audio n'a pas de lastWriteTime (les writers ne le bumpent pas) — le décrochage se lit sur un `head_index` qui ne bouge plus. Un flux audio réellement muet a un head qui AVANCE (le writer comble en silence) : un head figé n'est donc PAS du silence, c'est un décrochage. Même parade au-delà du seuil.",
+      "ESCALADE : `garbage_collect()` ne réclame pas un flux encore référencé DANS notre Instance — au 2ᵉ décrochage consécutif d'un slot, les readers sont rouverts sur une Instance MXL DÉDIÉE (cache vierge → résolution sur disque, génération vivante). Fermée avec ses readers. Banc (domaine scratch, dl360-1) : GC avec l'ancien reader ouvert → décroché ; close+GC+reopen → vivant, même avec un lecteur d'un AUTRE process resté décroché ; Instance dédiée → vivant.",
+      "Latence TX (`_tx_latency_loop`) : même correction sur son cache de readers — un âge aberrant (> 30 s) signait un reader décroché et laissait la latence du slot « inconnue » à VIE ; il déclenche désormais le drop/réouverture.",
+      "Toute reconnexion est tracée (nom du flux, motif, n° de tentative ; 3 lignes puis une par centaine). Pendant du correctif consommateur multiview 0.45.0."
+    ],
     "Audio d'une sortie non câblée : SILENCE produit par le moteur, plus par un producteur (0.64.0)": [
       "SUITE DE 0.63.0, ET RÉPARATION D'UNE RÉGRESSION QU'ELLE A INTRODUITE : en éteignant le générateur vidéo d'un slot statique, 0.63.0 éteignait aussi son générateur AUDIO — les sessions audio de ces slots disparaissaient (12 → 6 sessions TX). Or une sortie provisionnée doit émettre du SILENCE, pas RIEN : sans session, la feuille RL disparaît et câbler l'audio plus tard imposerait une recréation, donc un commit RL et un stop de port — exactement ce que le pré-provisionnement existe pour éviter.",
       "CAUSE DE FOND : le silence était produit par un thread Python écrivant des blocs de 1 ms dans un flux MXL, soit ~1000 réveils par seconde ET PAR SORTIE, pour des zéros. Le silence n'est pas un signal, c'est une absence : il n'a aucune raison de mobiliser un producteur, un flux et un reader.",

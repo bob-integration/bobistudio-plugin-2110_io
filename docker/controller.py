@@ -945,6 +945,22 @@ _sig_lock  = threading.Lock()
 _sig_state = {}      # ("rx"|"tx", idx) → état interne {name, vr, ar, vidx, crcs, *_since, fmt}
 
 
+# DÉCROCHAGE DE GÉNÉRATION (le sampler est un lecteur LONGUE DURÉE). Quand un flux MXL est
+# détruit puis recréé SOUS LE MÊME NOM — ce qui arrive sans redémarrer quoi que ce soit, dès qu'on
+# change la source d'un slot : mtl_rx fusionne/dégroupe ses sessions (deux slots sur le même
+# multicast = UNE session à N cibles) et recrée les flux concernés — notre Reader reste collé à la
+# génération MORTE. Ses grains restent LISIBLES (index figé) : aucun SIGBUS, aucune exception,
+# donc la réouverture « sur exception » ci-dessous ne se déclenche JAMAIS. Le sampler renvoie alors
+# « inconnu » à vie sur ce slot : plus aucune alerte noir/gel, et aucune résolution non plus
+# (mesuré en prod le 2026-07-26 : 3 slots décrochés pendant des heures, image parfaite à l'écran).
+# Détecteur conforme à la spec : `now_tai − lastWriteTime` croît alors que l'horloge avance
+# (maintenu par mtl_rx sur la vidéo ; l'audio n'a que head_index, cf. _sig_audio_probe).
+# Parade : lâcher NOTRE handle → garbage_collect() → rouvrir. Un flux encore référencé DANS notre
+# Instance n'est pas collecté et la réouverture retombe sur l'orphelin → au 2ᵉ échec consécutif on
+# rouvre sur une Instance DÉDIÉE (cache vierge, résolution sur disque).
+SIGNAL_STALE_MS = float(os.environ.get("SIGNAL_STALE_MS") or 5000.0)
+
+
 def _sig_close(st):
     for k in ("vr", "ar"):
         try:
@@ -953,6 +969,42 @@ def _sig_close(st):
         except Exception:
             pass
         st[k] = None
+    own = st.pop("own_inst", None)      # Instance dédiée (escalade) : fermée AVEC ses readers,
+    if own is not None:                 # sinon elle retient la génération qu'on veut lâcher.
+        try: own.close()
+        except Exception: pass
+
+
+def _sig_instance(st):
+    """Instance sur laquelle (r)ouvrir les readers de ce slot : la globale, ou une Instance DÉDIÉE
+    au-delà de 2 décrochages consécutifs (cf. commentaire SIGNAL_STALE_MS). Vidéo et audio d'un
+    même slot partagent l'Instance : c'est la même source, et une seule Instance de secours suffit."""
+    if max(st.get("stale_v", 0), st.get("stale_a", 0)) < 2:
+        return _mxl()
+    own = st.get("own_inst")
+    if own is None:
+        own = bobimxl.Instance(_MXL_DOMAIN)
+        st["own_inst"] = own
+    return own
+
+
+def _sig_reopen(st, name, motif, kind="v"):
+    """Reconnexion d'un lecteur décroché : close (NOS handles) → GC → réouverture paresseuse au
+    passage suivant. Tracé : c'est un événement rare qui signe une recréation de flux amont."""
+    key = "stale_" + kind
+    st[key] = st.get(key, 0) + 1
+    _sig_close(st)
+    try:
+        _mxl().garbage_collect()
+    except Exception:
+        pass
+    st.pop("vidx", None); st.pop("crcs", None); st.pop("ahead", None)
+    st.pop("black_since", None); st.pop("frozen_since", None); st.pop("gamut_since", None)
+    st.pop("sil_since", None); st.pop("ahead_t", None)
+    n = st[key]
+    if n <= 3 or n % 100 == 0:      # source réellement morte → on retente sans inonder le journal
+        print("sampler: {} — lecteur PÉRIMÉ ({}), reconnexion (tentative {}){}".format(
+            name, motif, n, " → Instance DÉDIÉE" if n >= 2 else ""), flush=True)
 
 
 def _gamut_illegal_pct(y, u, v, bd):
@@ -1030,16 +1082,27 @@ def _sig_video_probe(st, name, now):
     try:
         r = st.get("vr")
         if r is None:
-            r = bobimxl.Reader(_mxl(), name)
+            r = bobimxl.Reader(_sig_instance(st), name)
             st["vr"] = r
             st.pop("vidx", None); st.pop("crcs", None); st.pop("fmt", None)
             st.pop("black_since", None); st.pop("frozen_since", None)
+        # DÉCROCHAGE : lastWriteTime figé alors que l'horloge avance ⇒ on lit une génération morte
+        # (ou la source s'est arrêtée — dans les deux cas rouvrir est le bon réflexe et sans effet
+        # de bord). Testé AVANT la lecture : sur l'orphelin, get_latest() rend un grain et masque
+        # tout. Cf. SIGNAL_STALE_MS.
+        _lw = r.last_write_time()
+        if _lw and (bobimxl.now_tai() - _lw) / 1e6 > SIGNAL_STALE_MS:
+            _sig_reopen(st, name, "aucune écriture depuis %.1f s"
+                        % ((bobimxl.now_tai() - _lw) / 1e9), "v")
+            return None
         g = r.get_latest()
         if g is None:
             return None
         gidx, _gi, view = g
         prev_idx = st.get("vidx")
         st["vidx"] = gidx
+        if prev_idx is not None and gidx != prev_idx:
+            st["stale_v"] = 0        # grain neuf → lecteur sain (désarme l'escalade)
         if prev_idx is None or gidx == prev_idx:
             # 1er passage (pas de référence) ou aucun grain neuf → état contenu inconnu
             st.pop("black_since", None); st.pop("frozen_since", None)
@@ -1114,15 +1177,24 @@ def _sig_audio_probe(st, name, now):
     try:
         ar = st.get("ar")
         if ar is None:
-            ar = bobimxl.AudioReader(_mxl(), name)
+            ar = bobimxl.AudioReader(_sig_instance(st), name)
             st["ar"] = ar
-            st.pop("ahead", None); st.pop("sil_since", None)
+            st.pop("ahead", None); st.pop("sil_since", None); st.pop("ahead_t", None)
         head = int(ar.head_index())
         prev = st.get("ahead")
         st["ahead"] = head
         if prev is None or head < 0 or head == prev:
             st.pop("sil_since", None)
+            # Même décrochage que la vidéo, mais l'audio n'a PAS de lastWriteTime (les writers ne le
+            # bumpent pas) : le seul signe est un head_index qui ne bouge plus. Au-delà du seuil, on
+            # reconnecte (une source réellement muette a quand même un head qui AVANCE — le writer
+            # comble en silence ; un head figé n'est donc pas « du silence », c'est un décrochage).
+            _t0 = st.setdefault("ahead_t", now)
+            if now - _t0 > SIGNAL_STALE_MS / 1000.0:
+                _sig_reopen(st, name, "head figé %d depuis %.1f s" % (head, now - _t0), "a")
             return None
+        st["ahead_t"] = now
+        st["stale_a"] = 0            # head qui avance → lecteur sain (désarme l'escalade)
         nwin = max(48, int(SIGNAL_LOUD_MS / 1000.0 * 48000.0))   # fenêtre R128 « M » (400 ms) — sert
         r = ar.read_latest(nwin)                                 # aussi au pic (silence), float32 [-1,1]
         if r is None or not r.size:
@@ -2067,6 +2139,11 @@ def _tx_lat_monitor():
                 if lw:
                     v = round((bobimxl.now_tai() - lw) / 1e6, 1)
                     lat = v if 0 < v < 30_000 else None
+                    if lat is None:
+                        # Âge aberrant = flux recréé sous le même nom, notre Reader est resté sur la
+                        # génération morte (aucune exception : ses grains restent lisibles). Sans ce
+                        # drop, la latence de ce slot restait « inconnue » à VIE.
+                        _drop(nm)
                 else:
                     _drop(nm)   # flux absent/remplacé → recréer le reader au tour suivant
             except Exception:
