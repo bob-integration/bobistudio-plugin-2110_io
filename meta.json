@@ -1,7 +1,13 @@
 {
-  "version": "0.63.0",
+  "version": "0.64.0",
   "date": "2026-07-26",
   "changes": {
+    "Audio d'une sortie non câblée : SILENCE produit par le moteur, plus par un producteur (0.64.0)": [
+      "SUITE DE 0.63.0, ET RÉPARATION D'UNE RÉGRESSION QU'ELLE A INTRODUITE : en éteignant le générateur vidéo d'un slot statique, 0.63.0 éteignait aussi son générateur AUDIO — les sessions audio de ces slots disparaissaient (12 → 6 sessions TX). Or une sortie provisionnée doit émettre du SILENCE, pas RIEN : sans session, la feuille RL disparaît et câbler l'audio plus tard imposerait une recréation, donc un commit RL et un stop de port — exactement ce que le pré-provisionnement existe pour éviter.",
+      "CAUSE DE FOND : le silence était produit par un thread Python écrivant des blocs de 1 ms dans un flux MXL, soit ~1000 réveils par seconde ET PAR SORTIE, pour des zéros. Le silence n'est pas un signal, c'est une absence : il n'a aucune raison de mobiliser un producteur, un flux et un reader.",
+      "FIX (mtl_rx.c:audio_tx_thread) : sans source, on n'ouvre plus de reader et on descend directement au get_frame — le chemin « pas de samples → silence » existait DÉJÀ et fait le travail au pacing de la session. Côté contrôleur, la session audio est désormais émise même sans source (shm vide), au lieu d'être omise. Un décâblage audio à chaud lâche le reader et bascule au silence sans recréer la session.",
+      "La TONALITÉ, elle, reste un vrai signal et garde son producteur — même découpage que pour la vidéo : rendu vs émission."
+    ],
     "Slot TX non câblé : le MOTEUR ré-émet une trame statique, plus aucun producteur (0.63.0)": [
       "SUITE DE 0.62.0. La recopie par trame avait disparu, mais un slot provisionné non câblé gardait toute une chaîne vivante pour afficher une image FIXE : un thread Python, un flux MXL, un writer, un reader côté moteur, et une attente de grain bornée à 1,25 période à CHAQUE trame. Résultat : la cadence de la sortie 2110 était imposée par un thread Python en concurrence avec les lcores DPDK en busy-poll — 45 fps au lieu de 50.",
       "PRINCIPE : découper selon la CADENCE, pas selon le contenu. Le contenu d'un slot en GÉN ne change que sur évènement (motif, ident, format) : on le rend UNE fois côté contrôleur — qui a PIL et numpy — et on publie le résultat dans un fichier. `mtl_rx` le charge sur changement de mtime et le ré-émet lui-même : aucun reader, aucun flux MXL, aucune attente de grain. La boucle n'est plus cadencée que par la libération des framebuffers, donc par l'émission réelle : cadence NOMINALE.",

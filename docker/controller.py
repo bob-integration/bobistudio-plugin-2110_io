@@ -3030,7 +3030,11 @@ def _manager_loop():
                 if t["mcast"] and t["udp_port"] and ((t["enabled"] and t["shm_in"]) or t.get("provisioned")):
                     _emit_tx(_tx_session(i, t, _tx_iface(i, t.get("iface"))))
                 # TX audio : priorité TONALITÉ (gen autonome) > mire/repli (GEN vidéo) > câblé.
-                # NON câblé et sans tonalité ⇒ pas de session (silence).
+                # SANS aucune de ces sources, la session est émise QUAND MÊME, source VIDE : le
+                # moteur produit alors du SILENCE lui-même (audio_tx_thread, chemin `muet`). Émettre
+                # du silence plutôt que rien garde la session et sa feuille RL vivantes → câbler
+                # l'audio plus tard reste un swap de source, sans recréation ni commit RL. Et le
+                # silence ne justifie AUCUN producteur : c'est une absence, pas un signal.
                 _acable = t.get("audio_cable_shm") or []
                 for ai, acfg in enumerate(t.get("audios") or []):
                     if not acfg.get("mcast") or not acfg.get("port"):
@@ -3040,10 +3044,11 @@ def _manager_loop():
                         ashm = "/dev/shm/{}_audio_txgen_{}_{}".format(HOSTNAME, i, ai)
                     else:
                         ashm = _acable[ai] if ai < len(_acable) else None
-                    if t["enabled"] and ashm:
-                        if not ashm.startswith("/"):
+                    if t["enabled"]:
+                        if ashm and not ashm.startswith("/"):
                             ashm = "/dev/shm/" + ashm
-                        _emit_tx(_audio_tx_session(i * 2 + ai, acfg, ashm, _tx_iface(i, t.get("iface"))))
+                        _emit_tx(_audio_tx_session(i * 2 + ai, acfg, ashm or "",
+                                                   _tx_iface(i, t.get("iface"))))
                 # TX ANC : câblage INDÉPENDANT (anc_cable_shm). NON câblé ⇒ pas de session.
                 dshm = t.get("anc_cable_shm")
                 if t["enabled"] and t.get("anc_mcast") and t.get("anc_port") and dshm:

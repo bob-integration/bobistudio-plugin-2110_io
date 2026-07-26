@@ -2155,9 +2155,20 @@ static void* audio_tx_thread(void* arg) {
     if (tx_take_source(t) && t->reader) {   /* bobi.studio: source audio permutée à chaud → rouvrir */
       mxlReleaseFlowReader(g_mxl, t->reader); t->reader = NULL; t->tx_src_idx_init = 0;
     }
-    if (!t->reader) {
+    /* SILENCE SANS PRODUCTEUR (pendant audio du repli vidéo statique) : une sortie provisionnée
+     * dont l'audio n'est pas câblé doit émettre du SILENCE, pas RIEN — sinon la session (et sa
+     * feuille RL) disparaît, et câbler l'audio plus tard imposerait une recréation, donc un commit
+     * RL et un stop de port. Faire tourner un producteur pour du vide n'a en revanche aucun sens :
+     * ~1000 réveils/s et par sortie pour des blocs de 1 ms de zéros. Sans source, on descend donc
+     * directement au get_frame — le chemin « pas de samples → silence » plus bas fait déjà le
+     * travail, au pacing de la session. Le silence n'est pas un signal : c'est une absence. */
+    int muet = !t->shm_path[0];
+    if (!muet && !t->reader) {
       t->alive_ns = mono_ns();   /* attendre un câblage n'est pas un wedge */
       if (open_reader(t) != 0) { usleep(20000); continue; }
+    }
+    if (muet && t->reader) {     /* audio décâblé → on lâche le reader et on passe au silence */
+      mxlReleaseFlowReader(g_mxl, t->reader); t->reader = NULL; t->tx_src_idx_init = 0;
     }
     struct st30_frame* frame = st30p_tx_get_frame(s->a_tx);   /* bloque (BLOCK_GET) → pacing 1ms */
     if (!frame) { usleep(500); continue; }
@@ -2165,7 +2176,7 @@ static void* audio_tx_thread(void* arg) {
     uint8_t* dst = (uint8_t*)frame->addr;
     size_t n = frame->data_size / (size_t)(chs * 3);          /* samples par canal à émettre */
     mxlWrappedMultiBufferSlice slc; memset(&slc, 0, sizeof(slc));
-    if (n && reader_samples(t, n, &slc) == 0) {
+    if (!muet && n && reader_samples(t, n, &slc) == 0) {
       size_t stride = slc.stride;
       for (size_t c = 0; c < slc.count; c++) {
         size_t pos = 0;
