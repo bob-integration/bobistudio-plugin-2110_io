@@ -395,6 +395,10 @@ _profs_env = [s.strip().lower() for s in (os.environ.get("PORT_PROFILES") or "")
 PORT_PROFILES = [((_profs_env[_i] if _i < len(_profs_env) and _profs_env[_i] in
                    ("narrow", "narrow_linear", "wide") else "narrow")) for _i in range(len(IFACES))]
 _HAS_DPDK = any(p == "dpdk" for p in PORT_PMDS)
+# PTP INTERNE libmtl actif = même prédicat que mtl_rx.c (ENGINE_PTP=libmtl ∧ au moins un port dpdk ;
+# la variable est posée par l'orchestrateur, docker_driver._has_dpdk_pf). Quand il vaut True, le
+# moteur EST l'horloge du nœud — d'où le maintien du daemon même sans session (cf. _manager_loop).
+_ENGINE_PTP_ON = _HAS_DPDK and (os.environ.get("ENGINE_PTP") or "").strip().lower() == "libmtl"
 
 def _port_pmd(ifn):
     """PMD du port `ifn` : 'af_xdp' (défaut, chemin actuel) ou 'dpdk' (vfio-pci)."""
@@ -2912,8 +2916,23 @@ def _manager_loop():
         need_budget = (_mtl_proc is not None and not dead
                        and _ports_need_relaunch()
                        and (time.time() - _sig_changed_at) >= _RELAUNCH_SETTLE_S)
+        # HORLOGE AU REPOS (socle DPDK) : sur un port full-PF DPDK il n'y a plus de netdev kernel,
+        # donc plus de ptp4l — la SEULE horloge du nœud est le client PTP interne de libmtl, qui
+        # n'existe que tant que mtl_rx tourne (mtl_init). Tant que le daemon n'était lancé qu'au 1ᵉʳ
+        # abonnement, un moteur au repos laissait le nœud SANS AUCUNE référence de temps (alertes
+        # « horloge absente » permanentes, et le 1ᵉʳ flux câblé devait attendre la convergence PTP
+        # au lieu de trouver une horloge déjà disciplinée). mtl_rx accepte parfaitement 0 session :
+        # c'est un daemon `mtl_init` à vie + réconciliation à chaud, et sa boucle publie les stats
+        # (dont le bloc `ptp` de mtl_ports.json) indépendamment des sessions.
+        # En AF-XDP on garde le comportement HISTORIQUE : le CNI n'y a pas de PTP interne (l'horloge
+        # vient de ptp4l noyau) → lancer le daemon à vide attacherait le XDP et réserverait des files
+        # pour rien, sans aucune horloge à la clé.
+        garder_horloge = _ENGINE_PTP_ON and not sessions
         with _mtl_lock:
-            if _mtl_proc is None and sessions:
+            if _mtl_proc is None and (sessions or garder_horloge):
+                if garder_horloge:
+                    print("mtl_rx: démarrage à vide (0 session) — le moteur porte l'horloge PTP du "
+                          "nœud (socle DPDK, pas de ptp4l noyau)", flush=True)
                 _launch_mtl()                               # 1er lancement (mtl_init → 1 seule faute PTP)
             elif need_budget and sessions:
                 print("mtl_rx: demande de files > réserve ({} rx / {} tx alloc vs {} / {} réservé) → "
@@ -2921,7 +2940,7 @@ def _manager_loop():
                           _rx_queues_alloc, _tx_queues_alloc,
                           _rx_queues_reserved, _tx_queues_reserved), flush=True)
                 _launch_mtl()                               # réinit pour étendre la réserve de files
-            elif dead and sessions:
+            elif dead and (sessions or garder_horloge):
                 if (time.time() - _last_launch) < 6:
                     _fail_streak = min(_fail_streak + 1, 6)
                     wait = min(2 + 2 * _fail_streak, 15)
