@@ -424,6 +424,10 @@ static mxlRational fps_to_rational(double f) {
   return r;
 }
 
+/* Framebuffers suivis pour la ré-émission d'une trame STATIQUE en mode trame-entière (cf. struct
+ * target : sf_fb_ptr). Généreux : la lib en expose typiquement 3-4. */
+#define SF_FB_MAX 8
+
 /* Une cible = un FLUX MXL de sortie. Une session en porte 1..N (fan-out même-source → N flux).
  * Chaque cible a son propre writer (RX/simu) ou reader (TX), son index et son propre IDENT. */
 struct target {
@@ -460,6 +464,21 @@ struct target {
   uint64_t a_silence_log_ns;   /* throttle log gap-fill (mono_ns du dernier log, 0=jamais loggé) */
   char     ident_file[300]; int has_ident;
   uint8_t* ident_patch; int id_bw, id_bh; long id_mtime;
+  /* bobi.studio: TRAME STATIQUE (slot TX provisionné SANS câble — noir de repli, mire, ardoise).
+   * Le contenu ne change QUE sur évènement (changement de motif, d'ident, de format) : le rendre
+   * 50 fois par seconde n'a aucun sens. Le contrôleur le rend UNE fois et publie le résultat dans
+   * un fichier (écriture atomique, même contrat que `ident_file` : le C recharge sur le mtime) ;
+   * ce thread ne fait plus que ré-emettre. Aucun reader, aucun flux MXL, aucune attente de grain →
+   * la cadence est imposée par la seule libération des framebuffers, donc NOMINALE.
+   * Le fichier est byte-identique au payload d'un grain MXL (planar Y|Cb|Cr) : les deux chemins TX
+   * le consomment avec le code EXISTANT (sl_pack_band / copie+upshift), sans connaissance de format
+   * supplémentaire d'aucun côté. La profondeur se déduit de la TAILLE, comme pour un grain. */
+  char     static_frame[300];  /* chemin du fichier, ou "" (slot câblé / sans repli) */
+  uint8_t* sf_buf; size_t sf_size; long sf_mtime;
+  uint32_t sf_gen;             /* incrémenté à chaque (re)chargement → invalide les framebuffers */
+  /* Chemin TRAME ENTIÈRE : les framebuffers sont rendus par la lib (adresses stables et peu
+   * nombreuses) → même économie que le mode tranche, mémorisée par ADRESSE. */
+  void*    sf_fb_ptr[SF_FB_MAX]; uint32_t sf_fb_stamp[SF_FB_MAX]; int sf_fb_n;
   /* timecode ATC (data/ANC) — dernier TC décodé, publié dans les stats */
   char     tc[16]; int tc_df; int tc_valid;
   /* bobi.studio: SWAP de SOURCE à chaud sans re-créer la session TX (découplage source↔session).
@@ -580,7 +599,10 @@ struct sess {
   uint32_t sl_drop;            /* trames jetées (pas de slot / OpenGrain KO) */
   /* TX : framebuffers raw. Le worker remplit progressivement ; la lib consomme (get_next_frame)
    * et interroge lines_ready. stat : 0=FREE (à remplir) 1=READY (en remplissage ou en vol). */
-  struct sl_txfb { volatile int stat; volatile uint32_t lines_ready; } sl_fb[SL_Q];
+  /* `sf_stamp` : génération de trame STATIQUE déjà écrite dans ce framebuffer (0 = jamais). Les
+   * framebuffers libmtl PERSISTENT d'un tour à l'autre : une fois la trame statique packée dedans,
+   * la ré-émettre ne demande AUCUNE recopie — on ne fait que re-marquer le slot prêt. */
+  struct sl_txfb { volatile int stat; volatile uint32_t lines_ready; uint32_t sf_stamp; } sl_fb[SL_Q];
   uint16_t sl_fb_cnt, sl_fb_prod, sl_fb_cons;
   uint64_t sl_wedge_ns;        /* TX : début (mono) du blocage « aucun slot libre » (watchdog anneau) */
   uint64_t sl_wedge_log_ns;    /* TX : throttle du log wedge — instant du dernier log émis (0 = session
@@ -768,6 +790,31 @@ static void accum_rx_latency(struct target* t, uint64_t media_ts) {
 /* ═══ VIDÉO ═══════════════════════════════════════════════════════════════════ */
 
 static int frame_available(void* priv) { (void)priv; return 0; }
+
+/* TRAME STATIQUE : recharge le fichier (écrit par le contrôleur) si son mtime OU sa taille change.
+ * Même contrat que load_ident_patch — le contrôleur publie par rename atomique, on relit sur mtime.
+ * Renvoie 0 si une trame est disponible en mémoire, -1 sinon (pas de fichier, ou illisible : le
+ * slot reste alors silencieux, ce qui est visible, plutôt que d'émettre un buffer non initialisé).
+ * `sf_gen` est incrémenté à chaque chargement RÉUSSI : c'est lui qui invalide les framebuffers déjà
+ * remplis, sans quoi un changement de mire ne serait jamais visible à l'antenne. */
+static int load_static_frame(struct target* t) {
+  if (!t->static_frame[0]) return -1;
+  struct stat st;
+  if (stat(t->static_frame, &st) != 0 || st.st_size <= 0) return t->sf_buf ? 0 : -1;
+  if (t->sf_buf && (long)st.st_mtime == t->sf_mtime && (size_t)st.st_size == t->sf_size) return 0;
+  FILE* f = fopen(t->static_frame, "rb");
+  if (!f) return t->sf_buf ? 0 : -1;
+  uint8_t* buf = malloc((size_t)st.st_size);
+  if (!buf) { fclose(f); return t->sf_buf ? 0 : -1; }
+  size_t n = fread(buf, 1, (size_t)st.st_size, f);
+  fclose(f);
+  if (n != (size_t)st.st_size) { free(buf); return t->sf_buf ? 0 : -1; }
+  free(t->sf_buf);
+  t->sf_buf = buf; t->sf_size = n; t->sf_mtime = (long)st.st_mtime; t->sf_gen++;
+  fprintf(stderr, "mtl_rx: trame statique chargée (%s, %zu octets) — slot ré-émet sans producteur\n",
+          t->static_frame, n);
+  return 0;
+}
 
 /* IDENT : recharge le patch (fichier écrit par le contrôleur) si mtime change. Coût ~nul si off.
  * Le patch est PAR CIBLE (chaque slot a son propre IDENT, même quand la source est partagée). */
@@ -1489,15 +1536,52 @@ static void* video_tx_thread(void* arg) {
     if (tx_take_source(t) && t->reader) {
       mxlReleaseFlowReader(g_mxl, t->reader); t->reader = NULL; t->tx_src_idx_init = 0;
     }
-    if (!t->reader) {
+    /* MODE STATIQUE (cf. video_tx_slice_thread) : PROGRESSIF seulement. En entrelacé il faudrait
+     * servir le champ de la bonne parité à chaque get_frame ; tant que ce n'est pas fait, un slot
+     * entrelacé garde son producteur — limite ASSUMÉE et explicite, pas un trou silencieux (le
+     * contrôleur ne publie pas de `static_frame` pour un slot entrelacé). */
+    int statique = (!t->shm_path[0] && t->static_frame[0] && !s->interlaced);
+    if (!statique && !t->reader) {
       t->last_feed_ns = 0;   /* flux pas encore là : ne pas compter l'attente comme du retard */
       t->alive_ns = mono_ns();   /* attendre un câblage n'est pas un wedge */
       if (open_reader(t) != 0) { usleep(20000); continue; }
+    }
+    if (statique && t->reader) {   /* câble retiré → on lâche le reader et on passe en statique */
+      mxlReleaseFlowReader(g_mxl, t->reader); t->reader = NULL; t->tx_src_idx_init = 0;
+    }
+    if (statique && load_static_frame(t) != 0) {   /* pas (encore) de trame publiée → slot muet */
+      t->alive_ns = mono_ns();
+      usleep(20000); continue;
     }
     struct st_frame* frame = st20p_tx_get_frame(s->vth);   /* bloque → pacing à fps */
     if (!frame) { usleep(1000); continue; }
     uint64_t tnow = mono_ns();
     t->alive_ns = tnow;      /* la session transmet (frames libérées par MTL) */
+    if (statique) {
+      /* Remplissage UNE FOIS par framebuffer (adresses stables, cf. sf_fb_ptr) : après la première
+       * rotation, ré-émettre une trame statique ne coûte plus aucune copie. */
+      void* dst = frame->addr[0];
+      int slot = -1;
+      for (int k = 0; k < t->sf_fb_n; k++) if (t->sf_fb_ptr[k] == dst) { slot = k; break; }
+      if (slot < 0 && t->sf_fb_n < SF_FB_MAX) {
+        slot = t->sf_fb_n++; t->sf_fb_ptr[slot] = dst; t->sf_fb_stamp[slot] = 0;
+      }
+      if (slot < 0 || t->sf_fb_stamp[slot] != t->sf_gen) {
+        /* dst = trame planaire TOUJOURS 10 bits (input_fmt PLANAR10LE) ; source 8 bits → up-shift,
+         * exactement comme le chemin câblé (profondeur déduite de la TAILLE). */
+        size_t exp8 = (size_t)2 * (size_t)s->width * (size_t)s->height;
+        if (t->sf_size == exp8) {
+          uint16_t* d16 = (uint16_t*)dst;
+          for (size_t k = 0; k < t->sf_size; k++) d16[k] = (uint16_t)t->sf_buf[k] << 2;
+        } else {
+          memcpy(dst, t->sf_buf, out_size < t->sf_size ? out_size : t->sf_size);
+        }
+        if (slot >= 0) t->sf_fb_stamp[slot] = t->sf_gen;
+      }
+      st20p_tx_put_frame(s->vth, frame);
+      t->index++; t->recv++;
+      continue;                                  /* aucun `late` : il n'y a pas de source à rater */
+    }
     if (period_ns && t->last_feed_ns) {
       /* NB epoch-shift : ici PAS de biais de contre-pression (contrairement au mode tranche,
        * cf. video_tx_slice_thread) — le shift retarde chaque libération d'un offset CONSTANT,
@@ -1664,11 +1748,22 @@ static void* video_tx_slice_thread(void* arg) {
     if (tx_take_source(t) && t->reader) {       /* source permutée à chaud → rouvrir le reader */
       mxlReleaseFlowReader(g_mxl, t->reader); t->reader = NULL; fi_init = 0;
     }
-    if (!t->reader) {
+    /* MODE STATIQUE : slot SANS câble mais avec une trame publiée par le contrôleur (noir de repli,
+     * mire, ardoise). On ne dépend d'AUCUN producteur : ni reader, ni flux MXL, ni attente de grain.
+     * La boucle n'est alors cadencée que par la libération des framebuffers (donc par l'émission
+     * réelle) → cadence NOMINALE, là où un producteur externe imposait la sienne. Le câblage qui
+     * survient est pris au tour suivant par tx_take_source : la session reste la MÊME (aucun
+     * st20p_tx_create, aucun commit RL, aucun stop de port), la bascule se fait sur une frontière
+     * de trame et le flux 2110 n'est pas interrompu. */
+    int statique = (!t->shm_path[0] && t->static_frame[0]);
+    if (!statique && !t->reader) {
       t->last_feed_ns = 0; t->slot_wait_ns = 0;
       t->alive_ns = mono_ns();                  /* attendre un câblage n'est pas un wedge */
       fi_init = 0;
       if (open_reader(t) != 0) { usleep(20000); continue; }
+    }
+    if (statique && t->reader) {                /* on vient de perdre le câble → lâcher le reader */
+      mxlReleaseFlowReader(g_mxl, t->reader); t->reader = NULL; fi_init = 0;
     }
     /* attendre un framebuffer libre (la lib libère via notify_frame_done) */
     uint16_t idx = s->sl_fb_prod;
@@ -1743,6 +1838,28 @@ static void* video_tx_slice_thread(void* arg) {
     s->sl_wedge_ns = 0;                      /* un slot s'est libéré : anneau vivant */
     uint8_t* fb = st20_tx_get_framebuffer(s->sl_tx, idx);
     if (!fb) { usleep(5000); continue; }
+    if (statique) {
+      if (load_static_frame(t) != 0) {        /* pas (encore) de trame publiée → slot MUET */
+        t->alive_ns = mono_ns();              /* attendre une trame n'est pas un wedge */
+        usleep(20000); continue;
+      }
+      /* Packing UNE SEULE FOIS par framebuffer : les buffers libmtl persistent d'un tour à l'autre,
+       * donc ré-émettre une trame statique ne coûte plus rien après la première rotation. `sf_gen`
+       * change à chaque re-publication du fichier → tous les buffers sont re-packés. */
+      if (s->sl_fb[idx].sf_stamp != t->sf_gen) {
+        /* Profondeur SOURCE déduite de la TAILLE, comme pour un grain MXL (flux auto-descriptif). */
+        int src8 = (t->sf_size == (size_t)2 * (size_t)W * (size_t)H);
+        sl_pack_band(s, t->sf_buf, src8, 0, (uint32_t)H, fb);
+        s->sl_fb[idx].sf_stamp = t->sf_gen;
+      }
+      s->sl_fb[idx].lines_ready = (uint32_t)H;  /* contenu EN PLACE avant d'annoncer le slot prêt */
+      __sync_synchronize();
+      s->sl_fb[idx].stat = 1;
+      s->sl_fb_prod = (uint16_t)((idx + 1) % s->sl_fb_cnt);
+      t->index++; t->recv++;                    /* trame réellement émise (fps = nominal) */
+      t->alive_ns = mono_ns();
+      continue;                                 /* aucun `late` : il n'y a pas de source à rater */
+    }
     /* viser le grain de tête (rattrape si on est en retard ; jamais en arrière) */
     mxlFlowRuntimeInfo rt;
     mxlStatus stx = mxlFlowReaderGetRuntimeInfo(t->reader, &rt);
@@ -2291,7 +2408,10 @@ static int parse_target(struct json_object* j, struct target* t) {
   snprintf(t->stats_path, sizeof(t->stats_path), "%s", jstr(j, "stats", ""));
   const char* idf = jstr(j, "ident_file", "");
   if (idf && *idf) { snprintf(t->ident_file, sizeof(t->ident_file), "%s", idf); t->has_ident = 1; }
-  return t->shm_path[0] ? 0 : -1;
+  /* Trame STATIQUE : une cible SANS shm mais AVEC un fichier de trame est VALIDE — c'est le slot
+   * provisionné non câblé, qui émet son repli sans aucun producteur (cf. video_tx_*_thread). */
+  snprintf(t->static_frame, sizeof(t->static_frame), "%s", jstr(j, "static_frame", ""));
+  return (t->shm_path[0] || t->static_frame[0]) ? 0 : -1;
 }
 
 static void usage(const char* p) {
@@ -2399,6 +2519,7 @@ static void free_session(struct sess* s) {
     if (t->writer) mxlReleaseFlowWriter(g_mxl, t->writer);   /* RX/simu */
     if (t->reader) mxlReleaseFlowReader(g_mxl, t->reader);   /* TX */
     if (t->ident_patch) free(t->ident_patch);
+    if (t->sf_buf) free(t->sf_buf);                          /* trame statique */
   }
   if (s->tx_scratch) free(s->tx_scratch);
   if (s->rx_scratch) free(s->rx_scratch);
@@ -2441,9 +2562,19 @@ static void reconcile(struct sess* reg, const char* path, mtl_handle st, const c
         /* bobi.studio: TX — sig identique même si la SOURCE diffère (source hors-sig). On PROPAGE la
          * nouvelle source à la session VIVANTE (le thread rouvre son reader) au lieu de détruire+
          * recréer → aucun st20p_tx_create, aucun commit RL, aucun dé-lock PTP de la flotte. */
-        if (reg[i].role == ROLE_TX && reg[i].ntg > 0 && want.ntg > 0 &&
-            strcmp(reg[i].tg[0].want_shm, want.tg[0].shm_path) != 0)
-          tx_set_source(&reg[i].tg[0], want.tg[0].shm_path);
+        if (reg[i].role == ROLE_TX && reg[i].ntg > 0 && want.ntg > 0) {
+          /* Trame STATIQUE propagée elle aussi à chaud, et AVANT la source : un slot qu'on DÉCÂBLE
+           * (shm → "") doit trouver son repli déjà en place, sinon il deviendrait muet le temps
+           * d'un redéploiement. La cible ne la consulte que lorsque shm_path est vide, donc après
+           * que tx_take_source ait publié la nouvelle source — l'ordre d'écriture ici suffit. */
+          if (strcmp(reg[i].tg[0].static_frame, want.tg[0].static_frame) != 0) {
+            snprintf(reg[i].tg[0].static_frame, sizeof(reg[i].tg[0].static_frame), "%s",
+                     want.tg[0].static_frame);
+            reg[i].tg[0].sf_mtime = 0;      /* chemin changé → forcer un rechargement complet */
+          }
+          if (strcmp(reg[i].tg[0].want_shm, want.tg[0].shm_path) != 0)
+            tx_set_source(&reg[i].tg[0], want.tg[0].shm_path);
+        }
         break;
       }
   }

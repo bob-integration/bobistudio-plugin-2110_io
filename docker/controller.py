@@ -2234,8 +2234,12 @@ def _tx_session(idx, t, iface=IFACE):
             "epoch_shift_us": int(t.get("epoch_shift_us") or 0),
             # ident_file TOUJOURS présent (sig stable → toggle IDENT sans recréer la session) ;
             # le fichier n'existe que quand l'IDENT est actif (mtl_rx libère le patch sinon).
+            # static_frame TOUJOURS présent (comme ident_file : signature de session stable → passer
+            # du repli statique au câble ne recrée AUCUNE session, c'est un simple swap de source).
+            # Le fichier n'existe que quand le slot relève réellement du mode statique.
             "targets": [{"idx": idx, "shm": shm, "stats": "/tmp/mtl_tx{}.json".format(idx),
-                         "ident_file": _tx_ident_file(idx)}]},
+                         "ident_file": _tx_ident_file(idx),
+                         "static_frame": _tx_static_file(idx)}]},
             iface, t.get("mcast2"), t.get("udp_port2"))
 
 
@@ -2650,6 +2654,7 @@ def _tx_gen_apply(idx):
             _tx[idx]["enabled"] = False
         with _tx_gen_lock:
             _tx_gen[idx]["enabled"] = False
+        _publier_trame_statique(idx)    # retire un fichier de repli devenu sans objet
         return
     with _tx_lock:
         cable    = _tx[idx].get("cable_shm") or ""
@@ -2663,21 +2668,25 @@ def _tx_gen_apply(idx):
             _tx[idx]["enabled"] = True
         with _tx_gen_lock:
             _tx_gen[idx]["enabled"] = False
-    elif user_gen:
-        shm_name = "/dev/shm/{}_txgen_{}".format(HOSTNAME, idx)
-        with _tx_lock:
-            _tx[idx]["shm_in"] = shm_name
-            _tx[idx]["enabled"] = True
+    elif user_gen or fallback != "none":
         with _tx_gen_lock:
             _tx_gen[idx]["enabled"] = True
-    elif fallback != "none":
-        shm_name = "/dev/shm/{}_txgen_{}".format(HOSTNAME, idx)
-        with _tx_lock:
-            _tx[idx]["shm_in"] = shm_name
-            _tx[idx]["enabled"] = True
-        with _tx_gen_lock:
-            _tx_gen[idx]["enabled"] = True
-            _tx_gen[idx]["pattern"] = fallback   # le repli impose sa mire
+            if not user_gen:
+                _tx_gen[idx]["pattern"] = fallback   # le repli impose sa mire
+        # TRAME STATIQUE quand c'est possible (mire fixe, progressif) : le moteur ré-émet lui-même
+        # une trame publiée une fois, sans producteur ni flux MXL — cadence nominale et coût nul.
+        # Sinon (motif animé, entrelacé) on garde le générateur MXL historique.
+        if _tx_static_applicable(idx):
+            with _tx_lock:
+                _tx[idx]["shm_in"] = None            # pas de source vivante : le C sert le fichier
+                _tx[idx]["enabled"] = True
+            with _tx_gen_lock:
+                _tx_gen[idx]["enabled"] = False      # le thread txgen n'a plus lieu d'être
+        else:
+            shm_name = "/dev/shm/{}_txgen_{}".format(HOSTNAME, idx)
+            with _tx_lock:
+                _tx[idx]["shm_in"] = shm_name
+                _tx[idx]["enabled"] = True
     else:
         # Pas de source VIDÉO (ni câble, ni gen, ni repli). Le slot reste néanmoins ACTIF s'il porte
         # une source AUDIO ou ANC câblée : c'est un slot audio-seul / ANC-seul. `enabled` gouverne les
@@ -2691,6 +2700,10 @@ def _tx_gen_apply(idx):
             _tx[idx]["enabled"] = bool(has_aud or has_anc)
         with _tx_gen_lock:
             _tx_gen[idx]["enabled"] = False
+    # Publication (ou RETRAIT) de la trame statique, dans TOUS les cas : le prédicat est autonome,
+    # donc un slot qu'on vient de câbler voit son fichier de repli disparaître, et un slot décâblé
+    # le voit apparaître — sans qu'aucune branche ci-dessus n'ait à y penser.
+    _publier_trame_statique(idx)
 
 
 def _overlay_patch(mm, off, patch_data, lay):
@@ -2763,6 +2776,82 @@ def _tx_ident_file(idx):
     return "/dev/shm/{}_tx{}_ident".format(HOSTNAME, idx)
 
 
+# ─── Trame STATIQUE d'un slot TX non câblé (noir de repli, mire) ──────────────────────────────
+# Le contenu d'un slot en GÉN ne change QUE sur évènement : motif, ident, format. Le produire 50
+# fois par seconde via un flux MXL et un thread Python n'a aucun sens — et coûtait cher (≈4 Mo
+# recopiés par trame et par slot, cf. 0.62.0). On le rend UNE fois et on publie le résultat dans un
+# fichier ; `mtl_rx` le charge sur changement de mtime et le ré-émet lui-même, sans producteur, sans
+# reader, sans attente de grain — donc à la cadence NOMINALE (cf. video_tx_*_thread, mode statique).
+#
+# Le fichier est BYTE-IDENTIQUE au payload d'un grain MXL (planar Y|Cb|Cr, même profondeur) : les
+# deux chemins TX du moteur le consomment avec leur code existant, sans connaissance de format
+# nouvelle d'aucun côté, et la profondeur se déduit de la TAILLE comme pour un grain.
+#
+# Contrat identique à celui de l'IDENT : écriture atomique par rename, relecture sur mtime.
+def _tx_static_file(idx):
+    return "/dev/shm/{}_tx{}_static".format(HOSTNAME, idx)
+
+
+def _tx_static_applicable(idx):
+    """Ce slot peut-il être servi par une trame statique plutôt que par un producteur vivant ?
+
+    NON si : câblé (c'est de la vidéo qui bouge), entrelacé (le mode statique du moteur est
+    progressif seulement — limite assumée, cf. mtl_rx.c), ou motif ANIMÉ. Ces cas gardent le
+    générateur MXL historique : la bascule est explicite, jamais un trou silencieux.
+
+    Le prédicat se calcule depuis les SOURCES DE VÉRITÉ (câble, balayage, user_enabled,
+    fallback_mode) et surtout PAS depuis `_tx_gen[idx]["enabled"]`, qui n'est plus que l'état du
+    thread générateur — précisément ce que le mode statique éteint."""
+    if idx >= ACTIVE_TX_C:
+        return False
+    with _tx_lock:
+        cable = (_tx[idx].get("cable_shm") or "")
+        entrelace = (_tx[idx].get("scan") == "i")
+        fallback = _tx[idx].get("fallback_mode") or "none"
+    with _tx_gen_lock:
+        user_gen = _tx_gen[idx]["user_enabled"]
+        motif = (_tx_gen[idx].get("pattern") or "black") if user_gen else fallback
+    if cable or entrelace or not (user_gen or fallback != "none"):
+        return False
+    return motif not in _TXGEN_MOTIFS_DYNAMIQUES
+
+
+def _publier_trame_statique(idx):
+    """Rend la trame du slot (motif + ident incrusté) et la publie pour `mtl_rx`. Renvoie le chemin
+    du fichier, ou None si le slot ne relève pas du mode statique (le fichier est alors RETIRÉ, ce
+    qui rebascule proprement le moteur sur son producteur)."""
+    fpath = _tx_static_file(idx)
+    if not _tx_static_applicable(idx):
+        try:
+            if os.path.exists(fpath):
+                os.remove(fpath)
+        except OSError as e:
+            print("tx static remove err idx={}: {}".format(idx, e), flush=True)
+        return None
+    with _tx_lock:
+        w, h = int(_tx[idx]["w"] or WIDTH), int(_tx[idx]["h"] or HEIGHT)
+    with _tx_gen_lock:
+        motif = _tx_gen[idx].get("pattern") or "black"
+        user_ident = _tx_gen[idx]["ident"]
+    lay = _layout(w, h)
+    try:
+        y, cb, cr = _get_pattern(motif, 0, lay)
+        buf = np.empty(lay["y"] + 2 * lay["uv"], dtype=np.uint8)
+        _fill_grain_planes(buf, lay, y, cb, cr)
+        # IDENT user actif → c'est le moteur qui l'incruste (overlay C sur la trame émise) : ne pas
+        # le brûler ici, on aurait le libellé en double à l'écran.
+        if not user_ident:
+            _overlay_patch(buf, 0, _txgen_ident_patch(idx), lay)
+        tmp = fpath + ".tmp"
+        with open(tmp, "wb") as f:
+            f.write(buf.tobytes())
+        os.replace(tmp, fpath)      # publication atomique (mtl_rx lit le mtime)
+        return fpath
+    except Exception as e:
+        print("tx static publish err idx={}: {}".format(idx, e), flush=True)
+        return None
+
+
 def _render_tx_ident(idx):
     """Patch IDENT user d'une sortie TX (plan Y8) ou None si IDENT off / PIL absent."""
     with _tx_gen_lock:
@@ -2794,6 +2883,9 @@ def _update_tx_ident(idx):
             os.replace(tmp, fpath)   # publication atomique (mtl_rx lit le mtime)
     except Exception as e:
         print("tx ident file err:", e, flush=True)
+    # L'IDENT user gouverne aussi le libellé AUTO brûlé dans la trame statique (sans quoi on
+    # afficherait les deux) → republier la trame du slot s'il est en mode statique.
+    _publier_trame_statique(idx)
 
 
 def _ports_need_relaunch():
