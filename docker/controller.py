@@ -19,7 +19,7 @@
 #
 # Ce fichier est exécuté tel quel dans le conteneur (pas de str.format) → accolades normales.
 
-import json, mmap, os, re, signal, ssl, struct, subprocess, threading, time, zlib
+import hashlib, json, mmap, os, re, signal, ssl, struct, subprocess, threading, time, zlib
 import numpy as np
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
@@ -703,6 +703,82 @@ def _field_test(fi, f, w, fh):
     cr = np.tile(crrow, (uv_h, 1))
     y[0:max(2, fh // 8), 0:max(2, w // 8)] = _WHITE if f == 0 else _BLACK   # marqueur de champ (luma)
     return y, cb, cr
+
+
+# ─── Réutilisation de slot du ring MXL (mire STATIQUE) ────────────────────────────────────────
+# `Writer.open_grain()` rend une vue ZÉRO-COPIE sur un slot du ring : le contenu écrit lors d'une
+# rotation précédente y est ENCORE PRÉSENT. Pour une mire statique — le cas de TOUT slot TX
+# provisionné non câblé, qui émet le fallback noir — remplir le grain à chaque trame est donc une
+# recopie d'environ 4 Mo pour un résultat OCTET POUR OCTET IDENTIQUE.
+#
+# Mesuré le 2026-07-26 sur dl360-1 : 6 générateurs × 4,15 Mo × 50 fps ≈ 1,24 Go/s de memcpy en
+# Python pour une image CONSTANTE — et ils ne tenaient que 37,5 fps sur les 50 demandés (le fil,
+# lui, restait nominal : libmtl répète la trame, cf. mtl_rx.c « trame (gelée) émise »).
+#
+# On mémorise donc, PAR ADRESSE de slot (robuste : aucune hypothèse sur la géométrie du ring), la
+# signature du contenu écrit + un ÉCHANTILLON d'octets témoins. La cadence de grains ne change PAS
+# (50 grains/s, indices qui avancent normalement) : seul le remplissage redondant disparaît, après
+# une rotation complète du ring.
+#
+# GARDE (pas d'échec silencieux) : l'échantillon est REVÉRIFIÉ à chaque réutilisation. Si MXL
+# réinitialisait un slot entre deux grains, on le VERRAIT — on remplirait normalement et on le
+# dirait une fois dans les logs — au lieu d'émettre du vide en silence.
+_TXGEN_ECHANT_N = 64                 # octets témoins par slot (comparaison négligeable par trame)
+_TXGEN_MOTIFS_DYNAMIQUES = ("moving", "field_test")   # contenu different à chaque trame
+_txgen_ring_volatil = set()          # slots TX ayant déjà signalé un ring non conservatif
+
+
+def _grain_echantillon(view):
+    pas = max(1, view.size // _TXGEN_ECHANT_N)
+    return bytes(view[::pas][:_TXGEN_ECHANT_N])
+
+
+def _grain_empreinte(view):
+    """Empreinte du grain ENTIER. Coûteuse (une lecture pleine trame) — réservée à la
+    VÉRIFICATION PROFONDE, faite UNE seule fois par slot (cf. _grain_reutilisable)."""
+    return hashlib.blake2b(view, digest_size=16).digest()
+
+
+def _grain_reutilisable(cache, view, sig, idx):
+    """Le slot qu'on vient d'ouvrir contient-il DÉJÀ exactement ce contenu ?
+
+    Deux niveaux de preuve, parce que sauter le remplissage repose sur une HYPOTHÈSE (le ring
+    conserve les octets entre deux rotations) et qu'une hypothèse fausse émettrait du vide en
+    silence :
+      1. À la PREMIÈRE réutilisation d'un slot : comparaison de l'empreinte du grain ENTIER. Coût
+         payé une fois par slot (≈ 8 slots par flux), donc négligeable, et il PROUVE l'hypothèse sur
+         le matériel réel plutôt que de la supposer.
+      2. Ensuite : 64 octets témoins à chaque trame — assez pour voir un slot réinitialisé, pour un
+         coût nul.
+    Échec de l'un ou l'autre ⇒ on remplit normalement ET on le DIT (une fois par slot TX)."""
+    ent = cache.get(view.ctypes.data)
+    if ent is None or ent[0] != sig:
+        return False
+    sig_mem, echant, empreinte = ent
+    if empreinte is not None:                     # vérification PROFONDE, une seule fois
+        ok = (_grain_empreinte(view) == empreinte)
+        if ok:
+            cache[view.ctypes.data] = (sig_mem, echant, None)   # prouvé : on passe au contrôle léger
+        else:
+            _signaler_ring_volatil(idx, "empreinte du grain entier")
+            return False
+        return True
+    if _grain_echantillon(view) != echant:
+        _signaler_ring_volatil(idx, "octets témoins")
+        return False
+    return True
+
+
+def _signaler_ring_volatil(idx, quoi):
+    if idx not in _txgen_ring_volatil:
+        _txgen_ring_volatil.add(idx)
+        print("txgen idx={}: le ring MXL ne conserve PAS le contenu entre deux grains ({} en "
+              "défaut) — remplissage systématique, optimisation mire statique inopérante"
+              .format(idx, quoi), flush=True)
+
+
+def _noter_grain(cache, view, sig):
+    cache[view.ctypes.data] = (sig, _grain_echantillon(view), _grain_empreinte(view))
 
 
 def _fill_grain_planes(view, lay, y, cb, cr):
@@ -3068,12 +3144,17 @@ def _txgen_loop(idx):
     writer = None; res = None; fi = 0; patch = None; patch_age = 0
     next_t = None   # échéance absolue (monotone) du prochain GRAIN → pacing exact (compense le calcul)
     last_tai = -1   # entrelacé : dernier index TRAME TAI écrit (genlock PTP, anti-doublon/anti-saut)
+    slots = {}      # adresse de slot du ring → (signature, échantillon) — cf. _grain_reutilisable
+    patch_sig = None  # signature du CONTENU du patch ident (≠ compteur : cf. plus bas)
     def _close():
         nonlocal writer, res
         if writer is not None:
             try: writer.close()
             except Exception: pass
         writer = None; res = None
+        # Le ring disparaît avec le writer : ses adresses peuvent être recyclées par un AUTRE flux.
+        # Repartir d'un cache vide est OBLIGATOIRE (sinon on « reconnaîtrait » la mémoire d'autrui).
+        slots.clear()
     def _pace(period):
         # dort jusqu'à l'échéance (next_t += period), compense le temps de génération ; resync si
         # on accumule >½ période de retard (évite de courir derrière indéfiniment).
@@ -3123,28 +3204,44 @@ def _txgen_loop(idx):
                 layf = _layout(w, fh)
                 full = None if pat == "field_test" else _get_pattern(pat, frame_tai, lay)
                 for fld in (0, 1):
-                    if pat == "field_test":
-                        yy, cbb, crr = _field_test(frame_tai, fld, w, fh)
-                    else:
-                        yy, cbb, crr = full[0][fld::2], full[1][fld::2], full[2][fld::2]
                     _, gi, view = writer.open_grain(index=frame_tai * 2 + fld)
-                    _fill_grain_planes(view, layf, yy, cbb, crr)
+                    # Champ d'une mire statique : le contenu ne dépend que du motif et de la parité.
+                    sig = (pat, w, fh, fld, frame_tai if pat in _TXGEN_MOTIFS_DYNAMIQUES else None)
+                    if not _grain_reutilisable(slots, view, sig, idx):
+                        if pat == "field_test":
+                            yy, cbb, crr = _field_test(frame_tai, fld, w, fh)
+                        else:
+                            yy, cbb, crr = full[0][fld::2], full[1][fld::2], full[2][fld::2]
+                        _fill_grain_planes(view, layf, yy, cbb, crr)
+                        _noter_grain(slots, view, sig)
                     writer.commit(gi)
             else:
-                y_arr, cb_arr, cr_arr = _get_pattern(pat, fi, lay)
                 # IDENT user actif → mtl_rx incrustera l'IDENT sur la mire au passage du feeder TX ;
                 # on n'ajoute PAS le libellé auto de la mire (évite le doublon à l'écran).
                 with _tx_gen_lock:
                     user_ident = _tx_gen[idx]["ident"]
                 if user_ident:
-                    patch = None
+                    patch = None; patch_sig = None
                 elif patch_age <= 0 or patch is None:
                     patch = _txgen_ident_patch(idx); patch_age = int(fps)  # recalcul 1× par seconde
+                    # Signature du CONTENU, pas un compteur de recalcul : l'ident est re-rendu
+                    # chaque seconde mais son texte change rarement. Un compteur ferait réécrire
+                    # TOUT le ring 1×/s pour un patch rigoureusement identique.
+                    patch_sig = (hash((patch[0].tobytes(), patch[1], patch[2])) if patch else None)
                 else:
                     patch_age -= 1
                 _, gi, view = writer.open_grain()
-                _fill_grain_planes(view, lay, y_arr, cb_arr, cr_arr)
-                _overlay_patch(view, 0, patch, lay)
+                # Le contenu ne dépend QUE du motif, de la géométrie et du patch ident — donc
+                # constant tant que les trois le sont (mire noire d'un slot non câblé : toujours).
+                # `_get_pattern` n'est appelé QUE si le slot doit réellement être réécrit : pour un
+                # motif dynamique il ALLOUE une trame entière à chaque appel.
+                sig = (pat, lay["w"], lay["h"], patch_sig,
+                       fi if pat in _TXGEN_MOTIFS_DYNAMIQUES else None)
+                if not _grain_reutilisable(slots, view, sig, idx):
+                    y_arr, cb_arr, cr_arr = _get_pattern(pat, fi, lay)
+                    _fill_grain_planes(view, lay, y_arr, cb_arr, cr_arr)
+                    _overlay_patch(view, 0, patch, lay)
+                    _noter_grain(slots, view, sig)
                 writer.commit(gi)
         except Exception as e:
             print("txgen err idx={}: {}".format(idx, e), flush=True)
