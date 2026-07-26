@@ -85,7 +85,7 @@
 .gen-pat-wrap { position:absolute; top:calc(100% + 4px); left:50%; transform:translateX(-50%);
     z-index:20; }
 .gen-pat-sel { display:block; font-size:0.78em; font-weight:500;
-    font-family:var(--font-ui, Inter, 'Segoe UI', system-ui, sans-serif);
+    font-family:var(--font-base);
     background:var(--bg-input); color:var(--text); border:1px solid var(--border);
     border-radius:4px; padding:3px 7px; cursor:pointer; white-space:nowrap;
     transition:border-color 120ms; }
@@ -141,7 +141,7 @@
   border-left-width:3px; background:var(--surface,rgba(127,127,127,.04)); font-size:0.8em; }
 .io2110-portchip.down { opacity:.55; }
 .pc-top { display:flex; align-items:center; gap:6px; }
-.pc-name { font-weight:700; font-family:var(--font-mono,monospace); }
+.pc-name { font-weight:700; font-family:var(--font-mono); }
 .pc-net { font-size:0.82em; color:var(--text-muted); overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
 .pc-prim { font-size:0.62em; font-weight:700; letter-spacing:.04em; color:#e8a33d; flex:none; }
 .pc-down { font-size:0.7em; color:var(--status-stopped-fg,#f87171); flex:none; }
