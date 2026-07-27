@@ -4,7 +4,8 @@
   "changes": {
     "Libellé de la source : place à la mesure des noms réels (0.66.1)": [
       "Le libellé était rendu DANS la cellule du tag, large de 64 px : un nom d'antenne un peu long était tronqué au bout de quelques caractères. Il devient un élément de grille à part — 2ᵉ rangée, de la colonne du tag jusqu'à SDP, donc sous « Rx #1 », GÉN et IDENT, où la place était inutilisée : ~230 px au lieu de 64, aligné en bas sur la ligne des adresses.",
-      "Le nom complet reste dans l'infobulle (avec le niveau affiché et la mention « hérité » le cas échéant), pour les cas où même cette largeur ne suffit pas."
+      "Le nom complet reste dans l'infobulle (avec le niveau affiché et la mention « hérité » le cas échéant), pour les cas où même cette largeur ne suffit pas.",
+      "Mise en avant : le libellé passe en GRAS et à la taille de base de la ligne (le tag « Rx #1 », lui, reste petit). C'est le nom d'exploitation qu'on lit d'abord sur un mur de sources — pas le numéro de slot."
     ],
     "Libellé de la source sous chaque Rx + casse Rx/Tx (0.66.0)": [
       "Chaque ligne de flux Rx (vidéo, audio, ANC) affiche sous son tag le LIBELLÉ de la source — le nom que l'exploitant reconnaît (UMD reçu par TSL, nom d'antenne…), lu de la table `source_labels` alimentée par le service TSL et la page /labels. Le nom technique (shm) reste dans la colonne MXL.",
