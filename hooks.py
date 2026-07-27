@@ -103,7 +103,7 @@ def before_deploy(params, context):
         if not t.get("multicast_ip"):
             ip, prt = allocate_multicast_for(node_id, ifn, media_network_id=netid,
                                              essence="video", leg=0, port=_port_v, fmt=fmt_v,
-                                             owner_ref=f"tx:{vmid}:{i}:video:leg0")
+                                             owner_ref=f"tx:{vmid}:{i}:video:leg0", slot=i)
             if ip:
                 t["multicast_ip"], t["dest_port"] = ip, prt
             else:
@@ -122,7 +122,8 @@ def before_deploy(params, context):
                 if not a.get("multicast_ip"):
                     ipa, pa = allocate_multicast_for(node_id, ifn, media_network_id=netid, essence="audio",
                                                      leg=0, port=_port_a + aidx * 2, fmt={"channels": 8},
-                                                     owner_ref=f"tx:{vmid}:{i}:audio:{aidx}:leg0")
+                                                     owner_ref=f"tx:{vmid}:{i}:audio:{aidx}:leg0",
+                                                     slot=i, sub_index=ai)
                     if ipa:
                         a["multicast_ip"], a["dest_port"] = ipa, pa
                 # Générateur de tonalité par sous-flux audio — défaut OFF, 1 kHz / -18 dBFS.
@@ -135,7 +136,7 @@ def before_deploy(params, context):
             _port_d = port_default_for(node_id, ifn, netid, "anc", 0, None, 5008)
             ipd, pd = allocate_multicast_for(node_id, ifn, media_network_id=netid, essence="anc",
                                              leg=0, port=_port_d + i * 2,
-                                             owner_ref=f"tx:{vmid}:{i}:anc:leg0")
+                                             owner_ref=f"tx:{vmid}:{i}:anc:leg0", slot=i)
             if ipd:
                 t["anc_multicast_ip"], t["anc_dest_port"] = ipd, pd
         # SMPTE 2022-7 — leg1 auto-alloué une seule fois (guard explicite : ne pas écraser), sur
@@ -145,7 +146,7 @@ def before_deploy(params, context):
             if not t.get("multicast_ip_leg1"):
                 ip1, p1 = allocate_multicast_for(node_id, ifn1, media_network_id=netid1, essence="video",
                                                  leg=1, port=t.get("dest_port") or 5000, fmt=fmt_v,
-                                                 owner_ref=f"tx:{vmid}:{i}:video:leg1")
+                                                 owner_ref=f"tx:{vmid}:{i}:video:leg1", slot=i)
                 if ip1:
                     t["multicast_ip_leg1"], t["dest_port_leg1"] = ip1, p1
             for ai, a in enumerate(t.get("audios") or []):
@@ -153,13 +154,14 @@ def before_deploy(params, context):
                 if not a.get("multicast_ip_leg1"):
                     ipa1, pa1 = allocate_multicast_for(node_id, ifn1, media_network_id=netid1, essence="audio",
                                                        leg=1, port=a.get("dest_port") or 5004, fmt={"channels": 8},
-                                                       owner_ref=f"tx:{vmid}:{i}:audio:{aidx}:leg1")
+                                                       owner_ref=f"tx:{vmid}:{i}:audio:{aidx}:leg1",
+                                                       slot=i, sub_index=ai)
                     if ipa1:
                         a["multicast_ip_leg1"], a["dest_port_leg1"] = ipa1, pa1
             if not t.get("anc_multicast_ip_leg1"):
                 ipd1, pd1 = allocate_multicast_for(node_id, ifn1, media_network_id=netid1, essence="anc",
                                                    leg=1, port=t.get("anc_dest_port") or 5008,
-                                                   owner_ref=f"tx:{vmid}:{i}:anc:leg1")
+                                                   owner_ref=f"tx:{vmid}:{i}:anc:leg1", slot=i)
                 if ipd1:
                     t["anc_multicast_ip_leg1"], t["anc_dest_port_leg1"] = ipd1, pd1
     params["tx_slots"] = slots[:n_tx]
