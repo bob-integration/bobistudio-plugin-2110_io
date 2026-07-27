@@ -2700,7 +2700,12 @@ static void write_stats(struct sess* reg, uint64_t last[][MAX_TG], uint64_t last
     for (int ti = 0; ti < s->ntg; ti++) {
       struct target* t = &s->tg[ti];
       if (!t->stats_path[0]) continue;
-      double rate = dt > 0 ? (double)(t->recv - last[i][ti]) / dt : 0.0;
+      /* ★ Δ CAPTURÉ AVANT de recaler `last` : le calcul de fps_source plus bas a besoin du MÊME
+       * Δrecv que `rate`. Le lire après l'affectation donnerait 0 à tous les coups (last == recv),
+       * donc fps_source = 0 en permanence — une sortie parfaitement alimentée serait affichée
+       * « source à 0 image/s ». Une métrique fausse est pire que pas de métrique. */
+      uint64_t d_recv = t->recv - last[i][ti];
+      double rate = dt > 0 ? (double)d_recv / dt : 0.0;
       last[i][ti] = t->recv;
       /* Latence de réception (segment A) : moyenne de la fenêtre, en ms. -1 = pas d'échantillon
        * (TX, ou flux média sans timestamp) → sérialisé `null`. Reset du cumul à chaque fenêtre. */
@@ -2713,23 +2718,28 @@ static void write_stats(struct sess* reg, uint64_t last[][MAX_TG], uint64_t last
       int is_video_tx = (s->kind == K_VIDEO && s->role == ROLE_TX);
       double fps_source = 0.0;
       if (is_video_tx) {
-        uint64_t d_recv = t->recv - last[i][ti];
         uint64_t d_rep  = t->repeats - last_repeats[i][ti];
         d_rep = d_rep > d_recv ? d_recv : d_rep;      /* garde-fou : jamais plus de reprises que de trames */
         fps_source = dt > 0 ? (double)(d_recv - d_rep) / dt : 0.0;
         last_repeats[i][ti] = t->repeats;
       }
+      /* fps_source/repeats : UNIQUEMENT cibles TX vidéo (cf. is_video_tx ci-dessus) — toute autre
+       * cible (RX, audio, ANC) n'émet PAS ces champs. */
+      char repbuf[64]; repbuf[0] = '\0';
+      if (is_video_tx)
+        snprintf(repbuf, sizeof(repbuf), ", \"fps_source\": %.1f, \"repeats\": %llu",
+                 fps_source, (unsigned long long)t->repeats);
       FILE* sf = fopen(t->stats_path, "w");
       if (sf) {
         char latbuf[32];
         if (rx_lat >= 0.0) snprintf(latbuf, sizeof(latbuf), "%.1f", rx_lat);
         else               snprintf(latbuf, sizeof(latbuf), "null");
         if (s->kind == K_DATA && t->tc_valid)
-          fprintf(sf, "{\"fps\": %.1f, \"frame_index\": %llu, \"timecode\": \"%s\", \"df\": %s, \"rx_latency_ms\": %s%s}\n",
-                  rate, (unsigned long long)t->index, t->tc, t->tc_df ? "true" : "false", latbuf, tpbuf);
+          fprintf(sf, "{\"fps\": %.1f, \"frame_index\": %llu, \"timecode\": \"%s\", \"df\": %s, \"rx_latency_ms\": %s%s%s}\n",
+                  rate, (unsigned long long)t->index, t->tc, t->tc_df ? "true" : "false", latbuf, tpbuf, repbuf);
         else
-          fprintf(sf, "{\"fps\": %.1f, \"frame_index\": %llu, \"late\": %llu, \"rx_latency_ms\": %s%s}\n",
-                  rate, (unsigned long long)t->index, (unsigned long long)t->late, latbuf, tpbuf);
+          fprintf(sf, "{\"fps\": %.1f, \"frame_index\": %llu, \"late\": %llu, \"rx_latency_ms\": %s%s%s}\n",
+                  rate, (unsigned long long)t->index, (unsigned long long)t->late, latbuf, tpbuf, repbuf);
         fclose(sf);
       }
     }
@@ -2866,6 +2876,7 @@ int main(int argc, char** argv) {
   signal(SIGINT, on_signal); signal(SIGTERM, on_signal);
   static struct sess reg[MAX_SESS]; memset(reg, 0, sizeof(reg));
   static uint64_t last[MAX_SESS][MAX_TG]; memset(last, 0, sizeof(last));
+  static uint64_t last_repeats[MAX_SESS][MAX_TG]; memset(last_repeats, 0, sizeof(last_repeats));
 
   /* Instance MXL (domaine tmpfs partagé avec les consommateurs). À vie, comme mtl_init. */
   const char* mxl_domain = getenv("MXL_DOMAIN");
@@ -3084,7 +3095,7 @@ int main(int argc, char** argv) {
         }
       }
       uint64_t now_mono = mono_ns(); double dt = (double)(now_mono - last_t) / 1e9;
-      if (dt >= 2.0) { write_stats(reg, last, dt); last_t = now_mono;
+      if (dt >= 2.0) { write_stats(reg, last, last_repeats, dt); last_t = now_mono;
         write_port_stats(st);            /* contrat /tmp/mtl_ports.json (stats I/O par NIC) */
         mxlGarbageCollectFlows(g_mxl);   /* récupère les flux orphelins (producteurs morts) */
         /* Backstop wedge TX (ultime filet — le lien mort est normalement absorbé par le patch
@@ -3166,7 +3177,7 @@ int main(int argc, char** argv) {
     for (int z = 0; z < 20 && !g_stop; z++) usleep(100000);
     if (g_stop) break;
     uint64_t now_mono = mono_ns(); double dt = (double)(now_mono - last_t) / 1e9; last_t = now_mono;
-    write_stats(reg, last, dt);
+    write_stats(reg, last, last_repeats, dt);
   }
   free_session(s);
   mtl_uninit(st);

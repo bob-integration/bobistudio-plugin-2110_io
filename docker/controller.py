@@ -911,13 +911,19 @@ def _overlay_simu(mm, off, idx, lay):
 
 
 def _read_tx_stats(idx):
-    """Stats du sender TX idx écrites par mtl_rx (fps réel + late = trames ayant raté leur epoch)."""
+    """Stats du sender TX idx écrites par mtl_rx (fps réel + late = trames ayant raté leur epoch).
+    `fps_source`/`repeats` : répétition de trame VISIBLE (fps mélange trames uniques et rejouées) —
+    n'existent dans le fichier que pour les cibles TX VIDÉO (cf. mtl_rx.c write_stats) ; None sinon,
+    à ne PAS confondre avec 0 (une source qui avance à fps_source=0 n'a émis QUE des répétitions)."""
     try:
         with open("/tmp/mtl_tx{}.json".format(idx)) as f:
             d = json.load(f)
-        return float(d.get("fps", 0.0)), int(d.get("late", 0))
+        fps_source = d.get("fps_source")
+        return (float(d.get("fps", 0.0)), int(d.get("late", 0)),
+                float(fps_source) if fps_source is not None else None,
+                int(d["repeats"]) if "repeats" in d else None)
     except Exception:
-        return None, None
+        return None, None, None, None
 
 
 # ─── :8080 métriques (format get_metrics) ────────────────────────────
@@ -1342,7 +1348,7 @@ class MetricsHandler(BaseHTTPRequestHandler):
                 if t["enabled"] and t["shm_in"] and t.get("lat_ms") is not None:
                     inputs_lat = {t["shm_in"]: t["lat_ms"]}
                 if t["mcast"] and t["udp_port"]:
-                    tx_fps, tx_late = _read_tx_stats(i)
+                    tx_fps, tx_late, tx_fps_source, tx_repeats = _read_tx_stats(i)
                     with _tx_gen_lock:
                         _id_on, _id_sz = _tx_gen[i]["ident"], _tx_gen[i]["ident_size"]
                     entry = {"tx_idx": i, "idx": i, "essence": "video",
@@ -1350,6 +1356,12 @@ class MetricsHandler(BaseHTTPRequestHandler):
                              "late": tx_late, "sdp": _tx_sdp(i, t),
                              "ident": _id_on, "ident_size": _id_sz,
                              "inputs_latency_ms": inputs_lat}
+                    # Répétition de trame VISIBLE (cf. _read_tx_stats) : relayés TELS QUELS, aucune
+                    # dérivation ici (repeats_per_s etc. reste au consommateur, cf. contrat CLAUDE.md).
+                    if tx_fps_source is not None:
+                        entry["fps_source"] = tx_fps_source
+                    if tx_repeats is not None:
+                        entry["repeats"] = tx_repeats
                     if i in sig_tx:
                         entry["signal"] = sig_tx[i]
                     senders.append(entry)
