@@ -448,6 +448,11 @@ struct target {
   uint64_t tx_src_idx;     /* TX vidéo : dernier index de grain SOURCE lu (détection flux figé) */
   uint64_t tx_src_idx_ns;  /* TX vidéo : instant (monotone) où tx_src_idx a changé pour la dernière fois */
   int      tx_src_idx_init; /* TX vidéo : tx_src_idx amorcé ? (0 au (ré)ouverture du reader) */
+  /* TX vidéo (bobi.studio) : compteur CUMULÉ de trames RÉPÉTÉES (gel d'image tranche, ou grain
+   * source identique à la trame précédente en mode trame-entière). Trames UNIQUES = recv - repeats.
+   * EXCLUT le mode statique (nominal, pas une dégradation) et la trame noire de repli (absence de
+   * signal, pas une répétition) — cf. write_stats pour fps_source. */
+  uint64_t repeats;
   int      anc_fmt_init;   /* TX ANC : codage du producteur déjà résolu ? (0 au (ré)ouverture) */
   int      anc_rfc8331;    /* TX ANC : 1 = producteur RFC 8331 (normatif), 0 = ancien format maison */
   uint64_t field_base;     /* TX entrelacé : index du 1er champ de la trame émise (MÊME trame pour les
@@ -1621,6 +1626,10 @@ static void* video_tx_thread(void* arg) {
           memcpy(dst, payload, out_size < _gs ? out_size : _gs);
         }
         latched_fi = gi.index;
+        /* répétition VISIBLE : reader_field a rendu le MÊME grain-champ que la trame précédente
+         * (source figée) — tx_src_idx porte encore l'ancienne valeur, tx_reopen_if_stale ne l'a
+         * pas encore mise à jour pour ce tour. */
+        if (t->tx_src_idx_init && gi.index == t->tx_src_idx) t->repeats++;
         tx_reopen_if_stale(t, gi.index, tnow);   /* flux figé (producteur redéployé) → reconnexion */
         /* IDENT entrelacé : positionné en espace TRAME → différé (champ = ½ hauteur). TODO champ-aware. */
       } else {
@@ -1657,6 +1666,9 @@ static void* video_tx_thread(void* arg) {
         /* IDENT : dst est une trame pleine planaire TOUJOURS 10-bit (input_fmt PLANAR10LE). */
         if (t->has_ident) { load_ident_patch(t); overlay_ident(s, t, dst, 10); }
         t->index = gi.index;
+        /* répétition VISIBLE : même grain source que la trame précédente (source figée) — cf.
+         * commentaire miroir de la branche entrelacée ci-dessus. */
+        if (t->tx_src_idx_init && gi.index == t->tx_src_idx) t->repeats++;
         tx_reopen_if_stale(t, gi.index, tnow);   /* flux figé (producteur redéployé) → reconnexion */
       } else {
         memset(dst, 0, out_size);               /* pas de grain → trame neutre */
@@ -1906,6 +1918,7 @@ static void* video_tx_slice_thread(void* arg) {
         s->sl_fb[idx].lines_ready = l0 + nl;
       }
       t->recv++;                                /* trame (gelée) émise — fps reste nominal */
+      t->repeats++;                             /* répétition VISIBLE : même grain que la trame précédente */
       tx_reopen_if_stale(t, rt.headIndex, tnow);
       continue;                                 /* next_fi inchangé : reprise au grain frais */
     }
@@ -2659,8 +2672,11 @@ static void reconcile(struct sess* reg, const char* path, mtl_handle st, const c
   json_object_put(root);
 }
 
-/* Écrit le fichier de stats {fps, frame_index} de chaque cible vivante. */
-static void write_stats(struct sess* reg, uint64_t last[][MAX_TG], double dt) {
+/* Écrit le fichier de stats {fps, frame_index} de chaque cible vivante. `last_repeats` suit le
+ * MÊME mécanisme que `last` (fenêtre glissante de `recv`) mais pour `repeats` — nécessaire pour
+ * dériver fps_source = (Δrecv − Δrepeats)/dt sur la fenêtre, PAS depuis le cumul depuis le boot. */
+static void write_stats(struct sess* reg, uint64_t last[][MAX_TG], uint64_t last_repeats[][MAX_TG],
+                         double dt) {
   static const char* TP_VERDICT[] = {"failed", "wide", "narrow"};
   for (int i = 0; i < MAX_SESS; i++) {
     struct sess* s = &reg[i];
@@ -2690,6 +2706,19 @@ static void write_stats(struct sess* reg, uint64_t last[][MAX_TG], double dt) {
        * (TX, ou flux média sans timestamp) → sérialisé `null`. Reset du cumul à chaque fenêtre. */
       double rx_lat = t->lat_cnt ? (double)t->lat_sum / (double)t->lat_cnt / 1e6 : -1.0;
       t->lat_sum = 0; t->lat_cnt = 0;
+      /* bobi.studio: RÉPÉTITION DE TRAME VISIBLE (TX vidéo seulement) — fps_source = trames
+       * UNIQUES/s sur la fenêtre (Δrecv − Δrepeats)/dt, `repeats` = cumul depuis le démarrage. Même
+       * mécanique fenêtre glissante que `rate` ci-dessus, sur `last_repeats`. Buffer préparé même
+       * hors-vidéo/TX pour rester simple ; non émis (champs absents) en dehors du cas visé. */
+      int is_video_tx = (s->kind == K_VIDEO && s->role == ROLE_TX);
+      double fps_source = 0.0;
+      if (is_video_tx) {
+        uint64_t d_recv = t->recv - last[i][ti];
+        uint64_t d_rep  = t->repeats - last_repeats[i][ti];
+        d_rep = d_rep > d_recv ? d_recv : d_rep;      /* garde-fou : jamais plus de reprises que de trames */
+        fps_source = dt > 0 ? (double)(d_recv - d_rep) / dt : 0.0;
+        last_repeats[i][ti] = t->repeats;
+      }
       FILE* sf = fopen(t->stats_path, "w");
       if (sf) {
         char latbuf[32];

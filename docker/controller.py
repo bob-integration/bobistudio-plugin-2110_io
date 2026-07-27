@@ -661,12 +661,13 @@ def _fps_rational(f):
 
 
 def _mk_video_writer(name, w, h, fps, interlace="progressive"):
-    """Writer MXL vidéo planar (index_mode tai → grille continue avec le live RX).
+    """Writer MXL vidéo planar : index sur la grille TAI (bobimxl.Writer.next_index, le point
+    unique de calcul de la flotte) → grille continue avec le live RX.
     `interlace`=interlaced_tff/bff → libmxl dimensionne chaque grain à 1 CHAMP (½h) et double la
     cadence ; le producteur écrit 2 grains-champs/trame aux index CHAMP (cf. _txgen_loop)."""
     n, d = _fps_rational(fps)
     return bobimxl.Writer(_mxl(), name, w, h, chroma=CHROMA, bit_depth=BIT_DEPTH,
-                          fps_num=n, fps_den=d, index_mode="tai", interlace=interlace)
+                          fps_num=n, fps_den=d, interlace=interlace)
 
 
 # Barres de couleur 100% (Y, Cb, Cr en 8 bits, centre chroma 128) → mises à l'échelle bit-depth.
@@ -3366,11 +3367,11 @@ def _txgen_loop(idx):
                 patch = None; patch_age = 0   # forcer recalcul ident après resize
             if il:
                 # ENTRELACÉ GENLOCK PTP : 2 grains-CHAMPS par trame, aux index CHAMP de la GRILLE TAI
-                # (frame_tai×2 + champ). On suit l'index TAI (writer._next_index, cadence trame) AU LIEU
+                # (frame_tai×2 + champ). On suit l'index TAI (writer.next_index, cadence trame) AU LIEU
                 # d'un compteur monotone → la mire est verrouillée sur le PTP comme le TX → fluide (plus
                 # de répétition/saut dû à la dérive txgen(monotone)↔TX(PTP)). Dédoublonnage : on n'écrit
                 # qu'aux NOUVEAUX index TAI (même trame → on attend la suivante).
-                frame_tai = int(writer._next_index())
+                frame_tai = int(writer.next_index())
                 if frame_tai <= last_tai:
                     time.sleep(0.004); continue   # même trame TAI → attendre la suivante
                 last_tai = frame_tai
@@ -3472,7 +3473,7 @@ def _txgen_audio_loop(idx, ai):
         try:
             if writer is None:
                 writer = bobimxl.AudioWriter(_mxl(), name, channels=A_CHANNELS,
-                                             sample_rate=SR, index_mode="tai")
+                                             sample_rate=SR)
             if tone_on:
                 active = (tone.get("active") or [])
                 rupted = (tone.get("rupted") or [])
@@ -3535,7 +3536,7 @@ def _simu_audio_loop(idx):
         try:
             if writer is None:
                 writer = bobimxl.AudioWriter(_mxl(), name, channels=A_CHANNELS,
-                                             sample_rate=SR, index_mode="tai")
+                                             sample_rate=SR)
             active = (tone.get("active") or [])
             rupted = (tone.get("rupted") or [])
             freq = int(tone.get("freq") or 1000)
