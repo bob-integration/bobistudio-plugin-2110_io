@@ -183,9 +183,13 @@ window.MXLPlugins["2110_io"] = {
                 + (_lab.inherited ? ' — hérité de la vidéo du même Rx' : '')
                 + ' · niveau réglable en haut de page';
       }
+      // Le libellé est un ÉLÉMENT DE GRILLE À PART (2ᵉ rangée, colonnes 1→4) et non un enfant du
+      // tag : la colonne du tag fait 64 px, un nom d'antenne y était tronqué dès quelques
+      // caractères. Sous GÉN et IDENT il dispose de ~230 px, et la place était libre.
       const labelLine = _lab.value
-        ? `<small class="flow-label${_lab.level !== (window.SourceLabels || {}).level ? ' fallback' : ''}"
-                  title="${esc(_labTip)}">${esc(_lab.value)}</small>`
+        ? `<small class="flow-label ${isAnc ? 'd' : isAudio ? 'a' : 'v'}${
+                  _lab.level !== (window.SourceLabels || {}).level ? ' fallback' : ''}"
+                  title="${esc(_lab.value + (_labTip ? ' — ' + _labTip : ''))}">${esc(_lab.value)}</small>`
         : '';
       // Bouton générateur : data-* lus par délégation (pas d'onclick global). Pas de GÉN pour l'ANC.
       // Placeholder vide quand absent : la grille .flow-row place par position → sans cet espace
@@ -271,7 +275,8 @@ window.MXLPlugins["2110_io"] = {
           })();
       const rowCls = isAnc ? 'flow-anc' : isAudio ? 'flow-audio' : 'flow-video';
       return `<div class="flow-row ${rowCls}">
-        <span class="flow-tag ${isAnc ? 'd' : isAudio ? 'a' : 'v'}">${tag}${labelLine}</span>
+        <span class="flow-tag ${isAnc ? 'd' : isAudio ? 'a' : 'v'}">${tag}</span>
+        ${labelLine}
         ${genIcon}
         ${identCtl}
         ${sdpCtl}
