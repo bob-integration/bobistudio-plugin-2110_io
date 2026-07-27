@@ -1,7 +1,12 @@
 {
-  "version": "0.67.0",
+  "version": "0.68.0",
   "date": "2026-07-27",
   "changes": {
+    "Cadence FIL vs cadence SOURCE : la répétition de trame devient visible (0.68.0)": [
+      "Le champ `fps` d'une sortie TX mélangeait les trames uniques et les trames rejouées : une sortie dont la source sous-cadence pouvait afficher une cadence sans qu'on sache si l'image avançait vraiment. Le moteur publie désormais `fps_source` (trames UNIQUES par seconde) et `repeats` (cumul de trames rejouées) à côté de `fps`, qui garde son sens de cadence RÉELLE SUR LE FIL.",
+      "Une trame est comptée comme répétée dans la branche de gel d'image du chemin tranche, et dans le chemin trame pleine quand le grain lu porte le même index que la trame précédemment émise. Le mode statique (slot sans câble servi par une image fixe) et la trame noire de repli sont EXCLUS : le premier est le fonctionnement nominal, la seconde est une absence de signal — ni l'un ni l'autre n'est une dégradation de cadence.",
+      "Préalable de mesure au chantier « horloge de sortie » : le fil devra tenir l'époque quitte à répéter la dernière trame, mais le déficit amont ne doit pas devenir invisible pour autant. Les deux chiffres restent affichés côte à côte sur la page Sorties 2110 (« 50,0 fps · source 49,3 »)."
+    ],
     "Index de sortie : un seul point de calcul, dans bobimxl (0.67.0)": [
       "Le contrôleur du moteur déclarait index_mode=\"tai\" sur ses writers (mire, silence, txgen) et appelait _next_index() : il passe au point unique bobimxl.Writer.next_index, comme le reste de la flotte. Comportement identique — la grille TAI était déjà la bonne — mais plus de déclaration à tenir synchrone, et la stricte croissance est désormais garantie par le code commun.",
       "L'index de champ de la sortie entrelacée (frame_tai×2 + parité) dérive maintenant d'un next_index() monotone : deux fois le même index réécrirait des champs déjà publiés."
