@@ -136,7 +136,7 @@ window.MXLPlugins["2110_io"] = {
       return out;
     }
 
-    function rowReceiver(r){
+    function rowReceiver(r, groupVideo){
       // Préfère le SDP (toutes les jambes / DUP) ; repli sur les transport_params IS-05.
       let flows = flowsFromSdp(r.sdp);
       if (!flows.length && r.multicast_ip) flows = [`${r.multicast_ip}:${r.destination_port ?? '?'}`];
@@ -149,16 +149,44 @@ window.MXLPlugins["2110_io"] = {
       const isAudio = r.essence === 'audio';
       const isAnc   = r.essence === 'anc';
       const ess = isAudio ? 'audio' : 'video';
-      // Nommage d'AFFICHAGE uniforme avec les slots TX (« TX #n ») : « RX #1 » ; « RX #1 AUD 1 » =
-      // RX 1, 1ʳᵉ piste audio ; « RX #1 ANC ». Index 1-based. Le nom technique du flux (shm) reste
+      // Nommage d'AFFICHAGE uniforme avec les slots TX (« Tx #n ») : « Rx #1 » ; « Rx #1 AUD 1 » =
+      // Rx 1, 1ʳᵉ piste audio ; « Rx #1 ANC ». Index 1-based. Le nom technique du flux (shm) reste
       // visible dans la colonne MXL — jamais comme nom du flux.
       const tag = isAnc
-        ? `RX #${(r.video_idx != null ? r.video_idx : r.idx) + 1} ANC`
+        ? `Rx #${(r.video_idx != null ? r.video_idx : r.idx) + 1} ANC`
         : isAudio
         ? ((r.video_idx != null && r.audio_sub_idx != null)
-            ? `RX #${r.video_idx + 1} AUD ${r.audio_sub_idx + 1}`
-            : `RX AUD #${r.idx + 1}`)
-        : `RX #${r.idx + 1}`;
+            ? `Rx #${r.video_idx + 1} AUD ${r.audio_sub_idx + 1}`
+            : `Rx AUD #${r.idx + 1}`)
+        : `Rx #${r.idx + 1}`;
+      // LIBELLÉ DE LA SOURCE, sous le tag : le nom que l'exploitant reconnaît (UMD reçu par TSL,
+      // nom d'antenne…). Le NIVEAU affiché est celui choisi dans la barre de navigation — on
+      // n'en impose aucun, un même flux porte plusieurs noms selon le métier. La règle de repli
+      // et l'héritage parent→audio/ANC vivent dans window.SourceLabels (partagés avec /labels).
+      const _shm = String(r.shm_path || '').replace(/^\/dev\/shm\//, '');
+      let _lab = (window.SourceLabels && _shm) ? window.SourceLabels.labelOf(_shm)
+                                              : { value: '', inherited: false, level: null };
+      // Audio/ANC sans libellé propre → celui de la VIDÉO du même Rx. L'héritage de /labels ne
+      // couvre pas ce cas : il exige que le parent soit un PRÉFIXE du nom (`player` → `player_audio`),
+      // or le moteur nomme ses flux `<hôte>_0` et `<hôte>_audio_0` — des frères, pas un préfixe.
+      // Ici on ne devine rien : le moteur nous donne lui-même le groupement (g.video).
+      if (!_lab.value && groupVideo && window.SourceLabels) {
+        const _vshm = String(groupVideo.shm_path || '').replace(/^\/dev\/shm\//, '');
+        const _vlab = _vshm ? window.SourceLabels.labelOf(_vshm) : null;
+        if (_vlab && _vlab.value) _lab = { value: _vlab.value, inherited: true, level: _vlab.level };
+      }
+      let _labTip = '';
+      if (_lab.value && window.SourceLabels) {
+        _labTip = 'Libellé « ' + window.SourceLabels.levelName(_lab.level) + ' »'
+                + (_lab.level !== window.SourceLabels.level
+                     ? ' — le niveau demandé est vide pour cette source' : '')
+                + (_lab.inherited ? ' — hérité de la vidéo du même Rx' : '')
+                + ' · niveau réglable en haut de page';
+      }
+      const labelLine = _lab.value
+        ? `<small class="flow-label${_lab.level !== (window.SourceLabels || {}).level ? ' fallback' : ''}"
+                  title="${esc(_labTip)}">${esc(_lab.value)}</small>`
+        : '';
       // Bouton générateur : data-* lus par délégation (pas d'onclick global). Pas de GÉN pour l'ANC.
       // Placeholder vide quand absent : la grille .flow-row place par position → sans cet espace
       // réservé, le badge SDP se décalerait dans une colonne de gauche (désalignement audio/ANC vs vidéo).
@@ -243,7 +271,7 @@ window.MXLPlugins["2110_io"] = {
           })();
       const rowCls = isAnc ? 'flow-anc' : isAudio ? 'flow-audio' : 'flow-video';
       return `<div class="flow-row ${rowCls}">
-        <span class="flow-tag ${isAnc ? 'd' : isAudio ? 'a' : 'v'}">${tag}</span>
+        <span class="flow-tag ${isAnc ? 'd' : isAudio ? 'a' : 'v'}">${tag}${labelLine}</span>
         ${genIcon}
         ${identCtl}
         ${sdpCtl}
@@ -308,7 +336,7 @@ window.MXLPlugins["2110_io"] = {
           ${fmtDest(anc)}</div>`);
         const _txPort = (vid && vid.port) || (auds[0] && auds[0].port) || (anc && anc.port) || null;
         return `<div class="ens">
-          <div class="ens-title">Slot TX #${Number(ti) + 1}${portSelector('tx', Number(ti), _txPort)}</div>
+          <div class="ens-title">Slot Tx #${Number(ti) + 1}${portSelector('tx', Number(ti), _txPort)}</div>
           ${lines.join('')}
         </div>`;
       }).join('');
@@ -540,8 +568,8 @@ window.MXLPlugins["2110_io"] = {
         : ens.map((g, i) => {
             const rows = [];
             if (g.video) rows.push(rowReceiver(g.video));
-            g.audios.forEach(a => rows.push(_rmWrap(rowReceiver(a), a.flow_id)));
-            (g.ancs || []).forEach(d => rows.push(_rmWrap(rowReceiver(d), d.flow_id)));
+            g.audios.forEach(a => rows.push(_rmWrap(rowReceiver(a, g.video), a.flow_id)));
+            (g.ancs || []).forEach(d => rows.push(_rmWrap(rowReceiver(d, g.video), d.flow_id)));
             if (g.independent) {
               // Flux indépendants (audio/ANC non rattachés à une vidéo).
               return `<div class="ens ens-indep">
@@ -963,6 +991,12 @@ window.MXLPlugins["2110_io"] = {
     body.addEventListener('pointerup', onKnobUp);
     body.addEventListener('wheel', onKnobWheel, {passive: false});
 
+    // Changement de niveau de libellé (barre de navigation) → re-rendu immédiat, sans attendre
+    // le prochain tick de 5 s : le sélecteur doit répondre à la volée.
+    if (this._onLabelLevel) document.removeEventListener('source-labels:change', this._onLabelLevel);
+    this._onLabelLevel = () => refresh();
+    document.addEventListener('source-labels:change', this._onLabelLevel);
+
     refresh();
     if (this._timers[vmid]) clearInterval(this._timers[vmid]);
     this._timers[vmid] = setInterval(refresh, 5000);
@@ -971,5 +1005,9 @@ window.MXLPlugins["2110_io"] = {
   unmount(vmid){
     if (vmid != null) { clearInterval(this._timers[vmid]); delete this._timers[vmid]; }
     else { Object.values(this._timers).forEach(clearInterval); this._timers = {}; }
+    if (this._onLabelLevel) {
+      document.removeEventListener('source-labels:change', this._onLabelLevel);
+      this._onLabelLevel = null;
+    }
   }
 };

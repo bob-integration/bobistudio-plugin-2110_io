@@ -1,7 +1,13 @@
 {
-  "version": "0.65.0",
-  "date": "2026-07-26",
+  "version": "0.66.0",
+  "date": "2026-07-27",
   "changes": {
+    "Libellé de la source sous chaque Rx + casse Rx/Tx (0.66.0)": [
+      "Chaque ligne de flux Rx (vidéo, audio, ANC) affiche sous son tag le LIBELLÉ de la source — le nom que l'exploitant reconnaît (UMD reçu par TSL, nom d'antenne…), lu de la table `source_labels` alimentée par le service TSL et la page /labels. Le nom technique (shm) reste dans la colonne MXL.",
+      "Le NIVEAU affiché (label_2 … label_9) n'est pas figé : il vient du sélecteur global de la barre de navigation (window.SourceLabels), commun à toutes les pages qui listent des sources, et se change à la volée — un même flux porte plusieurs noms selon le métier. Défaut : colonne 2 (convention TSL du parc). Repli sur le premier autre niveau non vide, signalé en italique.",
+      "Audio/ANC sans libellé propre → celui de la vidéo du même Rx. L'héritage de /labels ne pouvait pas couvrir ce cas : il exige que le parent soit un PRÉFIXE du nom (`player` → `player_audio`), or le moteur nomme ses flux `<hôte>_0` et `<hôte>_audio_0` — des frères. Le groupement vient du moteur lui-même, on ne devine rien.",
+      "Casse harmonisée : « Rx #1 » / « Tx #1 » au lieu de « RX #1 » / « TX #1 » (l'en-tête d'ensemble écrivait déjà « Rx #n » — incohérence interne levée). Aucun impact fonctionnel : c'est de l'affichage, les noms techniques ne changent pas."
+    ],
     "Sampler de présence signal : reconnexion d'un lecteur MXL DÉCROCHÉ (0.65.0)": [
       "ANGLE MORT DE SUPERVISION MESURÉ EN PROD (Horace, 2026-07-26) : changer la source d'un slot RX fait fusionner/dégrouper les sessions mtl_rx (deux slots sur le même multicast = UNE session à N cibles) et DÉTRUIT/RECRÉE les flux MXL concernés sous le même nom. Le sampler, lecteur longue durée, restait collé à la génération MORTE de 3 slots pendant des heures — sans aucune exception : les grains de l'orphelin restent LISIBLES, index figé. La réouverture n'existait que « sur exception » : elle ne se déclenchait donc JAMAIS.",
       "Conséquence : `_sig_video_probe` renvoyait « inconnu » à vie sur ces slots (index identique au précédent) → plus aucune alerte noir/gel, ni résolution. L'image restait parfaite à l'écran : seule la supervision était aveugle.",
