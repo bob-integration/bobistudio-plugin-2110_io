@@ -1737,6 +1737,15 @@ static void* video_tx_thread(void* arg) {
  * -EBUSY, c'est perdre l'époque et laisser le producteur dicter le rythme des paquets. */
 static int tx_sl_next_frame(void* priv, uint16_t* next_frame_idx, struct st20_tx_frame_meta* meta) {
   struct sess* s = priv; (void)meta;
+  /* ★ LE CONSOMMATEUR DOIT SAUTER LES SLOTS RÉSERVÉS (stat=2), exactement comme le producteur.
+   * Sans ça il avance d'un cran par trame consommée, tombe sur un tampon de repli — figé à un index
+   * FIXE, lui — et s'y arrête DÉFINITIVEMENT : plus aucune trame fraîche n'est jamais consommée.
+   * Régression introduite avec la paire de repli (0.71.0) et mesurée en prod : 1,5 fps, port à
+   * 0,01 Gb/s. Elle n'existait pas tant que le seul slot réservé était la tenue, qui MIGRE vers les
+   * slots du worker à chaque trame émise et libère donc toujours la place. Bornée à un tour
+   * d'anneau, même raison que la garde du producteur. */
+  for (uint16_t _k = 0; _k < s->sl_fb_cnt && s->sl_fb[s->sl_fb_cons].stat == 2; _k++)
+    s->sl_fb_cons = (uint16_t)((s->sl_fb_cons + 1) % s->sl_fb_cnt);
   uint16_t c = s->sl_fb_cons;
   if (s->sl_fb[c].stat != 1) {
     /* Rien de frais : bascule GEL → REPLI (TÉMOIN DE REPLI, bobi.studio). Un slot câblé

@@ -1,11 +1,12 @@
 {
-  "version": "0.71.0",
+  "version": "0.71.1",
   "date": "2026-07-28",
   "changes": {
     "Témoin de vie : une sortie en repli PROUVE qu'elle émet (0.71.0)": [
       "Une sortie dont la source meurt se figeait sur la dernière image — indiscernable, sur un moniteur, d'une chaîne d'émission plantée. Au-delà de 2 s sans grain frais, elle sert désormais une PAIRE de trames de repli pré-packées, identiques à un carré témoin près, alternées toutes les 500 ms : le témoin se DÉPLACE, et ce mouvement prouve que le moteur émet toujours sur la grille d'époque.",
       "Coût à l'exécution : une bascule d'index. Aucune écriture pendant l'émission (modifier un framebuffer en vol provoquerait du déchirement), aucun rendu, aucune copie. L'anneau passe à 6 slots — 3 pour le worker, 1 pour le gel, 2 pour la paire — et le témoin est dessiné par le MOTEUR en C : il bat même contrôleur injoignable, comme le noir de repli.",
-      "Le gel reste le comportement des 2 premières secondes : un hoquet de 300 ms ne doit rien changer à l'antenne, une source morte doit se voir. Les deux seuils sont des constantes nommées, à remonter dans les Réglages avec le mode de repli (noir / mire / ardoise)."
+      "Le gel reste le comportement des 2 premières secondes : un hoquet de 300 ms ne doit rien changer à l'antenne, une source morte doit se voir. Les deux seuils sont des constantes nommées, à remonter dans les Réglages avec le mode de repli (noir / mire / ardoise).",
+      "0.71.1 — CORRECTIF : le consommateur doit lui aussi sauter les slots réservés. Il s'arrêtait définitivement sur un tampon de repli (index fixe) et ne consommait plus aucune trame fraîche — mesuré en prod : 1,5 fps, port à 0,01 Gb/s. Le défaut n'existait pas tant que le seul slot réservé était la tenue, qui migre vers les slots du worker à chaque trame émise."
     ],
     "Une sortie 2110 ne s arrête jamais : trame courante amorcée et préservée (0.70.0)": [
       "La trame de tenue introduite en 0.69.0 n'existait qu'APRÈS la première trame émise, et le watchdog d'anneau l'invalidait. Une sortie dont le producteur disparaissait redevenait donc MUETTE — mesuré en prod : port à 0,01 Gb/s au lieu de 2,19, et anneau qui resynchronisait toutes les 2 s.",
