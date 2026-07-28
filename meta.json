@@ -1,7 +1,13 @@
 {
-  "version": "0.76.0",
+  "version": "0.77.0",
   "date": "2026-07-28",
   "changes": {
+    "Sondes de présence signal armées PAR SLOT (POST /probes) — 0.77.0": [
+      "L'orchestrateur sait quels drapeaux l'exploitant a armés par source ; le moteur, lui, calculait tout pour tout le monde. Décocher doit économiser le CALCUL, pas seulement taire l'alerte : 0,03 % d'un cœur par source pour le gamut, 0,09 % par flux pour l'audio (mesurés sur le nœud).",
+      "Trois sondes distinctes, parce que leurs coûts n'ont rien à voir : `video` (noir + gel — un CRC et une moyenne, négligeable), `gamut` (le calcul cher : matriçage BT.709) et `audio` (silence + saturation, lus en continu à 20 Hz). Le gamut s'éteint SEUL, sans désarmer noir et gel.",
+      "⚠ DÉFAUT = TOUT CALCULER. Un slot jamais configuré, ou un moteur redémarré avant que l'orchestrateur ne repousse sa configuration, surveille comme avant. Une surveillance qui s'éteindrait toute seule au premier redémarrage serait exactement l'échec silencieux qu'on corrige partout.",
+      "`_sig_probes` vit en RAM : l'orchestrateur repousse donc la configuration complète après chaque (re)création du moteur (resync_moteur → push_probes_all). Sans ce repush, seule l'ÉCONOMIE serait perdue — jamais la surveillance."
+    ],
     "Sonde signal : audio lu SANS TROU, cadences découplées, gamut à origine tournante (0.76.0)": [
       "★ L'alarme de SILENCE n'a JAMAIS fonctionné. La sonde demandait 400 ms (fenêtre R128 « M ») à un ring qui n'en retient que 100 (A_RING = 100 chunks de 1 ms) : la lecture échouait, la fonction sortait par `r is None` sans un mot, et ni le silence ni le loudness n'ont jamais été publiés. Vérifié en production : 12 sessions audio vivantes à 1000 chunks/s, `silence` absent des 15 slots qui publiaient un signal. Les 400 ms n'existaient que pour le loudness, retiré des alarmes le même jour.",
       "LECTURE SÉQUENTIELLE par curseur (read_from) au lieu de « la fenêtre la plus récente » : on lit TOUT ce qui est arrivé depuis le relevé précédent. Un pic peut tenir en un seul échantillon — une fenêtre glissante en raterait par construction. Vérifié sur simulateur de ring : 480 000 échantillons écrits, 480 000 analysés, zéro trou, et un pic isolé d'UN échantillon attrapé.",

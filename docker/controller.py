@@ -969,6 +969,10 @@ SIGNAL_AUDIO_S    = float(os.environ.get("SIGNAL_AUDIO_S") or 0.05)
 
 _signal_rx = {}      # idx slot RX → {"black","frozen"[,"silence"]} — lu par MetricsHandler
 _signal_tx = {}      # idx slot TX → {"black","frozen"} (contenu du shm d'entrée câblé)
+# Sondes ACTIVES par slot RX : {idx: {"video":bool, "gamut":bool, "audio":bool}}. Poussé par
+# l'orchestrateur depuis les réglages par source (POST /probes). Slot ABSENT = tout est calculé —
+# le défaut ne doit jamais éteindre une surveillance par omission.
+_sig_probes = {}
 _sig_lock  = threading.Lock()
 _sig_state = {}      # ("rx"|"tx", idx) → état interne {name, vr, ar, vidx, crcs, *_since, fmt}
 
@@ -1033,6 +1037,22 @@ def _sig_reopen(st, name, motif, kind="v"):
     if n <= 3 or n % 100 == 0:      # source réellement morte → on retente sans inonder le journal
         print("sampler: {} — lecteur PÉRIMÉ ({}), reconnexion (tentative {}){}".format(
             name, motif, n, " → Instance DÉDIÉE" if n >= 2 else ""), flush=True)
+
+
+class _SkipGamut(Exception):
+    """Sonde gamut désarmée sur ce slot — sortie propre du bloc de calcul, pas une erreur."""
+
+
+def _gamut_arme(st):
+    """Le gamut est-il armé sur le slot que décrit `st` ? Le gamut est la partie CHÈRE de la sonde
+    vidéo (0,59 ms par relevé contre 46 µs pour l'audio) : il doit pouvoir s'éteindre SEUL, sans
+    désarmer noir et gel qui, eux, ne coûtent qu'un CRC et une moyenne."""
+    idx = st.get("slot_idx")
+    if idx is None:
+        return True
+    with _sig_lock:
+        pr = _sig_probes.get(idx)
+    return True if pr is None else bool(pr.get("gamut", True))
 
 
 def _gamut_illegal_pct(y, u, v, bd):
@@ -1151,6 +1171,8 @@ def _sig_video_probe(st, name, now):
         # Isolé dans son propre try : un plan chroma illisible ne doit pas fermer le reader vidéo.
         gam_pct = None
         try:
+            if not _gamut_arme(st):
+                raise _SkipGamut            # sonde désarmée sur ce slot : on ne calcule pas
             hx, hy = _CHROMA.get(str(fmt.get("chroma") or "422"), (2, 1))
             cw, ch_ = w // hx, h // hy
             it = np.dtype(dt).itemsize
@@ -1189,6 +1211,8 @@ def _sig_video_probe(st, name, now):
             _gh.append(gam_pct)
             del _gh[:-SIGNAL_GAMUT_AVG]
             gam_pct = sum(_gh) / len(_gh)
+        except _SkipGamut:
+            gam_pct = None
         except Exception:
             gam_pct = None
         thr = SIGNAL_BLACK_Y or ((16 + 6) << (bd - 8))    # noir nominal 16 (8 bits) + marge
@@ -1357,16 +1381,26 @@ def _signal_loop():
                         _signal_rx.pop(idx, None)
                     continue
                 st = _sig_state.setdefault(key, {})
+                st["slot_idx"] = idx
+                # Sondes armées sur CE slot (poussées par l'orchestrateur, cf. POST /probes).
+                # Absent = tout calculer : le défaut ne doit jamais éteindre une surveillance.
+                with _sig_lock:
+                    pr = _sig_probes.get(idx)
+                v_on = True if pr is None else bool(pr.get("video", True) or pr.get("gamut", True))
+                a_on = True if pr is None else bool(pr.get("audio", True))
                 # Vidéo : un tick sur n_video. Le résultat précédent est CONSERVÉ entre deux
                 # calculs (il décrit un état, pas un événement) — sinon les drapeaux image
                 # clignoteraient au rythme de la cadence audio.
-                vres = _sig_video_probe(st, "{}_{}".format(HOSTNAME, idx), now) if faire_video \
-                    else st.get("vres_last")
-                if faire_video and vres is not None:
+                vres = _sig_video_probe(st, "{}_{}".format(HOSTNAME, idx), now) \
+                    if (faire_video and v_on) else st.get("vres_last")
+                if faire_video and v_on and vres is not None:
                     st["vres_last"] = vres
                 sres = None
-                if idx < N_AUDIO and _audio_live[idx]:
+                if a_on and idx < N_AUDIO and _audio_live[idx]:
                     sres = _sig_audio_probe(st, "{}_audio_{}".format(HOSTNAME, idx), now)
+                elif not a_on:
+                    st.pop("acur", None)          # sonde désarmée → le curseur repart proprement
+                    st.pop("sres_last", None)
                 if sres is not None:
                     st["sres_last"] = sres
                 else:
@@ -1889,6 +1923,30 @@ class ControlHandler(BaseHTTPRequestHandler):
                 if "pattern" in body:
                     _ctl[idx]["pattern"] = str(body["pattern"])
             return self._json(200, {"ok": True})
+        if path == "/probes":       # QUELLES sondes de présence signal calculer sur ce slot
+            # Gating du COÛT, pas seulement de l'alerte. L'orchestrateur sait quels drapeaux
+            # l'exploitant a armés par source ; sans le lui dire, le moteur calcule tout pour tout
+            # le monde — 0,03 % d'un cœur par source pour le gamut, 0,09 % par flux pour l'audio.
+            # Décocher doit vouloir dire « ne le calcule même pas ».
+            # ⚠ DÉFAUT = TOUT CALCULER. Un moteur qui n'a jamais reçu de configuration, ou qui
+            # redémarre avant que l'orchestrateur ne repousse la sienne, doit surveiller comme
+            # avant — une surveillance qui s'éteint toute seule au premier redémarrage serait
+            # exactement l'échec silencieux qu'on corrige partout ailleurs.
+            try:
+                i = int(body.get("slot", body.get("idx", -1)))
+            except Exception:
+                i = -1
+            if not (0 <= i < N_VIDEO):
+                return self._json(400, {"error": "slot hors bornes"})
+            m = body.get("probes")
+            with _sig_lock:
+                if m is None:
+                    _sig_probes.pop(i, None)          # retour au défaut : tout est calculé
+                else:
+                    _sig_probes[i] = {k: bool(v) for k, v in dict(m).items()
+                                      if k in ("video", "gamut", "audio")}
+            return self._json(200, {"ok": True, "slot": i, "probes": _sig_probes.get(i)})
+
         if path == "/ident":        # bascule/taille de l'incrustation (à chaud, sans respawn)
             with _ctl_lock:
                 if "enabled" in body:
