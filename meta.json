@@ -1,7 +1,17 @@
 {
-  "version": "0.69.3",
+  "version": "0.71.0",
   "date": "2026-07-28",
   "changes": {
+    "Témoin de vie : une sortie en repli PROUVE qu'elle émet (0.71.0)": [
+      "Une sortie dont la source meurt se figeait sur la dernière image — indiscernable, sur un moniteur, d'une chaîne d'émission plantée. Au-delà de 2 s sans grain frais, elle sert désormais une PAIRE de trames de repli pré-packées, identiques à un carré témoin près, alternées toutes les 500 ms : le témoin se DÉPLACE, et ce mouvement prouve que le moteur émet toujours sur la grille d'époque.",
+      "Coût à l'exécution : une bascule d'index. Aucune écriture pendant l'émission (modifier un framebuffer en vol provoquerait du déchirement), aucun rendu, aucune copie. L'anneau passe à 6 slots — 3 pour le worker, 1 pour le gel, 2 pour la paire — et le témoin est dessiné par le MOTEUR en C : il bat même contrôleur injoignable, comme le noir de repli.",
+      "Le gel reste le comportement des 2 premières secondes : un hoquet de 300 ms ne doit rien changer à l'antenne, une source morte doit se voir. Les deux seuils sont des constantes nommées, à remonter dans les Réglages avec le mode de repli (noir / mire / ardoise)."
+    ],
+    "Une sortie 2110 ne s arrête jamais : trame courante amorcée et préservée (0.70.0)": [
+      "La trame de tenue introduite en 0.69.0 n'existait qu'APRÈS la première trame émise, et le watchdog d'anneau l'invalidait. Une sortie dont le producteur disparaissait redevenait donc MUETTE — mesuré en prod : port à 0,01 Gb/s au lieu de 2,19, et anneau qui resynchronisait toutes les 2 s.",
+      "La trame courante est désormais amorcée À LA CRÉATION de la session avec un NOIR LÉGAL (Y=64, Cb=Cr=512 en 10 bits plage narrow) généré par le moteur lui-même, sans dépendre du contrôleur ni d'aucun fichier : une sortie émet quelque chose de valide dès sa première époque, même si aucun producteur n'a jamais existé. Le resync du watchdog la préserve au lieu de la détruire.",
+      "Observabilité par ÉTAT et non par comptage : `source_live` (la source a livré un grain frais dans les 3 dernières périodes) et `holding` (la sortie tient sur sa trame courante) sont publiés sur :8080. libmtl ne signalant pas de façon fiable une trame re-servie, compter les rejeux est impossible — un état, lui, s'observe."
+    ],
     "Horloge de sortie : le fil ne dépend plus du producteur (0.69.0)": [
       "Une sortie 2110 est un appareil à HORLOGE : elle doit présenter une trame à chaque époque de la grille PTP, quoi que fasse sa source. Ce n'était pas le cas en mode tranche — quand le worker n'avait rien de prêt, `tx_sl_next_frame` rendait -EBUSY, l'époque était perdue, et le worker rattrapait ensuite en paquetant la trame entière d'un bloc : un grand trou suivi d'une rafale.",
       "Mesuré contre un EVS Neuron, qui refuse au-delà d'un PIT max de 1500 : une sortie alimentée par un producteur déficitaire montait à 7077-12708 et était REFUSÉE, là où une sortie sans producteur tenait 818 et était acceptée. Un problème de source devenait un problème de signal — le récepteur décrochait tout.",

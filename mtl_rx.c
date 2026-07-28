@@ -61,6 +61,14 @@
 #define MAX_SESS  128
 #define MAX_TG    16   /* cibles (shm de sortie) par session : fan-out même-source → N slots */
 
+/* TÉMOIN DE REPLI (bobi.studio) : au-delà de ce délai sans grain SOURCE frais, une sortie câblée
+ * bascule de la trame de TENUE (gel) vers la PAIRE de repli, alternée pour prouver visuellement que
+ * la chaîne d'émission vit encore (cf. tx_sl_next_frame). Réglage à remonter dans les Réglages. */
+#define SL_FALLBACK_AFTER_NS   (2ull * 1000000000ull)   /* 2 s sans grain frais ⇒ repli clignotant */
+/* Demi-période d'alternance des 2 tampons de repli (cycle complet ≈ 2×). Réglage à remonter dans
+ * les Réglages. */
+#define SL_FALLBACK_TOGGLE_NS  (500ull * 1000000ull)     /* ~500 ms par tampon */
+
 /* ── ANC / ST 2110-40 (data) ── le grain MXL porte une charge utile ANC.
  *
  * FORMAT NORMATIF (depuis 2026-07-12) : **RFC 8331** → interopérable. Le format MAISON
@@ -448,6 +456,11 @@ struct target {
   uint64_t tx_src_idx;     /* TX vidéo : dernier index de grain SOURCE lu (détection flux figé) */
   uint64_t tx_src_idx_ns;  /* TX vidéo : instant (monotone) où tx_src_idx a changé pour la dernière fois */
   int      tx_src_idx_init; /* TX vidéo : tx_src_idx amorcé ? (0 au (ré)ouverture du reader) */
+  /* bobi.studio: OBSERVABILITÉ tenue/source (write_stats) — instant (monotone) du dernier grain
+   * SOURCE FRAIS réellement lu (posé par tx_reopen_if_stale, qui détecte déjà cet évènement pour la
+   * reconnexion sur flux figé — même fait, deux consommateurs). Ne PAS recompter les rejeux de la
+   * trame de tenue : libmtl ne les signale pas de façon fiable (cf. tx_sl_next_frame). */
+  uint64_t last_fresh_ns;
   /* TX vidéo (bobi.studio) : compteur CUMULÉ de trames RÉPÉTÉES (gel d'image tranche, ou grain
    * source identique à la trame précédente en mode trame-entière). Trames UNIQUES = recv - repeats.
    * EXCLUT le mode statique (nominal, pas une dégradation) et la trame noire de repli (absence de
@@ -627,6 +640,18 @@ struct sess {
   uint64_t sl_hold_emitted;    /* trames émises PAR REJEU de la trame de tenue (cumul) */
   uint64_t sl_hold_last_ns;    /* dernier rejeu COMPTÉ (anti-double-compte, cf. tx_sl_next_frame) */
   uint64_t sl_period_ns;       /* période nominale d'époque (1/fps) — borne du comptage de rejeu */
+  /* ── TÉMOIN DE REPLI (bobi.studio) ──────────────────────────────────────────────────────────────
+   * Au-delà de SL_FALLBACK_AFTER_NS sans grain SOURCE frais (cf. t->last_fresh_ns), la tenue « gel »
+   * ne suffit plus à prouver que la chaîne vit : on bascule sur DEUX framebuffers amorcés au setup
+   * (noir légal + petit carré témoin, position différente dans chacun) et on les alterne toutes les
+   * SL_FALLBACK_TOGGLE_NS — le déplacement du carré est ce qui distingue un « gel » d'un « plantage ».
+   * Réservés en PERMANENCE comme la tenue : jamais visés par le worker, jamais libérés par
+   * tx_sl_frame_done. Un slot SANS câble (mode statique) n'a pas de source à perdre → ne bascule
+   * jamais ici (cf. tx_sl_next_frame). */
+  uint16_t sl_fallback_idx[2]; /* les 2 derniers slots de l'anneau (amorcés ssi sl_fallback_valid) */
+  int      sl_fallback_valid;
+  uint64_t sl_fallback_switch_ns; /* mono_ns du dernier basculement A/B (0 = pas encore basculé) */
+  int      sl_fallback_cur;    /* tampon actuellement servi : 0 (A) ou 1 (B) */
   uint64_t sl_wedge_ns;        /* TX : début (mono) du blocage « aucun slot libre » (watchdog anneau) */
   uint64_t sl_wedge_log_ns;    /* TX : throttle du log wedge — instant du dernier log émis (0 = session
                                 * saine, le prochain wedge logue en entier). Reset par tx_sl_frame_done. */
@@ -1479,6 +1504,7 @@ static int open_reader(struct target* t) {
 static void tx_reopen_if_stale(struct target* t, uint64_t idx, uint64_t tnow) {
   if (!t->tx_src_idx_init || idx != t->tx_src_idx) {
     t->tx_src_idx = idx; t->tx_src_idx_ns = tnow; t->tx_src_idx_init = 1;
+    t->last_fresh_ns = tnow;   /* grain SOURCE neuf (cf. champ, pour "source_live" dans write_stats) */
     return;
   }
   if (tnow - t->tx_src_idx_ns > TX_REOPEN_STALE_NS) {
@@ -1713,10 +1739,34 @@ static int tx_sl_next_frame(void* priv, uint16_t* next_frame_idx, struct st20_tx
   struct sess* s = priv; (void)meta;
   uint16_t c = s->sl_fb_cons;
   if (s->sl_fb[c].stat != 1) {
-    /* Rien de frais : on RE-SERT la dernière trame intégralement émise. Elle n'est plus en vol
-     * (notify_frame_done reçu) et le worker ne peut pas l'avoir reprise (stat=TENUE l'en exclut) →
-     * aucune écriture concurrente, aucune copie. L'époque est tenue, le pacing reste régulier.
-     * Pas encore de trame de tenue (démarrage) → -EBUSY comme avant : il n'y a rien à émettre. */
+    /* Rien de frais : bascule GEL → REPLI (TÉMOIN DE REPLI, bobi.studio). Un slot câblé
+     * (t->shm_path non vide) dont la source est perdue depuis LONGTEMPS ne doit plus se figer sur la
+     * dernière image (indiscernable d'une chaîne plantée) : on sert la PAIRE de repli en alternance,
+     * pour un témoin qui BOUGE. Un slot SANS câble (mode statique, !t->shm_path[0]) n'a AUCUNE source
+     * à perdre — il garde le comportement historique (gel = trame statique déjà correcte) et
+     * n'entre jamais dans cette branche. Idem si aucune trame réelle n'a JAMAIS été émise : le champ
+     * `last_fresh_ns` du target vaut alors 0 (struct statique, zéro-initialisée), donc l'écart au
+     * temps courant dépasse largement SL_FALLBACK_AFTER_NS → le repli bat naturellement, comme voulu
+     * (aucune trame produite ⇒ rien à « figer » de toute façon, le noir amorcé n'est qu'un des deux
+     * tampons de repli). */
+    struct target* t = &s->tg[0];
+    int cabled = t->shm_path[0] != 0;
+    uint64_t now = mono_ns();
+    if (cabled && s->sl_fallback_valid && now - t->last_fresh_ns >= SL_FALLBACK_AFTER_NS) {
+      if (!s->sl_fallback_switch_ns || now - s->sl_fallback_switch_ns >= SL_FALLBACK_TOGGLE_NS) {
+        s->sl_fallback_switch_ns = now;
+        s->sl_fallback_cur ^= 1;                 /* alterne A/B : le déplacement prouve la vie */
+      }
+      *next_frame_idx = s->sl_fallback_idx[s->sl_fallback_cur];
+      return 0;   /* réservé à vie (cf. tx_sl_frame_done) : pas de comptage rejeu, cf. sl_hold_emitted */
+    }
+    /* Sinon : on RE-SERT la dernière trame intégralement émise (gel, comportement historique — un
+     * hoquet de moins de SL_FALLBACK_AFTER_NS ne doit rien changer à l'antenne). Elle n'est plus en
+     * vol (notify_frame_done reçu) et le worker ne peut pas l'avoir reprise (stat=TENUE l'en exclut)
+     * → aucune écriture concurrente, aucune copie. L'époque est tenue, le pacing reste régulier.
+     * sl_hold_valid est désormais amorcé DÈS setup_video_slice_tx (noir légal) et PRÉSERVÉ par le
+     * resync watchdog (cf. « anneau fb WEDGÉ ») : ce -EBUSY ne doit plus se produire en pratique.
+     * Gardé comme filet défensif (perdre une époque vaut mieux que déréférencer un slot invalide). */
     if (!s->sl_hold_valid) return -EBUSY;
     *next_frame_idx = s->sl_hold_idx;
     /* COMPTAGE DU REJEU — ni ici sans garde, ni dans notify_frame_done : mesuré, la lib SOLLICITE ce
@@ -1725,8 +1775,7 @@ static int tx_sl_next_frame(void* priv, uint16_t* next_frame_idx, struct st20_tx
      * alors à 38 pour un fil à 50). Les deux points de comptage sont donc faux en sens opposés.
      * Ce qui est VRAI, c'est qu'une trame de tenue ne peut partir qu'UNE FOIS PAR ÉPOQUE : on borne
      * le comptage à une période nominale. La valeur est alors exacte à la période près, et jamais
-     * au-dessus du nominal. */
-    uint64_t now = mono_ns();
+     * au-dessus du nominal (`now` déjà calculé plus haut pour la décision gel/repli). */
     if (s->sl_period_ns && now - s->sl_hold_last_ns >= (s->sl_period_ns * 3) / 4) {
       s->sl_hold_last_ns = now;
       s->sl_hold_emitted++;
@@ -1740,9 +1789,10 @@ static int tx_sl_next_frame(void* priv, uint16_t* next_frame_idx, struct st20_tx
 
 /* lcore tasklet : trame émise → la trame qui vient de partir devient la TRAME DE TENUE (elle sera
  * re-servie si la suivante n'est pas prête), et la tenue PRÉCÉDENTE est rendue au worker. Une seule
- * trame est ainsi immobilisée en permanence — d'où l'anneau porté à 4 slots, pour que le worker en
- * garde 3 comme avant. Un re-service de la tenue rappelle ce callback avec le MÊME index : on ne
- * touche alors à rien (elle reste tenue, ses lines_ready restent complètes). */
+ * trame est ainsi immobilisée en permanence pour le gel, + 2 de plus pour la PAIRE DE REPLI (cf.
+ * TÉMOIN DE REPLI) — d'où l'anneau porté à 6 slots, pour que le worker en garde 3 comme avant. Un
+ * re-service de la tenue rappelle ce callback avec le MÊME index : on ne touche alors à rien (elle
+ * reste tenue, ses lines_ready restent complètes). */
 static int tx_sl_frame_done(void* priv, uint16_t frame_idx, struct st20_tx_frame_meta* meta) {
   struct sess* s = priv; (void)meta;
   if (s->sl_hold_valid && frame_idx == s->sl_hold_idx) {
@@ -1751,6 +1801,17 @@ static int tx_sl_frame_done(void* priv, uint16_t frame_idx, struct st20_tx_frame
     pthread_cond_signal(&s->sl_cv);
     pthread_mutex_unlock(&s->sl_mx);
     return 0;                                   /* rejeu de la tenue : rien à libérer */
+  }
+  if (s->sl_fallback_valid &&
+      (frame_idx == s->sl_fallback_idx[0] || frame_idx == s->sl_fallback_idx[1])) {
+    /* rejeu d'un tampon de REPLI : réservé à vie (cf. tx_sl_next_frame) — rien à libérer, et
+     * surtout NE PAS le promouvoir en trame de tenue (branche ci-dessous) : ce serait invalider à
+     * tort la vraie tenue au profit d'un slot qui ne contient jamais un grain source réel. */
+    s->sl_wedge_log_ns = 0; s->sl_wedge_log_n = 0;
+    pthread_mutex_lock(&s->sl_mx);
+    pthread_cond_signal(&s->sl_cv);
+    pthread_mutex_unlock(&s->sl_mx);
+    return 0;
   }
   if (s->sl_hold_valid) {                       /* l'ancienne tenue redevient disponible */
     s->sl_fb[s->sl_hold_idx].lines_ready = 0;
@@ -1802,6 +1863,38 @@ static void sl_pack_band(struct sess* s, const uint8_t* pay, int src8,
   st20_yuv422p10le_to_rfc4175_422be10(ys, bs, rs, dst, (uint32_t)W, nl);
 }
 
+/* Construit dans `fb` (framebuffer packé RFC4175 BE10) un fond NOIR LÉGAL + un petit carré témoin
+ * gris clair, centré horizontalement sur `cx` (pixels), vers le bas de l'image — cf. TÉMOIN DE
+ * REPLI. VOIE CHOISIE : on construit une bande planar 16 bits temporaire (Y|Cb|Cr, EXACTEMENT le
+ * format déjà attendu par sl_pack_band côté src8=0, cf. l'amorçage de la trame de tenue) puis on la
+ * packe UNE fois avec le pack SIMD existant — plutôt que de tracer le carré directement dans le
+ * packé RFC4175 (un pgroup porte 2 pixels sur 5 octets à cheval Y/Cb/Cr : y écrire un rectangle
+ * exigerait de réimplémenter un déballage/remballage pgroup rien que pour ce cas, pour un gain nul
+ * puisque ce code ne tourne QU'AU SETUP, jamais sur le tasklet lcore). Aucune duplication du pack :
+ * même fonction que le noir de tenue. */
+#define SL_WITNESS_SQ 48   /* côté du carré témoin, en pixels (~48×48) */
+static void sl_fill_fallback_frame(struct sess* s, uint8_t* fb, int cx) {
+  int W = s->width, H = s->height;
+  size_t npix = (size_t)W * H;
+  uint16_t* buf = malloc((size_t)2 * npix * sizeof(uint16_t));   /* Y (npix) + Cb+Cr (npix) */
+  if (!buf) return;
+  uint16_t* y = buf;
+  uint16_t* cbcr = buf + npix;
+  for (size_t k = 0; k < npix; k++) y[k] = 64;     /* noir légal (comme l'amorçage de la tenue) */
+  for (size_t k = 0; k < npix; k++) cbcr[k] = 512;  /* Cb=Cr=512 : achromatique, le carré n'y touche pas */
+  int sq = SL_WITNESS_SQ;
+  int cy = H - H / 8;                               /* ~1/8 de hauteur au-dessus du bas de l'image */
+  int x0 = cx - sq / 2, y0 = cy - sq / 2;
+  if (x0 < 0) x0 = 0; if (y0 < 0) y0 = 0;
+  int x1 = x0 + sq; if (x1 > W) x1 = W;
+  int y1 = y0 + sq; if (y1 > H) y1 = H;
+  for (int yy = y0; yy < y1; yy++)
+    for (int xx = x0; xx < x1; xx++)
+      y[(size_t)yy * W + xx] = 700;                  /* gris clair légal (Y) */
+  sl_pack_band(s, (uint8_t*)buf, 0, 0, (uint32_t)H, fb);
+  free(buf);
+}
+
 /* Worker TX tranche : vise toujours le grain de TÊTE du flux source (celui en cours d'écriture),
  * le suit tranche par tranche et remplit le framebuffer au fil de l'eau. */
 static void* video_tx_slice_thread(void* arg) {
@@ -1832,10 +1925,19 @@ static void* video_tx_slice_thread(void* arg) {
     if (statique && t->reader) {                /* on vient de perdre le câble → lâcher le reader */
       mxlReleaseFlowReader(g_mxl, t->reader); t->reader = NULL; fi_init = 0;
     }
-    /* HORLOGE DE SORTIE : la TRAME DE TENUE est immobilisée pour le rejeu — on ne la remplit jamais,
-     * et surtout on ne l'ATTEND pas (l'attendre déclencherait le watchdog anneau au bout de 2 s alors
-     * que le slot est retenu volontairement). L'anneau fait 4 slots : il en reste 3 au worker. */
-    if (s->sl_fb[s->sl_fb_prod].stat == 2)
+    /* HORLOGE DE SORTIE : la TRAME DE TENUE et la PAIRE DE REPLI sont immobilisées pour le rejeu —
+     * on ne les remplit jamais, et surtout on ne les ATTEND pas (les attendre déclencherait le
+     * watchdog anneau au bout de 2 s alors que ces slots sont retenus volontairement). L'anneau fait
+     * 6 slots (3 réservés, cf. stat=2) : il en reste 3 au worker. BOUCLE (pas un simple if) : les 3
+     * slots réservés sont CONSÉCUTIFS en fin d'anneau — un unique pas par itération de la boucle
+     * externe laisserait sl_fb_prod s'arrêter sur un 2ᵉ ou 3ᵉ slot réservé et tomber dans l'attente
+     * de slot libre ci-dessous (fausse contre-pression, à chaque tour de l'anneau). */
+    /* BORNÉE : 3 slots au plus portent stat=2 (1 tenue + 2 repli), donc la boucle sort toujours.
+     * Mais ce chemin a un historique de blocages définitifs — si un jour un défaut marquait TOUS les
+     * slots réservés, une boucle non bornée ferait tourner ce thread à 100 % de CPU en silence, sans
+     * watchdog pour le voir. Un tour d'anneau au plus : on préfère une contre-pression visible à un
+     * thread qui part en vrille muet. */
+    for (uint16_t _k = 0; _k < s->sl_fb_cnt && s->sl_fb[s->sl_fb_prod].stat == 2; _k++)
       s->sl_fb_prod = (uint16_t)((s->sl_fb_prod + 1) % s->sl_fb_cnt);
     /* attendre un framebuffer libre (la lib libère via notify_frame_done) */
     uint16_t idx = s->sl_fb_prod;
@@ -1889,13 +1991,19 @@ static void* video_tx_slice_thread(void* arg) {
           s->sl_wedge_log_ns = lnow; s->sl_wedge_log_n = 0;
         }
         for (uint16_t k = 0; k < s->sl_fb_cnt; k++) {
+          if (s->sl_hold_valid && k == s->sl_hold_idx) continue;   /* cf. note ci-dessous : PRÉSERVÉ */
+          if (s->sl_fallback_valid && (k == s->sl_fallback_idx[0] || k == s->sl_fallback_idx[1]))
+            continue;                                              /* idem : PAIRE DE REPLI préservée */
           s->sl_fb[k].lines_ready = 0;
           s->sl_fb[k].stat = 0;
         }
-        /* Le resync REND TOUS les slots au worker : la trame de tenue n'en est plus une (elle
-         * pourrait être réécrite sous les pieds de la lib). Elle se reconstituera au prochain
-         * notify_frame_done. */
-        s->sl_hold_valid = 0;
+        /* Le resync REND tous les AUTRES slots au worker, mais PRÉSERVE la trame de TENUE et la PAIRE
+         * DE REPLI (stat=2, lines_ready intacts) — les invalider ici rendrait la sortie MUETTE
+         * précisément quand ce watchdog constate que plus rien n'avance côté producteur, soit le
+         * pire moment. Sans danger de réécriture concurrente : le worker ne produit JAMAIS dans ces
+         * slots (la garde en tête de boucle les saute, cf. `sl_fb_prod`), et le hold_idx courant
+         * n'est jamais celui qui vient de se coincer (même garde). Elle se remplace normalement à la
+         * prochaine trame réellement émise (tx_sl_frame_done). */
         s->sl_fb_cons = s->sl_fb_prod;
         s->sl_wedge_ns = mono_ns();          /* ré-arme (resync fait) */
       }
@@ -2045,10 +2153,12 @@ static int setup_video_slice_tx(struct sess* s) {
   s->slotsize = (size_t)(s->bit_depth == 8 ? 2 : 4) * (size_t)s->width * (size_t)s->height;
   s->shm_slotsize = s->slotsize;
   pthread_mutex_init(&s->sl_mx, NULL); pthread_cond_init(&s->sl_cv, NULL);
-  /* 4 framebuffers, pas 3 : un slot reste immobilisé en permanence comme TRAME DE TENUE (horloge de
-   * sortie, cf. tx_sl_next_frame) → le worker en garde 3, exactement comme avant le correctif. */
-  s->sl_fb_cnt = 4; s->sl_fb_prod = 0; s->sl_fb_cons = 0;
+  /* 6 framebuffers, pas 4 : 3 restent immobilisés en permanence — la TRAME DE TENUE (horloge de
+   * sortie, cf. tx_sl_next_frame) ET la PAIRE de repli (témoin qui bouge, cf. TÉMOIN DE REPLI) —
+   * le worker en garde 3, exactement comme avant le correctif. */
+  s->sl_fb_cnt = 6; s->sl_fb_prod = 0; s->sl_fb_cons = 0;
   s->sl_hold_valid = 0; s->sl_hold_emitted = 0; s->sl_hold_last_ns = 0;
+  s->sl_fallback_valid = 0; s->sl_fallback_switch_ns = 0; s->sl_fallback_cur = 0;
   s->sl_period_ns = s->fps > 0 ? (uint64_t)(1e9 / s->fps) : 0;
 
   struct st20_tx_ops ops; memset(&ops, 0, sizeof(ops));
@@ -2094,6 +2204,59 @@ static int setup_video_slice_tx(struct sess* s) {
   if (s->epoch_shift_us > 0)
     fprintf(stderr, "mtl_rx[video TX SLICE] epoch-shift +%d µs (émission décalée, stamp RTP sur l'epoch nominal)\n",
             s->epoch_shift_us);
+  /* AMORÇAGE DE LA TRAME DE TENUE (bobi.studio) : la réserver ICI, à la création — pas d'attendre
+   * la 1ère trame émise par le worker (cf. tx_sl_frame_done) — sinon rien à re-servir si le
+   * producteur n'apparaît JAMAIS, ou meurt avant d'avoir livré une trame complète. On réserve le
+   * DERNIER slot de l'anneau (jamais visé par sl_fb_prod, cf. la garde en tête de
+   * video_tx_slice_thread) et on le remplit avec un NOIR LÉGAL 10 bits narrow (Y=64, Cb=Cr=512).
+   * ⚠ Le framebuffer est RFC4175 4:2:2 10 bits BE (st20_rfc4175_422_10_pg2_be), PAS planar : un
+   * memset(0) donnerait une image verte illégale. On construit donc une bande planar 16 bits
+   * (Y puis Cb puis Cr, comme l'attend sl_pack_band côté src8=0 — cf. sa lecture de `pay`) dans un
+   * tampon temporaire, packée UNE fois via le pack SIMD existant, puis libérée : setup, pas le
+   * chemin critique (tasklet lcore). */
+  {
+    uint16_t hidx = (uint16_t)(s->sl_fb_cnt - 1);
+    uint8_t* hfb = st20_tx_get_framebuffer(s->sl_tx, hidx);
+    size_t nsamp = (size_t)2 * s->width * s->height;    /* Y (W·H) + Cb (W/2·H) + Cr (W/2·H) */
+    uint16_t* black = hfb ? malloc(nsamp * sizeof(uint16_t)) : NULL;
+    if (black) {
+      size_t npix = (size_t)s->width * s->height;
+      uint16_t* y = black;
+      uint16_t* cbcr = black + npix;                    /* Cb (npix/2) puis Cr (npix/2), même valeur */
+      for (size_t k = 0; k < npix; k++) y[k] = 64;
+      for (size_t k = 0; k < npix; k++) cbcr[k] = 512;
+      sl_pack_band(s, (uint8_t*)black, 0, 0, (uint32_t)s->height, hfb);
+      free(black);
+      s->sl_fb[hidx].lines_ready = (uint32_t)s->height;
+      s->sl_fb[hidx].stat = 2;             /* TENUE dès la création : re-servie tant qu'aucune trame
+                                             * réelle n'a encore été émise (cf. tx_sl_next_frame) */
+      s->sl_hold_idx = hidx; s->sl_hold_valid = 1;
+    } else {
+      fprintf(stderr, "mtl_rx[video TX SLICE] %s:%d amorçage trame noire échoué (alloc/fb) — "
+              "sortie MUETTE jusqu'à la 1ère trame réelle\n", s->mcast, s->udp_port);
+    }
+  }
+  /* AMORÇAGE DE LA PAIRE DE REPLI (bobi.studio, TÉMOIN DE REPLI) : les 2 slots juste avant la tenue
+   * (cnt-2, cnt-3) — même noir légal que ci-dessus + un petit carré témoin gris clair, à une
+   * position DIFFÉRENTE dans chaque tampon (l'alternance doit se lire comme un DÉPLACEMENT, cf.
+   * tx_sl_next_frame). Setup seulement, jamais sur le tasklet lcore. */
+  {
+    int cxA = s->width / 2 - 100, cxB = s->width / 2 + 100;   /* ~200 px d'écart, symétrique au centre */
+    uint16_t idxA = (uint16_t)(s->sl_fb_cnt - 2), idxB = (uint16_t)(s->sl_fb_cnt - 3);
+    uint8_t* fbA = st20_tx_get_framebuffer(s->sl_tx, idxA);
+    uint8_t* fbB = st20_tx_get_framebuffer(s->sl_tx, idxB);
+    if (fbA && fbB) {
+      sl_fill_fallback_frame(s, fbA, cxA);
+      sl_fill_fallback_frame(s, fbB, cxB);
+      s->sl_fb[idxA].lines_ready = (uint32_t)s->height; s->sl_fb[idxA].stat = 2;
+      s->sl_fb[idxB].lines_ready = (uint32_t)s->height; s->sl_fb[idxB].stat = 2;
+      s->sl_fallback_idx[0] = idxA; s->sl_fallback_idx[1] = idxB;
+      s->sl_fallback_valid = 1;
+    } else {
+      fprintf(stderr, "mtl_rx[video TX SLICE] %s:%d amorçage paire de repli échoué (alloc/fb) — "
+              "pas de témoin de repli, la tenue seule reste servie\n", s->mcast, s->udp_port);
+    }
+  }
   if (pthread_create(&s->thread, NULL, video_tx_slice_thread, s) != 0) {
     st20_tx_free(s->sl_tx); s->sl_tx = NULL;
     pthread_mutex_destroy(&s->sl_mx); pthread_cond_destroy(&s->sl_cv);
@@ -2808,17 +2971,39 @@ static void write_stats(struct sess* reg, uint64_t last[][MAX_TG], uint64_t last
       if (is_video_tx)
         snprintf(repbuf, sizeof(repbuf), ", \"fps_source\": %.1f, \"repeats\": %llu",
                  fps_source, (unsigned long long)reps);
+      /* bobi.studio: ÉTAT tenue/source (PAS un comptage — cf. tx_sl_next_frame, libmtl ne signale
+       * fiablement ni le rejeu ni son absence). UNIQUEMENT les cibles TX vidéo EN MODE TRANCHE
+       * (s->slice_on) : c'est la seule où la trame de tenue existe (setup_video_slice_tx / le
+       * resync watchdog la préserve désormais). Un slot SANS câble (mode statique, cf. `statique`
+       * dans video_tx_slice_thread) n'est PAS « holding » : il n'a jamais eu de producteur à perdre,
+       * c'est son fonctionnement nominal — traité à part, jamais via last_fresh_ns (qui ne concerne
+       * que le chemin avec reader). */
+      char livebuf[64]; livebuf[0] = '\0';
+      if (is_video_tx && s->slice_on) {
+        int statique = (!t->shm_path[0] && t->static_frame[0]);
+        int source_live, holding;
+        if (statique) {
+          source_live = 1; holding = 0;
+        } else {
+          uint64_t now_ns = mono_ns();
+          source_live = s->sl_period_ns > 0 &&
+                        (now_ns - t->last_fresh_ns) < 3 * s->sl_period_ns;
+          holding = !source_live;
+        }
+        snprintf(livebuf, sizeof(livebuf), ", \"source_live\": %s, \"holding\": %s",
+                 source_live ? "true" : "false", holding ? "true" : "false");
+      }
       FILE* sf = fopen(t->stats_path, "w");
       if (sf) {
         char latbuf[32];
         if (rx_lat >= 0.0) snprintf(latbuf, sizeof(latbuf), "%.1f", rx_lat);
         else               snprintf(latbuf, sizeof(latbuf), "null");
         if (s->kind == K_DATA && t->tc_valid)
-          fprintf(sf, "{\"fps\": %.1f, \"frame_index\": %llu, \"timecode\": \"%s\", \"df\": %s, \"rx_latency_ms\": %s%s%s}\n",
-                  rate, (unsigned long long)t->index, t->tc, t->tc_df ? "true" : "false", latbuf, tpbuf, repbuf);
+          fprintf(sf, "{\"fps\": %.1f, \"frame_index\": %llu, \"timecode\": \"%s\", \"df\": %s, \"rx_latency_ms\": %s%s%s%s}\n",
+                  rate, (unsigned long long)t->index, t->tc, t->tc_df ? "true" : "false", latbuf, tpbuf, repbuf, livebuf);
         else
-          fprintf(sf, "{\"fps\": %.1f, \"frame_index\": %llu, \"late\": %llu, \"rx_latency_ms\": %s%s%s}\n",
-                  rate, (unsigned long long)t->index, (unsigned long long)t->late, latbuf, tpbuf, repbuf);
+          fprintf(sf, "{\"fps\": %.1f, \"frame_index\": %llu, \"late\": %llu, \"rx_latency_ms\": %s%s%s%s}\n",
+                  rate, (unsigned long long)t->index, (unsigned long long)t->late, latbuf, tpbuf, repbuf, livebuf);
         fclose(sf);
       }
     }
