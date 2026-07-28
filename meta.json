@@ -1,11 +1,12 @@
 {
-  "version": "0.74.0",
+  "version": "0.74.1",
   "date": "2026-07-28",
   "changes": {
     "Le watchdog RX n'abat plus les sorties TX de la même carte (0.74.0)": [
       "MESURÉ le 2026-07-28 : six entrées privées de signal faisaient recréer leurs sessions RX en boucle, et CHAQUE recréation tuait la sortie TX du même port — muette ensuite pour toujours. Recréer une session déclenche un rte_tm_hierarchy_commit qui arrête et redémarre le port entier ; une session TX vivante peut y perdre ses mbufs définitivement. Le backoff plafonnant à 300 s, une source absente déclenchait donc une exécution toutes les 5 minutes, indéfiniment.",
       "Le watchdog distingue désormais deux situations que rien ne séparait : un flux qui RECEVAIT puis s'est figé (join IGMP sur la mauvaise carte — sa raison d'être, comportement inchangé), et un flux qui n'a JAMAIS rien reçu. Dans le second cas il tente MTL_RX_WATCHDOG_COLD_MAX fois (2 par défaut, de quoi couvrir un mauvais join au démarrage) puis ABANDONNE.",
-      "L'abandon est ANNONCÉ une fois, avec sa cause probable en amont (émetteur absent, mauvais groupe, route manquante) — renoncer en silence aurait remplacé une panne bruyante par une panne invisible. Le groupe se réarme entièrement dès qu'il reçoit pour de bon."
+      "L'abandon est ANNONCÉ une fois, avec sa cause probable en amont (émetteur absent, mauvais groupe, route manquante) — renoncer en silence aurait remplacé une panne bruyante par une panne invisible. Le groupe se réarme entièrement dès qu'il reçoit pour de bon.",
+      "0.74.1 — CORRECTIF : abandonner la recréation ne doit pas DÉMONTER la session. Le chemin d'abandon recopiait le retrait du groupe utilisé par le chemin de recréation, où il signifie « omettre ce tour pour recréer au suivant » ; ici il supprimait l'écoute définitivement (config 10 → 4, rx_sessions=0) — plus rien n'aurait reçu si une source était revenue."
     ],
     "Invariant : tout tour de boucle qui prend un framebuffer publie une trame (0.73.0)": [
       "Les deux renforcements précédents laissaient un TROU entre eux : une source qui livre ~1 image/seconde est trop lente pour la trame de tenue (le worker ne publie plus assez, donc libmtl cesse de solliciter le callback) et trop vivante pour le témoin de repli (seuil de 2 s de silence jamais atteint). Mesuré : port à 0,01 Gb/s au lieu de 2,19. Nos deux recettes portaient sur les extrêmes — 37 fps et 0 fps — jamais sur la bande intermédiaire.",

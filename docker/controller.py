@@ -3085,7 +3085,12 @@ def _manager_loop():
                                   "tuent les sorties TX de la même carte). Cause en amont : émetteur "
                                   "absent, mauvais groupe ou route manquante.".format(
                                       key[0], key[1], g["idxs"], st["n"]), flush=True)
-                        del groups[key]
+                        # ⚠ SURTOUT PAS de `del groups[key]` ici : dans le chemin de recréation il
+                        # signifie « omettre ce tour pour recréer au suivant », mais ici il
+                        # SUPPRIMERAIT la session — définitivement, puisqu'on repasse à chaque tour.
+                        # Vécu : les 6 entrées démontées (config 10 → 4, rx_sessions=0), plus rien
+                        # n'écoutait si une source revenait. Abandonner la RECRÉATION, ce n'est pas
+                        # démonter l'écoute : la session reste en place et recevra si ça arrive.
                         continue
                     worst = max(_wd_now - st["anchor"][i] for i in stalled)
                     st["until"] = _wd_now + _WD_BOUNCE_S
