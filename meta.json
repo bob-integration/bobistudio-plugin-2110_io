@@ -1,12 +1,24 @@
 {
-  "version": "0.71.1",
+  "version": "0.73.0",
   "date": "2026-07-28",
   "changes": {
+    "Invariant : tout tour de boucle qui prend un framebuffer publie une trame (0.73.0)": [
+      "Les deux renforcements précédents laissaient un TROU entre eux : une source qui livre ~1 image/seconde est trop lente pour la trame de tenue (le worker ne publie plus assez, donc libmtl cesse de solliciter le callback) et trop vivante pour le témoin de repli (seuil de 2 s de silence jamais atteint). Mesuré : port à 0,01 Gb/s au lieu de 2,19. Nos deux recettes portaient sur les extrêmes — 37 fps et 0 fps — jamais sur la bande intermédiaire.",
+      "Le worker respecte désormais un invariant unique : tout tour qui obtient un framebuffer libre PUBLIE exactement une trame. Cinq chemins sortaient sans rien publier (échec d'ouverture du lecteur, GetRuntimeInfo en échec, flux invalidé en cours de tranche, timeout sans grain de tête récupérable, trame statique absente) — chacun était un trou par lequel la sortie se taisait.",
+      "Contenu par ordre de préférence : grain frais, sinon répétition de la dernière image, sinon témoin. La répétition est quasi sans copie — les framebuffers libmtl persistent, une empreinte de contenu par slot évite toute recopie inutile, et on ne recopie jamais depuis un slot en cours d'émission (image déchirée). Au plus 3 copies par image fraîche."
+    ],
+    "Le témoin de repli est publié par le WORKER, pas par le callback (0.72.0)": [
+      "Diagnostic mesuré avec des compteurs par branche : dès que l'application cesse de publier des trames, libmtl ARRÊTE d'appeler get_next_frame et ne reprend jamais. Toute la paire de repli servie depuis le callback (0.71.x) était donc morte-née — correctement amorcée, jamais sollicitée, sortie muette et pas de reprise même au recâblage.",
+      "Le témoin est désormais publié par le worker, exactement comme le fait le mode statique — le seul chemin dont on a la preuve qu'il tient 50 fps sans faillir. La lib ne s'arrête plus, puisqu'on continue de l'alimenter. La paire réservée disparaît, l'anneau revient à 4 slots.",
+      "Le carré témoin alterne entre deux positions toutes les 500 ms : c'est le DÉPLACEMENT qui prouve que la chaîne d'émission vit, là où une image figée est indiscernable d'un plantage. Re-packing borné par une empreinte de génération dédiée : 6 packings par seconde au plus, jamais un par époque.",
+      "La reprise est le point critique : la réouverture du lecteur reste tentée à chaque tour pendant que le témoin est publié, et la garde `!t->reader` évite le blocage où `morte` resterait vrai à vie dès qu'un lecteur existe."
+    ],
     "Témoin de vie : une sortie en repli PROUVE qu'elle émet (0.71.0)": [
       "Une sortie dont la source meurt se figeait sur la dernière image — indiscernable, sur un moniteur, d'une chaîne d'émission plantée. Au-delà de 2 s sans grain frais, elle sert désormais une PAIRE de trames de repli pré-packées, identiques à un carré témoin près, alternées toutes les 500 ms : le témoin se DÉPLACE, et ce mouvement prouve que le moteur émet toujours sur la grille d'époque.",
       "Coût à l'exécution : une bascule d'index. Aucune écriture pendant l'émission (modifier un framebuffer en vol provoquerait du déchirement), aucun rendu, aucune copie. L'anneau passe à 6 slots — 3 pour le worker, 1 pour le gel, 2 pour la paire — et le témoin est dessiné par le MOTEUR en C : il bat même contrôleur injoignable, comme le noir de repli.",
       "Le gel reste le comportement des 2 premières secondes : un hoquet de 300 ms ne doit rien changer à l'antenne, une source morte doit se voir. Les deux seuils sont des constantes nommées, à remonter dans les Réglages avec le mode de repli (noir / mire / ardoise).",
-      "0.71.1 — CORRECTIF : le consommateur doit lui aussi sauter les slots réservés. Il s'arrêtait définitivement sur un tampon de repli (index fixe) et ne consommait plus aucune trame fraîche — mesuré en prod : 1,5 fps, port à 0,01 Gb/s. Le défaut n'existait pas tant que le seul slot réservé était la tenue, qui migre vers les slots du worker à chaque trame émise."
+      "0.71.1 — CORRECTIF : le consommateur doit lui aussi sauter les slots réservés. Il s'arrêtait définitivement sur un tampon de repli (index fixe) et ne consommait plus aucune trame fraîche — mesuré en prod : 1,5 fps, port à 0,01 Gb/s. Le défaut n'existait pas tant que le seul slot réservé était la tenue, qui migre vers les slots du worker à chaque trame émise.",
+      "0.71.2 — INSTRUMENTATION : compteurs de service par branche (srv.fresh / srv.hold / srv.fb / srv.busy), état d'amorçage des deux réserves (hold_ok / fb_ok) et trace au démarrage. Sans eux, diagnostiquer une sortie muette se fait à l'aveugle — vécu deux fois."
     ],
     "Une sortie 2110 ne s arrête jamais : trame courante amorcée et préservée (0.70.0)": [
       "La trame de tenue introduite en 0.69.0 n'existait qu'APRÈS la première trame émise, et le watchdog d'anneau l'invalidait. Une sortie dont le producteur disparaissait redevenait donc MUETTE — mesuré en prod : port à 0,01 Gb/s au lieu de 2,19, et anneau qui resynchronisait toutes les 2 s.",
