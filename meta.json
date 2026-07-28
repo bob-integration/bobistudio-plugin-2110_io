@@ -1,12 +1,14 @@
 {
-  "version": "0.69.1",
+  "version": "0.69.3",
   "date": "2026-07-28",
   "changes": {
     "Horloge de sortie : le fil ne dépend plus du producteur (0.69.0)": [
       "Une sortie 2110 est un appareil à HORLOGE : elle doit présenter une trame à chaque époque de la grille PTP, quoi que fasse sa source. Ce n'était pas le cas en mode tranche — quand le worker n'avait rien de prêt, `tx_sl_next_frame` rendait -EBUSY, l'époque était perdue, et le worker rattrapait ensuite en paquetant la trame entière d'un bloc : un grand trou suivi d'une rafale.",
       "Mesuré contre un EVS Neuron, qui refuse au-delà d'un PIT max de 1500 : une sortie alimentée par un producteur déficitaire montait à 7077-12708 et était REFUSÉE, là où une sortie sans producteur tenait 818 et était acceptée. Un problème de source devenait un problème de signal — le récepteur décrochait tout.",
       "Correctif : la dernière trame intégralement émise est conservée comme TRAME DE TENUE et re-servie telle quelle quand la suivante n'est pas prête (aucune copie — les framebuffers libmtl persistent). L'anneau passe de 3 à 4 slots pour que le worker en garde 3. Le rejeu est COMPTÉ (`repeats`, `fps_source`) : la sortie devient fiable, mais le déficit amont reste nommé et alarmable — le masquer serait pire que le bug.",
-      "0.69.1 — le rejeu se compte à notify_frame_done, pas à get_next_frame : la lib peut solliciter le callback sans émettre derrière, ce qui gonflait fps (une sortie statique affichait 65 fps pour 2,19 Gb/s réels, soit 50)."
+      "0.69.1 — le rejeu se compte à notify_frame_done, pas à get_next_frame : la lib peut solliciter le callback sans émettre derrière, ce qui gonflait fps (une sortie statique affichait 65 fps pour 2,19 Gb/s réels, soit 50).",
+      "0.69.2 — comptage du rejeu borné à une période : la lib sollicite get_next_frame sans toujours émettre (fps gonflé à 65) et ne rappelle pas notify_frame_done sur un re-service (fps tombé à 38 pour un fil à 50). Une trame de tenue ne partant qu'une fois par époque, le comptage est borné dans le temps — exact à la période près, jamais au-dessus du nominal.",
+      "0.69.3 — le rejeu n est PAS comptabilisé : libmtl n offre aucun signal fiable (get_next_frame sollicité sans émission, notify_frame_done non rappelé sur re-service, bornage temporel qui majore). fps publie donc les trames NEUVES réellement mesurées ; la cadence du fil est garantie nominale par l horloge de sortie et se vérifie aux compteurs du port. Publier une valeur non mesurée serait le travers qu on corrige."
     ],
     "Cadence FIL vs cadence SOURCE : la répétition de trame devient visible (0.68.0)": [
       "Le champ `fps` d'une sortie TX mélangeait les trames uniques et les trames rejouées : une sortie dont la source sous-cadence pouvait afficher une cadence sans qu'on sache si l'image avançait vraiment. Le moteur publie désormais `fps_source` (trames UNIQUES par seconde) et `repeats` (cumul de trames rejouées) à côté de `fps`, qui garde son sens de cadence RÉELLE SUR LE FIL.",

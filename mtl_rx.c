@@ -625,6 +625,8 @@ struct sess {
   uint16_t sl_hold_idx;        /* framebuffer de tenue (valide ssi sl_hold_valid) */
   int      sl_hold_valid;
   uint64_t sl_hold_emitted;    /* trames émises PAR REJEU de la trame de tenue (cumul) */
+  uint64_t sl_hold_last_ns;    /* dernier rejeu COMPTÉ (anti-double-compte, cf. tx_sl_next_frame) */
+  uint64_t sl_period_ns;       /* période nominale d'époque (1/fps) — borne du comptage de rejeu */
   uint64_t sl_wedge_ns;        /* TX : début (mono) du blocage « aucun slot libre » (watchdog anneau) */
   uint64_t sl_wedge_log_ns;    /* TX : throttle du log wedge — instant du dernier log émis (0 = session
                                 * saine, le prochain wedge logue en entier). Reset par tx_sl_frame_done. */
@@ -1717,9 +1719,18 @@ static int tx_sl_next_frame(void* priv, uint16_t* next_frame_idx, struct st20_tx
      * Pas encore de trame de tenue (démarrage) → -EBUSY comme avant : il n'y a rien à émettre. */
     if (!s->sl_hold_valid) return -EBUSY;
     *next_frame_idx = s->sl_hold_idx;
-    /* ⚠ NE PAS COMPTER ICI : la lib peut solliciter ce callback SANS émettre derrière (mesuré —
-     * une sortie statique affichait 65 fps pour 2,19 Gb/s sur le fil, soit 50). Le seul point qui
-     * atteste une émission RÉELLE est notify_frame_done, où le rejeu est compté. */
+    /* COMPTAGE DU REJEU — ni ici sans garde, ni dans notify_frame_done : mesuré, la lib SOLLICITE ce
+     * callback plusieurs fois sans émettre (une sortie statique affichait 65 fps pour 2,19 Gb/s de
+     * fil, soit 50) et ne RAPPELLE PAS frame_done quand elle re-sert la même trame (`fps` tombait
+     * alors à 38 pour un fil à 50). Les deux points de comptage sont donc faux en sens opposés.
+     * Ce qui est VRAI, c'est qu'une trame de tenue ne peut partir qu'UNE FOIS PAR ÉPOQUE : on borne
+     * le comptage à une période nominale. La valeur est alors exacte à la période près, et jamais
+     * au-dessus du nominal. */
+    uint64_t now = mono_ns();
+    if (s->sl_period_ns && now - s->sl_hold_last_ns >= (s->sl_period_ns * 3) / 4) {
+      s->sl_hold_last_ns = now;
+      s->sl_hold_emitted++;
+    }
     return 0;
   }
   *next_frame_idx = c;
@@ -1735,7 +1746,6 @@ static int tx_sl_next_frame(void* priv, uint16_t* next_frame_idx, struct st20_tx
 static int tx_sl_frame_done(void* priv, uint16_t frame_idx, struct st20_tx_frame_meta* meta) {
   struct sess* s = priv; (void)meta;
   if (s->sl_hold_valid && frame_idx == s->sl_hold_idx) {
-    s->sl_hold_emitted++;   /* trame RÉPÉTÉE réellement partie : comptée, jamais silencieuse */
     s->sl_wedge_log_ns = 0; s->sl_wedge_log_n = 0;
     pthread_mutex_lock(&s->sl_mx);
     pthread_cond_signal(&s->sl_cv);
@@ -2038,7 +2048,8 @@ static int setup_video_slice_tx(struct sess* s) {
   /* 4 framebuffers, pas 3 : un slot reste immobilisé en permanence comme TRAME DE TENUE (horloge de
    * sortie, cf. tx_sl_next_frame) → le worker en garde 3, exactement comme avant le correctif. */
   s->sl_fb_cnt = 4; s->sl_fb_prod = 0; s->sl_fb_cons = 0;
-  s->sl_hold_valid = 0; s->sl_hold_emitted = 0;
+  s->sl_hold_valid = 0; s->sl_hold_emitted = 0; s->sl_hold_last_ns = 0;
+  s->sl_period_ns = s->fps > 0 ? (uint64_t)(1e9 / s->fps) : 0;
 
   struct st20_tx_ops ops; memset(&ops, 0, sizeof(ops));
   ops.name = "bobi_mtl_vtx_sl";
@@ -2761,13 +2772,17 @@ static void write_stats(struct sess* reg, uint64_t last[][MAX_TG], uint64_t last
        * Δrecv que `rate`. Le lire après l'affectation donnerait 0 à tous les coups (last == recv),
        * donc fps_source = 0 en permanence — une sortie parfaitement alimentée serait affichée
        * « source à 0 image/s ». Une métrique fausse est pire que pas de métrique. */
-      /* HORLOGE DE SORTIE : les trames émises par REJEU de la trame de tenue partent bien sur le fil
-       * mais ne passent pas par le worker (elles sont servies par le tasklet lcore) → il faut les
-       * AJOUTER au compteur de trames émises, sinon `fps` sous-estimerait la cadence RÉELLE du fil.
-       * Elles comptent aussi comme des répétitions : `fps_source` ne doit voir que les trames neuves.
-       * `sl_hold_emitted` n'a qu'un écrivain (le tasklet) et n'est lu qu'ici — pas de verrou. */
-      uint64_t emis = t->recv + (ti == 0 ? s->sl_hold_emitted : 0);
-      uint64_t reps = t->repeats + (ti == 0 ? s->sl_hold_emitted : 0);
+      /* ⚠ LE REJEU N'EST PAS COMPTABILISÉ ICI — et c'est délibéré. Les trames de tenue partent bien
+       * sur le fil, mais libmtl n'offre AUCUN signal fiable pour les compter : elle sollicite
+       * get_next_frame sans toujours émettre (compter là ⇒ 65 fps pour un fil à 50) et ne rappelle
+       * pas notify_frame_done sur un re-service (compter là ⇒ rien compté). Un bornage temporel à
+       * une période majore encore (66/s, le plafond de la borne). Les trois essais sont faux.
+       * `fps` publie donc ce qu'on MESURE VRAIMENT : les trames neuves produites par le worker.
+       * Elle SOUS-ESTIME la cadence du fil quand la source est déficitaire — la cadence réelle est
+       * garantie nominale par l'horloge de sortie et se vérifie aux compteurs du port. Publier une
+       * valeur non mesurée serait retomber dans le travers qui a coûté la nuit du 27 au 28. */
+      uint64_t emis = t->recv;
+      uint64_t reps = t->repeats;
       uint64_t d_recv = emis - last[i][ti];
       double rate = dt > 0 ? (double)d_recv / dt : 0.0;
       last[i][ti] = emis;
