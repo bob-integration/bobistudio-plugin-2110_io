@@ -1476,6 +1476,27 @@ class MetricsHandler(BaseHTTPRequestHandler):
             if d.get("timecode"):
                 rec["timecode"] = d["timecode"]; rec["df"] = bool(d.get("df"))
             recs.append(rec)
+        # Receivers AUDIO (2110-30), même principe que l'ANC juste au-dessus : ils n'existent que si
+        # abonnés, donc l'absence du stats json vaut « pas de session » — c'est le seul critère.
+        #
+        # Ils MANQUAIENT à `receivers[]`, alors que le moteur les servait bel et bien : `rl` comptait
+        # 12 sessions RX pour 6 vidéo, les six flux MXL `*_audio_*` étaient écrits, mais aucun
+        # consommateur du contrat :8080 ne pouvait le savoir. Conséquence directe : le voyant de
+        # signal de la page Câbles affichait « pas de signal » sur des sorties audio parfaitement
+        # alimentées — un indicateur qui se trompe dans le sens rassurant, le pire des deux.
+        #
+        # `fps` porte ici des paquets par seconde (≈1000 à ptime 1 ms), pas des trames : c'est la
+        # grandeur que publie mtl_rx pour l'audio, on la relaie TELLE QUELLE (le contrat interdit de
+        # dériver ici, cf. CLAUDE.md).
+        for idx in range(N_AUDIO):
+            d = _read_stats_raw("/tmp/mtl_a{}.json".format(idx))
+            if d is None:
+                continue
+            recs.append({"idx": idx, "essence": "audio", "fps": float(d.get("fps", 0.0)),
+                         "frame_index": int(d.get("frame_index", 0)),
+                         "late": int(d.get("late", 0) or 0),
+                         "rx_latency_ms": d.get("rx_latency_ms"),
+                         "mode": "mtl" if float(d.get("fps", 0.0)) > 0 else "idle"})
         # fps agrégé = premier slot actif (compat get_metrics qui lit .fps top-level)
         top_fps = next((m["fps"] for m in recs if m.get("mode") == "mtl"), recs[0]["fps"] if recs else 0.0)
         # Senders TX : SDP exposé dès que la destination est configurée (même sans câblage).

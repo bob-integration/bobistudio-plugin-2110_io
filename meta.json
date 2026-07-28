@@ -1,7 +1,12 @@
 {
-  "version": "0.77.0",
+  "version": "0.78.0",
   "date": "2026-07-28",
   "changes": {
+    "Les receivers AUDIO apparaissent enfin dans :8080 (0.78.0)": [
+      "`receivers[]` n'énumérait que la vidéo et l'ANC. L'audio était pourtant bien servi — `rl` comptait 12 sessions RX pour 6 vidéo, les six flux MXL `*_audio_*` étaient écrits — mais aucun consommateur du contrat :8080 ne pouvait le savoir.",
+      "Conséquence directe : le voyant de signal de la page Câbles affichait « pas de signal » sur des sorties audio parfaitement alimentées. Un indicateur qui se trompe dans le sens rassurant est pire que pas d'indicateur.",
+      "Bloc ajouté en miroir exact de celui de l'ANC : lecture de /tmp/mtl_a{idx}.json, absence du fichier = pas de session. `fps` porte des paquets par seconde (~1000 à ptime 1 ms) et non des trames — relayé tel quel, le contrat interdit de dériver côté moteur."
+    ],
     "Sondes de présence signal armées PAR SLOT (POST /probes) — 0.77.0": [
       "L'orchestrateur sait quels drapeaux l'exploitant a armés par source ; le moteur, lui, calculait tout pour tout le monde. Décocher doit économiser le CALCUL, pas seulement taire l'alerte : 0,03 % d'un cœur par source pour le gamut, 0,09 % par flux pour l'audio (mesurés sur le nœud).",
       "Trois sondes distinctes, parce que leurs coûts n'ont rien à voir : `video` (noir + gel — un CRC et une moyenne, négligeable), `gamut` (le calcul cher : matriçage BT.709) et `audio` (silence + saturation, lus en continu à 20 Hz). Le gamut s'éteint SEUL, sans désarmer noir et gel.",
