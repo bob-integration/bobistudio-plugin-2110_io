@@ -2067,6 +2067,16 @@ _WD_STALL_S  = float(os.environ.get("MTL_RX_WATCHDOG_S") or 15.0)
 _WD_BOUNCE_S = 2.0           # durée d'omission de la session (≫ période de poll du daemon)
 _WD_MAX_S    = 300.0         # plafond du backoff par groupe
 _WD_GRACE_S  = 20.0          # pas de bounce juste après un (re)lancement du daemon (mtl_init lent)
+# ★ PLAFOND D'ESSAIS À FROID (bobi.studio) : nombre de recréations tentées sur un groupe qui n'a
+# JAMAIS rien reçu. Recréer une session coûte un `rte_tm_hierarchy_commit` qui ARRÊTE ET REDÉMARRE
+# LE PORT ENTIER (pacing RL) — et une session TX vivante peut y perdre ses mbufs définitivement
+# (cf. patch_tx_builder_famine_recovery). MESURÉ le 2026-07-28 : six entrées sans signal faisaient
+# recréer leurs sessions en boucle, et CHAQUE passage tuait la sortie TX du même port, muette
+# ensuite pour toujours. Le watchdog sert à débloquer un flux qui RECEVAIT et s'est figé (join IGMP
+# sur la mauvaise carte, cf. mémoire Horace) : quelques essais suffisent à couvrir ce cas au
+# démarrage. Au-delà, sans le moindre grain jamais reçu, la cause est en AMONT (pas d'émetteur,
+# mauvais groupe, pas de route) — insister ne répare rien et casse le voisin.
+_WD_COLD_MAX_N = int(os.environ.get("MTL_RX_WATCHDOG_COLD_MAX") or 2)
 _wd_state = {}               # (mcast,port) → état watchdog ; touché par le seul thread manager
 _ip_check_at = 0.0           # prochain contrôle périodique _check_port_ips (manager loop)
 
@@ -3057,7 +3067,26 @@ def _manager_loop():
                     if st["n"] and all((_wd_now - st["prog"].get(i, 0)) < _WD_STALL_S
                                        for i in g["idxs"]):
                         st["delay"] = _WD_STALL_S; st["n"] = 0       # vraie reprise → reset backoff
+                        st.pop("cold_logged", None)                  # réarme l'abandon à froid :
+                        # ce groupe a reçu pour de bon, il MÉRITE de nouveau des tentatives s'il
+                        # se fige un jour (et un nouveau message si on doit re-renoncer).
                 elif _wd_daemon_ok:
+                    # ★ Groupe JAMAIS ALIMENTÉ : aucun de ses slots n'a jamais progressé (`prog`
+                    # vide). Après _WD_COLD_MAX_N essais, on ARRÊTE — recréer coûte un commit RL
+                    # (arrêt/redémarrage du port) qui tue les sorties TX de la même carte, pour
+                    # une panne qui n'est pas de notre ressort. On le DIT une fois, plutôt que de
+                    # renoncer en silence : le groupe reste visible comme « sans signal ».
+                    _jamais_recu = not any(st["prog"].get(i) for i in g["idxs"])
+                    if _jamais_recu and st["n"] >= _WD_COLD_MAX_N:
+                        if not st.get("cold_logged"):
+                            st["cold_logged"] = True
+                            print("watchdog RX: {}:{} slot(s) {} n'ont JAMAIS reçu d'image après {} "
+                                  "tentative(s) → abandon des recréations (elles arrêtent le port et "
+                                  "tuent les sorties TX de la même carte). Cause en amont : émetteur "
+                                  "absent, mauvais groupe ou route manquante.".format(
+                                      key[0], key[1], g["idxs"], st["n"]), flush=True)
+                        del groups[key]
+                        continue
                     worst = max(_wd_now - st["anchor"][i] for i in stalled)
                     st["until"] = _wd_now + _WD_BOUNCE_S
                     st["n"]    += 1
