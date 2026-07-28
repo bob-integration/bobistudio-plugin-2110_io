@@ -1,7 +1,16 @@
 {
-  "version": "0.75.0",
+  "version": "0.76.0",
   "date": "2026-07-28",
   "changes": {
+    "Sonde signal : audio lu SANS TROU, cadences découplées, gamut à origine tournante (0.76.0)": [
+      "★ L'alarme de SILENCE n'a JAMAIS fonctionné. La sonde demandait 400 ms (fenêtre R128 « M ») à un ring qui n'en retient que 100 (A_RING = 100 chunks de 1 ms) : la lecture échouait, la fonction sortait par `r is None` sans un mot, et ni le silence ni le loudness n'ont jamais été publiés. Vérifié en production : 12 sessions audio vivantes à 1000 chunks/s, `silence` absent des 15 slots qui publiaient un signal. Les 400 ms n'existaient que pour le loudness, retiré des alarmes le même jour.",
+      "LECTURE SÉQUENTIELLE par curseur (read_from) au lieu de « la fenêtre la plus récente » : on lit TOUT ce qui est arrivé depuis le relevé précédent. Un pic peut tenir en un seul échantillon — une fenêtre glissante en raterait par construction. Vérifié sur simulateur de ring : 480 000 échantillons écrits, 480 000 analysés, zéro trou, et un pic isolé d'UN échantillon attrapé.",
+      "TROU SIGNALÉ, jamais silencieux : au-delà de la profondeur du ring les échantillons sont écrasés, on ne peut pas les inventer. Le moteur écrit alors combien ont été perdus. Et l'échec de lecture est loggé — c'est son absence qui a masqué le bug ci-dessus pendant toute la vie de cette sonde.",
+      "DEUX CADENCES : audio à 20 Hz (50 ms d'avance sur un tampon de 100 ms, marge pour l'ordonnancement), vidéo à 0,5 Hz. La vidéo conserve son dernier résultat entre deux calculs, sinon ses drapeaux clignoteraient au rythme de l'audio. Sans ce découplage, la lecture séquentielle signalerait un trou à chaque relevé (2 s d'intervalle sur un ring de 100 ms).",
+      "PIC SANS COPIE : `read_from` matérialisait un tableau de 153 ko jeté aussitôt, et `np.abs()` en allouait un second. Mesuré sur le nœud : 196 µs → 46 µs, soit 4,2×. À 20 Hz et 64 flux : 5,9 % d'un cœur.",
+      "GAMUT à origine tournante + moyenne sur 8 relevés. Le déclenchement était déjà fiable avec une origine fixe (vérifié sur images de synthèse : diffus, bandeau, synthé, logo tous classés correctement) — ce qui était faux, c'est le CHIFFRE publié : un synthé occupant 11,1 % de l'image était annoncé à 5,88 %. L'origine tournante converge vers la valeur réelle (11,18 %) à coût identique. Elle ne touche PAS les lignes du CRC de gel, qui doivent rester fixes.",
+      "Loudness supprimé du moteur avec sa FFT, qui coûtait plus cher que tout le reste de la sonde."
+    ],
     "Alarme de SATURATION audio (écrêtage) — 0.75.0": [
       "Le pic audio était déjà calculé pour détecter le silence ; le comparer à l'autre extrémité (≥ -0,1 dBFS) donne l'écrêtage pour rien. Contrairement au loudness — retiré des alarmes le même jour — une saturation n'a pas besoin d'un programme : c'est un défaut à l'instant où il se produit, comme un gel ou un noir côté image.",
       "Le drapeau est un HOLD de 30 s, pas un état instantané, et c'est indispensable : la sonde ne regarde que 400 ms toutes les 2 s (20 % de l'audio) et l'orchestrateur exige 3 relevés concordants avant d'alerter. Un drapeau vrai seulement pendant la fenêtre où l'écrêtage a été vu ne survivrait jamais au débounce.",

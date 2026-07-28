@@ -942,6 +942,11 @@ SIGNAL_ROWS       = 16                                                 # lignes 
 # Paliers CONTENU supplémentaires (#25) — gamut/niveaux illégaux (vidéo) + loudness R128 (audio).
 SIGNAL_GAMUT_PCT  = float(os.environ.get("SIGNAL_GAMUT_PCT") or 2.0)   # % pixels hors-gamut avant flag
 SIGNAL_GAMUT_TOL  = float(os.environ.get("SIGNAL_GAMUT_TOL") or 0.02)  # tolérance RGB (fraction de plage)
+# Nombre de relevés moyennés pour le % hors-gamut. Nécessaire depuis que l'origine des lignes
+# tourne (cf. _sig_video_probe) : sans lissage, un défaut localisé ferait osciller la mesure d'un
+# relevé à l'autre. 8 relevés ≈ 16 s à la cadence vidéo — assez pour stabiliser, assez court pour
+# rester réactif face au délai de persistance (SIGNAL_HOLD_S).
+SIGNAL_GAMUT_AVG  = max(1, int(os.environ.get("SIGNAL_GAMUT_AVG") or 8))
 SIGNAL_LOUD_MS    = float(os.environ.get("SIGNAL_LOUD_MS") or 400.0)   # fenêtre loudness momentané (R128 « M »)
 SIGNAL_LOUD_TARGET= float(os.environ.get("SIGNAL_LOUD_TARGET") or -23.0)  # cible EBU R128 (LUFS)
 SIGNAL_LOUD_TOL   = float(os.environ.get("SIGNAL_LOUD_TOL") or 2.0)    # ± LU avant flag « hors cible »
@@ -956,6 +961,11 @@ SIGNAL_LOUD_TOL   = float(os.environ.get("SIGNAL_LOUD_TOL") or 2.0)    # ± LU a
 # n'est pas vu. Attraper tout imposerait un suivi de pic continu dans mtl_rx, pas dans cette sonde.
 SIGNAL_CLIP_DB    = float(os.environ.get("SIGNAL_CLIP_DB") or -0.1)    # dBFS : pic ≥ seuil = écrêtage
 SIGNAL_CLIP_HOLD_S= float(os.environ.get("SIGNAL_CLIP_HOLD_S") or 30.0) # maintien du drapeau
+# Cadence de la sonde AUDIO, distincte de la vidéo. Elle doit être < A_RING (100 ms) pour que la
+# lecture séquentielle ne perde jamais d'échantillon : à 20 Hz on lit 50 ms d'avance sur un tampon
+# qui en tient 100, ce qui laisse de la marge pour un ordonnancement irrégulier. Coût mesuré sur le
+# nœud : 46 µs par flux et par relevé, sans copie — 3 % d'un cœur à 64 flux.
+SIGNAL_AUDIO_S    = float(os.environ.get("SIGNAL_AUDIO_S") or 0.05)
 
 _signal_rx = {}      # idx slot RX → {"black","frozen"[,"silence"]} — lu par MetricsHandler
 _signal_tx = {}      # idx slot TX → {"black","frozen"} (contenu du shm d'entrée câblé)
@@ -1147,12 +1157,38 @@ def _sig_video_probe(st, name, now):
             u = np.frombuffer(view, dtype=dt, count=cw * ch_, offset=w * h * it).reshape(ch_, cw)
             v = np.frombuffer(view, dtype=dt, count=cw * ch_,
                               offset=(w * h + cw * ch_) * it).reshape(ch_, cw)
-            yr = rows                                              # lignes Y (h/step, w)
+            # ── ORIGINE TOURNANTE (et NON les lignes du gel) ──────────────────────────────────
+            # 17 lignes sur 1080, mais pleine largeur : 32 640 pixels. Pour estimer une PROPORTION
+            # c'est un très gros échantillon (±0,15 % à 2σ sur une valeur de 2 %), et le
+            # DÉCLENCHEMENT de l'alarme est déjà fiable avec une origine fixe — mesuré sur images
+            # de synthèse : diffus, bandeau, synthé et logo sont tous classés correctement.
+            # Ce que l'origine fixe rate, c'est la JUSTESSE du chiffre publié, parce qu'elle ne
+            # croise qu'une partie d'un défaut localisé : un synthé occupant 11,1 % de l'image est
+            # annoncé à 5,88 % (facteur 2), un logo de 0,58 % à 0,92 %. Or `gamut_pct` est montré à
+            # l'exploitant et sert à régler un seuil — il doit dire vrai.
+            # En décalant l'origine à chaque relevé, la moyenne converge vers la proportion réelle
+            # de l'image ENTIÈRE (mesuré : 11,18 % contre 11,11 % de vérité), à coût identique.
+            # ⚠ SURTOUT PAS sur `rows` : ces lignes-là servent au CRC du GEL. Les faire tourner
+            # rendrait chaque trame différente de la précédente et le gel ne serait PLUS JAMAIS
+            # détecté. Le gel garde son échantillon fixe, le gamut a le sien, mobile.
+            goff = int(st.get("gam_off", 0)) % step
+            st["gam_off"] = (goff + 1) % step
+            yr = np.ascontiguousarray(y[goff::step])               # lignes Y (h/step, w)
             cstep = max(1, ch_ // SIGNAL_ROWS)
-            ur = np.repeat(u[::cstep], hx, axis=1)[:, :w]          # chroma suréchantillonné → largeur w
-            vr = np.repeat(v[::cstep], hx, axis=1)[:, :w]
+            coff = (goff // hy) % cstep
+            ur = np.repeat(u[coff::cstep], hx, axis=1)[:, :w]      # chroma suréchantillonné → largeur w
+            vr = np.repeat(v[coff::cstep], hx, axis=1)[:, :w]
             n = min(yr.shape[0], ur.shape[0], vr.shape[0])
             gam_pct = _gamut_illegal_pct(yr[:n], ur[:n], vr[:n], bd)
+            # LISSAGE, conséquence directe de l'origine tournante : d'un relevé à l'autre on ne
+            # regarde plus les mêmes lignes, donc la mesure oscille (sur un synthé : 5,88 % à
+            # 12,50 % d'un relevé au suivant). Seuiller là-dessus recréerait l'alarme qui bat qu'on
+            # corrige partout ailleurs. La moyenne sur N relevés ramène l'écart à ±0,1 % et
+            # converge vers la proportion réelle de l'image entière.
+            _gh = st.setdefault("gam_hist", [])
+            _gh.append(gam_pct)
+            del _gh[:-SIGNAL_GAMUT_AVG]
+            gam_pct = sum(_gh) / len(_gh)
         except Exception:
             gam_pct = None
         thr = SIGNAL_BLACK_Y or ((16 + 6) << (bd - 8))    # noir nominal 16 (8 bits) + marge
@@ -1213,11 +1249,44 @@ def _sig_audio_probe(st, name, now):
             return None
         st["ahead_t"] = now
         st["stale_a"] = 0            # head qui avance → lecteur sain (désarme l'escalade)
-        nwin = max(48, int(SIGNAL_LOUD_MS / 1000.0 * 48000.0))   # fenêtre R128 « M » (400 ms) — sert
-        r = ar.read_latest(nwin)                                 # aussi au pic (silence), float32 [-1,1]
-        if r is None or not r.size:
+        # ── LECTURE SÉQUENTIELLE, SANS TROU ───────────────────────────────────────────────────
+        # « Ne rien laisser passer quand la saturation est armée » n'est pas une question de
+        # cadence mais de CONTINUITÉ : on suit un curseur et on lit TOUT ce qui est arrivé depuis
+        # le relevé précédent (read_from est fait pour ça, cf. son docstring). Un pic peut tenir en
+        # un seul échantillon — une fenêtre « la plus récente » en raterait par construction.
+        #
+        # ⚠ L'ancienne version demandait 400 ms (fenêtre R128 « M ») à `read_latest` sur un ring qui
+        # n'en contient que 100 (A_RING = 100 chunks de 1 ms). La lecture échouait, la sonde sortait
+        # par `r is None`, et NI le silence NI le loudness n'ont jamais été publiés — vérifié en
+        # prod : 12 sessions audio vivantes à 1000 chunks/s, `silence` absent des 15 slots qui
+        # publient un signal. Les 400 ms n'existaient que pour le loudness, retiré des alarmes.
+        nres = head - int(st["acur"]) if st.get("acur") is not None else 0
+        cur = st.get("acur")
+        if cur is None or nres <= 0 or nres > A_RING:
+            # Premier passage, ou retard supérieur à la profondeur du ring : les échantillons
+            # manquants sont ÉCRASÉS, on ne peut pas les inventer. On le DIT (un trou silencieux
+            # ferait croire à une couverture qu'on n'a pas) et on repart du présent.
+            if cur is not None and nres > A_RING:
+                st["gap"] = int(st.get("gap", 0)) + 1
+                print("sampler: {} — {} échantillon(s) NON ANALYSÉS (retard > ring de {} ms) : "
+                      "couverture incomplète".format(name, nres - A_RING, A_RING), flush=True)
+            st["acur"] = head
             return None
-        peak_db = 20.0 * float(np.log10(max(float(np.max(np.abs(r))), 1e-6)))
+        r = ar.read_from(cur, min(nres, A_RING))
+        if r is None or not r.size:
+            # Échec de lecture : ne JAMAIS sortir en silence — c'est ce qui a masqué le bug
+            # ci-dessus pendant toute la vie de cette sonde.
+            if not st.get("rd_warn"):
+                st["rd_warn"] = True
+                print("sampler: {} — lecture audio IMPOSSIBLE ({} samples depuis {}) : silence et "
+                      "saturation NE SERONT PAS calculés".format(name, min(nres, A_RING), cur),
+                      flush=True)
+            return None
+        st.pop("rd_warn", None)
+        st["acur"] = cur + int(r.shape[0])
+        # Pic sans tableau temporaire : `np.abs(r)` allouerait une copie complète à chaque relevé
+        # (mesuré sur le nœud : 4,2× le coût du calcul utile).
+        peak_db = 20.0 * float(np.log10(max(max(float(r.max()), -float(r.min())), 1e-6)))
         if peak_db < SIGNAL_SILENCE_DB:
             st.setdefault("sil_since", now)
         else:
@@ -1232,12 +1301,9 @@ def _sig_audio_probe(st, name, now):
         out = {"silence": silence,
                "clip": bool(_ct is not None and now - _ct < SIGNAL_CLIP_HOLD_S),
                "peak_db": round(peak_db, 1)}
-        if r.ndim == 2:                                          # loudness momentané (#25) sur L/R
-            lufs = _loudness_lufs(r)
-            if lufs is not None:
-                out["lufs"] = round(lufs, 1)
-                # « hors cible » seulement sur de l'audio présent (le silence est déjà flaggé).
-                out["loud"] = (not silence) and abs(lufs - SIGNAL_LOUD_TARGET) > SIGNAL_LOUD_TOL
+        # Loudness RETIRÉ : il n'a de sens que rapporté à un PROGRAMME (début, fin, intégré R128),
+        # la fenêtre est désormais variable, et sa FFT coûtait plus cher que tout le reste de la
+        # sonde. Un plugin dédié fera la mesure, armé au début d'un programme et coupé à la fin.
         return out
     except Exception:
         _sig_close(st)
@@ -1260,8 +1326,19 @@ _sig_bus = threading.Event()   # SIGBUS pendant une lecture MXL (flux recréé) 
 def _signal_loop():
     """Thread sampler : slots RX live (flux vidéo + audio associé) et slots TX câblés (contenu
     du shm d'entrée). Publie _signal_rx/_signal_tx (consommés par MetricsHandler)."""
+    # ── DEUX CADENCES, PAS UNE ────────────────────────────────────────────────────────────────
+    # L'audio doit être lu SANS TROU (cf. _sig_audio_probe) : le ring ne retient que A_RING ms, donc
+    # tout intervalle plus long qu'A_RING perd des échantillons DÉFINITIVEMENT. La vidéo, elle, n'a
+    # aucune raison d'aller si vite — comparer des CRC de trames et estimer un % hors-gamut à 0,5 Hz
+    # suffit largement, et c'est le calcul coûteux (0,59 ms par slot contre 46 µs pour l'audio).
+    # On tourne donc au pas de l'AUDIO et on ne fait la vidéo qu'un tick sur N.
+    tick_s = max(0.02, min(SIGNAL_AUDIO_S, SIGNAL_SAMPLE_S))
+    n_video = max(1, int(round(SIGNAL_SAMPLE_S / tick_s)))
+    it = 0
     while True:
-        time.sleep(SIGNAL_SAMPLE_S)
+        time.sleep(tick_s)
+        it += 1
+        faire_video = (it % n_video) == 0
         now = time.monotonic()
         if _sig_bus.is_set():          # SIGBUS vu (producteur a recréé un flux) → repartir à neuf
             _sig_bus.clear()
@@ -1280,15 +1357,25 @@ def _signal_loop():
                         _signal_rx.pop(idx, None)
                     continue
                 st = _sig_state.setdefault(key, {})
-                vres = _sig_video_probe(st, "{}_{}".format(HOSTNAME, idx), now)
+                # Vidéo : un tick sur n_video. Le résultat précédent est CONSERVÉ entre deux
+                # calculs (il décrit un état, pas un événement) — sinon les drapeaux image
+                # clignoteraient au rythme de la cadence audio.
+                vres = _sig_video_probe(st, "{}_{}".format(HOSTNAME, idx), now) if faire_video \
+                    else st.get("vres_last")
+                if faire_video and vres is not None:
+                    st["vres_last"] = vres
                 sres = None
                 if idx < N_AUDIO and _audio_live[idx]:
                     sres = _sig_audio_probe(st, "{}_audio_{}".format(HOSTNAME, idx), now)
+                if sres is not None:
+                    st["sres_last"] = sres
+                else:
+                    sres = st.get("sres_last")   # une lecture vide ne doit pas effacer l'état connu
                 sig = {}
                 if vres is not None:
                     sig.update(vres)          # black/frozen/gamut/gamut_pct
                 if sres is not None:
-                    sig.update(sres)          # silence/lufs/loud
+                    sig.update(sres)          # silence/clip/peak_db
                 with _sig_lock:
                     if sig:
                         _signal_rx[idx] = sig
