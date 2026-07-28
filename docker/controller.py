@@ -945,6 +945,17 @@ SIGNAL_GAMUT_TOL  = float(os.environ.get("SIGNAL_GAMUT_TOL") or 0.02)  # toléra
 SIGNAL_LOUD_MS    = float(os.environ.get("SIGNAL_LOUD_MS") or 400.0)   # fenêtre loudness momentané (R128 « M »)
 SIGNAL_LOUD_TARGET= float(os.environ.get("SIGNAL_LOUD_TARGET") or -23.0)  # cible EBU R128 (LUFS)
 SIGNAL_LOUD_TOL   = float(os.environ.get("SIGNAL_LOUD_TOL") or 2.0)    # ± LU avant flag « hors cible »
+# SATURATION (écrêtage). Le pic est DÉJÀ calculé pour le silence : le comparer à l'autre extrémité
+# ne coûte rien. Contrairement au loudness, un écrêtage n'a pas besoin d'un programme — c'est un
+# défaut à l'instant où il se produit.
+# ⚠ C'est un HOLD, pas un état instantané, et c'est indispensable : la sonde ne regarde que 400 ms
+# toutes les 2 s (20 % de l'audio), et l'orchestrateur exige 3 relevés concordants avant d'alerter.
+# Un drapeau vrai « seulement pendant la fenêtre où l'écrêtage a été vu » ne survivrait jamais au
+# débounce. On tient donc le drapeau HOLD secondes après le dernier écrêtage constaté.
+# ⚠ Détection par ÉCHANTILLONNAGE, jamais exhaustive : un écrêtage bref tombant entre deux fenêtres
+# n'est pas vu. Attraper tout imposerait un suivi de pic continu dans mtl_rx, pas dans cette sonde.
+SIGNAL_CLIP_DB    = float(os.environ.get("SIGNAL_CLIP_DB") or -0.1)    # dBFS : pic ≥ seuil = écrêtage
+SIGNAL_CLIP_HOLD_S= float(os.environ.get("SIGNAL_CLIP_HOLD_S") or 30.0) # maintien du drapeau
 
 _signal_rx = {}      # idx slot RX → {"black","frozen"[,"silence"]} — lu par MetricsHandler
 _signal_tx = {}      # idx slot TX → {"black","frozen"} (contenu du shm d'entrée câblé)
@@ -1212,7 +1223,15 @@ def _sig_audio_probe(st, name, now):
         else:
             st.pop("sil_since", None)
         silence = "sil_since" in st and now - st["sil_since"] >= SIGNAL_SILENCE_S
-        out = {"silence": silence}
+        # Saturation : même pic, autre extrémité. GLOBAL sur les 8 canaux, comme le silence — une
+        # analyse par canal suppose de savoir QUELS canaux sont censés porter du son, ce qui est une
+        # question d'intention et fera l'objet d'un plugin dédié (décision 2026-07-28).
+        if peak_db >= SIGNAL_CLIP_DB:
+            st["clip_t"] = now
+        _ct = st.get("clip_t")
+        out = {"silence": silence,
+               "clip": bool(_ct is not None and now - _ct < SIGNAL_CLIP_HOLD_S),
+               "peak_db": round(peak_db, 1)}
         if r.ndim == 2:                                          # loudness momentané (#25) sur L/R
             lufs = _loudness_lufs(r)
             if lufs is not None:

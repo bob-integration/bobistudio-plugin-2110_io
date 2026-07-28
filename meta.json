@@ -1,7 +1,14 @@
 {
-  "version": "0.74.1",
+  "version": "0.75.0",
   "date": "2026-07-28",
   "changes": {
+    "Alarme de SATURATION audio (écrêtage) — 0.75.0": [
+      "Le pic audio était déjà calculé pour détecter le silence ; le comparer à l'autre extrémité (≥ -0,1 dBFS) donne l'écrêtage pour rien. Contrairement au loudness — retiré des alarmes le même jour — une saturation n'a pas besoin d'un programme : c'est un défaut à l'instant où il se produit, comme un gel ou un noir côté image.",
+      "Le drapeau est un HOLD de 30 s, pas un état instantané, et c'est indispensable : la sonde ne regarde que 400 ms toutes les 2 s (20 % de l'audio) et l'orchestrateur exige 3 relevés concordants avant d'alerter. Un drapeau vrai seulement pendant la fenêtre où l'écrêtage a été vu ne survivrait jamais au débounce.",
+      "⚠ Détection par ÉCHANTILLONNAGE, jamais exhaustive : un écrêtage bref tombant entre deux fenêtres n'est pas vu. Le rendre exhaustif imposerait un suivi de pic continu dans mtl_rx, pas dans cette sonde Python.",
+      "Mesure GLOBALE sur les 8 canaux, comme le silence. Conséquence assumée : une source dont un seul canal est mort reste invisible (le pic global est porté par les autres). Une analyse par canal suppose de savoir QUELS canaux sont censés porter du son — une question d'intention, qui fera l'objet d'un plugin dédié.",
+      "`peak_db` est publié à côté du drapeau (mesure brute, utile à l'affichage et au diagnostic)."
+    ],
     "Le watchdog RX n'abat plus les sorties TX de la même carte (0.74.0)": [
       "MESURÉ le 2026-07-28 : six entrées privées de signal faisaient recréer leurs sessions RX en boucle, et CHAQUE recréation tuait la sortie TX du même port — muette ensuite pour toujours. Recréer une session déclenche un rte_tm_hierarchy_commit qui arrête et redémarre le port entier ; une session TX vivante peut y perdre ses mbufs définitivement. Le backoff plafonnant à 300 s, une source absente déclenchait donc une exécution toutes les 5 minutes, indéfiniment.",
       "Le watchdog distingue désormais deux situations que rien ne séparait : un flux qui RECEVAIT puis s'est figé (join IGMP sur la mauvaise carte — sa raison d'être, comportement inchangé), et un flux qui n'a JAMAIS rien reçu. Dans le second cas il tente MTL_RX_WATCHDOG_COLD_MAX fois (2 par défaut, de quoi couvrir un mauvais join au démarrage) puis ABANDONNE.",
