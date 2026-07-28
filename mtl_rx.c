@@ -1717,7 +1717,9 @@ static int tx_sl_next_frame(void* priv, uint16_t* next_frame_idx, struct st20_tx
      * Pas encore de trame de tenue (démarrage) → -EBUSY comme avant : il n'y a rien à émettre. */
     if (!s->sl_hold_valid) return -EBUSY;
     *next_frame_idx = s->sl_hold_idx;
-    s->sl_hold_emitted++;                       /* trame RÉPÉTÉE : comptée, jamais silencieuse */
+    /* ⚠ NE PAS COMPTER ICI : la lib peut solliciter ce callback SANS émettre derrière (mesuré —
+     * une sortie statique affichait 65 fps pour 2,19 Gb/s sur le fil, soit 50). Le seul point qui
+     * atteste une émission RÉELLE est notify_frame_done, où le rejeu est compté. */
     return 0;
   }
   *next_frame_idx = c;
@@ -1733,6 +1735,7 @@ static int tx_sl_next_frame(void* priv, uint16_t* next_frame_idx, struct st20_tx
 static int tx_sl_frame_done(void* priv, uint16_t frame_idx, struct st20_tx_frame_meta* meta) {
   struct sess* s = priv; (void)meta;
   if (s->sl_hold_valid && frame_idx == s->sl_hold_idx) {
+    s->sl_hold_emitted++;   /* trame RÉPÉTÉE réellement partie : comptée, jamais silencieuse */
     s->sl_wedge_log_ns = 0; s->sl_wedge_log_n = 0;
     pthread_mutex_lock(&s->sl_mx);
     pthread_cond_signal(&s->sl_cv);
