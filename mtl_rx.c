@@ -607,8 +607,24 @@ struct sess {
   /* `sf_stamp` : génération de trame STATIQUE déjà écrite dans ce framebuffer (0 = jamais). Les
    * framebuffers libmtl PERSISTENT d'un tour à l'autre : une fois la trame statique packée dedans,
    * la ré-émettre ne demande AUCUNE recopie — on ne fait que re-marquer le slot prêt. */
+  /* stat : 0=FREE (le worker peut le remplir) 1=READY (rempli / en vol) 2=TENUE (dernière trame
+   * intégralement émise, CONSERVÉE pour être re-servie si la source est en retard — le worker ne
+   * doit jamais la reprendre, cf. HORLOGE DE SORTIE dans tx_sl_next_frame). */
   struct sl_txfb { volatile int stat; volatile uint32_t lines_ready; uint32_t sf_stamp; } sl_fb[SL_Q];
   uint16_t sl_fb_cnt, sl_fb_prod, sl_fb_cons;
+  /* ── HORLOGE DE SORTIE (trame de tenue) ────────────────────────────────────────────────────────
+   * Une sortie 2110 est un appareil à HORLOGE : elle doit présenter une trame à CHAQUE époque de la
+   * grille PTP, quoi que fasse le producteur. Sans ça, `tx_sl_next_frame` rendait -EBUSY dès que le
+   * worker n'avait rien de prêt : l'époque était perdue, et le worker rattrapait ensuite en paquetant
+   * la trame entière d'un bloc → un grand trou suivi d'une rafale. MESURÉ contre un EVS Neuron :
+   * PIT max 7077-12708 avec un producteur déficitaire, contre 818 sur une sortie sans producteur —
+   * et il REFUSE au-delà de 1500. Un problème de SOURCE devenait un problème de SIGNAL.
+   * `sl_hold_idx` = dernier framebuffer intégralement émis, gardé en stat=TENUE et re-servi tel quel
+   * (aucune copie : les framebuffers libmtl persistent). `sl_hold_emitted` n'est écrit QUE par le
+   * tasklet lcore — un seul écrivain par compteur, pas de course avec le worker (cf. write_stats). */
+  uint16_t sl_hold_idx;        /* framebuffer de tenue (valide ssi sl_hold_valid) */
+  int      sl_hold_valid;
+  uint64_t sl_hold_emitted;    /* trames émises PAR REJEU de la trame de tenue (cumul) */
   uint64_t sl_wedge_ns;        /* TX : début (mono) du blocage « aucun slot libre » (watchdog anneau) */
   uint64_t sl_wedge_log_ns;    /* TX : throttle du log wedge — instant du dernier log émis (0 = session
                                 * saine, le prochain wedge logue en entier). Reset par tx_sl_frame_done. */
@@ -1688,21 +1704,47 @@ static void* video_tx_thread(void* arg) {
  * amont (latence sous-trame). Le nombre de tranches vient du GRAIN SOURCE (totalSlices) : une
  * source whole-frame (totalSlices=1) dégrade proprement en trame pleine. */
 
-/* lcore tasklet : la lib veut une trame à émettre → le prochain framebuffer publié (READY). */
+/* lcore tasklet : la lib veut une trame à émettre → le prochain framebuffer publié (READY), ou, à
+ * défaut, la TRAME DE TENUE (cf. sl_hold_idx). C'est ICI que se joue l'horloge de sortie : rendre
+ * -EBUSY, c'est perdre l'époque et laisser le producteur dicter le rythme des paquets. */
 static int tx_sl_next_frame(void* priv, uint16_t* next_frame_idx, struct st20_tx_frame_meta* meta) {
   struct sess* s = priv; (void)meta;
   uint16_t c = s->sl_fb_cons;
-  if (s->sl_fb[c].stat != 1) return -EBUSY;     /* rien de prêt (slot silencieux) : la lib retente */
+  if (s->sl_fb[c].stat != 1) {
+    /* Rien de frais : on RE-SERT la dernière trame intégralement émise. Elle n'est plus en vol
+     * (notify_frame_done reçu) et le worker ne peut pas l'avoir reprise (stat=TENUE l'en exclut) →
+     * aucune écriture concurrente, aucune copie. L'époque est tenue, le pacing reste régulier.
+     * Pas encore de trame de tenue (démarrage) → -EBUSY comme avant : il n'y a rien à émettre. */
+    if (!s->sl_hold_valid) return -EBUSY;
+    *next_frame_idx = s->sl_hold_idx;
+    s->sl_hold_emitted++;                       /* trame RÉPÉTÉE : comptée, jamais silencieuse */
+    return 0;
+  }
   *next_frame_idx = c;
   s->sl_fb_cons = (uint16_t)((c + 1) % s->sl_fb_cnt);
   return 0;
 }
 
-/* lcore tasklet : trame émise → slot libre, réveil du worker. */
+/* lcore tasklet : trame émise → la trame qui vient de partir devient la TRAME DE TENUE (elle sera
+ * re-servie si la suivante n'est pas prête), et la tenue PRÉCÉDENTE est rendue au worker. Une seule
+ * trame est ainsi immobilisée en permanence — d'où l'anneau porté à 4 slots, pour que le worker en
+ * garde 3 comme avant. Un re-service de la tenue rappelle ce callback avec le MÊME index : on ne
+ * touche alors à rien (elle reste tenue, ses lines_ready restent complètes). */
 static int tx_sl_frame_done(void* priv, uint16_t frame_idx, struct st20_tx_frame_meta* meta) {
   struct sess* s = priv; (void)meta;
-  s->sl_fb[frame_idx].lines_ready = 0;
-  s->sl_fb[frame_idx].stat = 0;
+  if (s->sl_hold_valid && frame_idx == s->sl_hold_idx) {
+    s->sl_wedge_log_ns = 0; s->sl_wedge_log_n = 0;
+    pthread_mutex_lock(&s->sl_mx);
+    pthread_cond_signal(&s->sl_cv);
+    pthread_mutex_unlock(&s->sl_mx);
+    return 0;                                   /* rejeu de la tenue : rien à libérer */
+  }
+  if (s->sl_hold_valid) {                       /* l'ancienne tenue redevient disponible */
+    s->sl_fb[s->sl_hold_idx].lines_ready = 0;
+    s->sl_fb[s->sl_hold_idx].stat = 0;
+  }
+  s->sl_hold_idx = frame_idx; s->sl_hold_valid = 1;
+  s->sl_fb[frame_idx].stat = 2;                 /* TENUE : contenu complet, worker exclu */
   s->sl_wedge_log_ns = 0; s->sl_wedge_log_n = 0;   /* done reçu : session saine → réarme le throttle */
   pthread_mutex_lock(&s->sl_mx);
   pthread_cond_signal(&s->sl_cv);
@@ -1777,6 +1819,11 @@ static void* video_tx_slice_thread(void* arg) {
     if (statique && t->reader) {                /* on vient de perdre le câble → lâcher le reader */
       mxlReleaseFlowReader(g_mxl, t->reader); t->reader = NULL; fi_init = 0;
     }
+    /* HORLOGE DE SORTIE : la TRAME DE TENUE est immobilisée pour le rejeu — on ne la remplit jamais,
+     * et surtout on ne l'ATTEND pas (l'attendre déclencherait le watchdog anneau au bout de 2 s alors
+     * que le slot est retenu volontairement). L'anneau fait 4 slots : il en reste 3 au worker. */
+    if (s->sl_fb[s->sl_fb_prod].stat == 2)
+      s->sl_fb_prod = (uint16_t)((s->sl_fb_prod + 1) % s->sl_fb_cnt);
     /* attendre un framebuffer libre (la lib libère via notify_frame_done) */
     uint16_t idx = s->sl_fb_prod;
     if (s->sl_fb[idx].stat != 0) {
@@ -1832,6 +1879,10 @@ static void* video_tx_slice_thread(void* arg) {
           s->sl_fb[k].lines_ready = 0;
           s->sl_fb[k].stat = 0;
         }
+        /* Le resync REND TOUS les slots au worker : la trame de tenue n'en est plus une (elle
+         * pourrait être réécrite sous les pieds de la lib). Elle se reconstituera au prochain
+         * notify_frame_done. */
+        s->sl_hold_valid = 0;
         s->sl_fb_cons = s->sl_fb_prod;
         s->sl_wedge_ns = mono_ns();          /* ré-arme (resync fait) */
       }
@@ -1981,7 +2032,10 @@ static int setup_video_slice_tx(struct sess* s) {
   s->slotsize = (size_t)(s->bit_depth == 8 ? 2 : 4) * (size_t)s->width * (size_t)s->height;
   s->shm_slotsize = s->slotsize;
   pthread_mutex_init(&s->sl_mx, NULL); pthread_cond_init(&s->sl_cv, NULL);
-  s->sl_fb_cnt = 3; s->sl_fb_prod = 0; s->sl_fb_cons = 0;
+  /* 4 framebuffers, pas 3 : un slot reste immobilisé en permanence comme TRAME DE TENUE (horloge de
+   * sortie, cf. tx_sl_next_frame) → le worker en garde 3, exactement comme avant le correctif. */
+  s->sl_fb_cnt = 4; s->sl_fb_prod = 0; s->sl_fb_cons = 0;
+  s->sl_hold_valid = 0; s->sl_hold_emitted = 0;
 
   struct st20_tx_ops ops; memset(&ops, 0, sizeof(ops));
   ops.name = "bobi_mtl_vtx_sl";
@@ -2704,9 +2758,16 @@ static void write_stats(struct sess* reg, uint64_t last[][MAX_TG], uint64_t last
        * Δrecv que `rate`. Le lire après l'affectation donnerait 0 à tous les coups (last == recv),
        * donc fps_source = 0 en permanence — une sortie parfaitement alimentée serait affichée
        * « source à 0 image/s ». Une métrique fausse est pire que pas de métrique. */
-      uint64_t d_recv = t->recv - last[i][ti];
+      /* HORLOGE DE SORTIE : les trames émises par REJEU de la trame de tenue partent bien sur le fil
+       * mais ne passent pas par le worker (elles sont servies par le tasklet lcore) → il faut les
+       * AJOUTER au compteur de trames émises, sinon `fps` sous-estimerait la cadence RÉELLE du fil.
+       * Elles comptent aussi comme des répétitions : `fps_source` ne doit voir que les trames neuves.
+       * `sl_hold_emitted` n'a qu'un écrivain (le tasklet) et n'est lu qu'ici — pas de verrou. */
+      uint64_t emis = t->recv + (ti == 0 ? s->sl_hold_emitted : 0);
+      uint64_t reps = t->repeats + (ti == 0 ? s->sl_hold_emitted : 0);
+      uint64_t d_recv = emis - last[i][ti];
       double rate = dt > 0 ? (double)d_recv / dt : 0.0;
-      last[i][ti] = t->recv;
+      last[i][ti] = emis;
       /* Latence de réception (segment A) : moyenne de la fenêtre, en ms. -1 = pas d'échantillon
        * (TX, ou flux média sans timestamp) → sérialisé `null`. Reset du cumul à chaque fenêtre. */
       double rx_lat = t->lat_cnt ? (double)t->lat_sum / (double)t->lat_cnt / 1e6 : -1.0;
@@ -2718,17 +2779,17 @@ static void write_stats(struct sess* reg, uint64_t last[][MAX_TG], uint64_t last
       int is_video_tx = (s->kind == K_VIDEO && s->role == ROLE_TX);
       double fps_source = 0.0;
       if (is_video_tx) {
-        uint64_t d_rep  = t->repeats - last_repeats[i][ti];
+        uint64_t d_rep  = reps - last_repeats[i][ti];
         d_rep = d_rep > d_recv ? d_recv : d_rep;      /* garde-fou : jamais plus de reprises que de trames */
         fps_source = dt > 0 ? (double)(d_recv - d_rep) / dt : 0.0;
-        last_repeats[i][ti] = t->repeats;
+        last_repeats[i][ti] = reps;
       }
       /* fps_source/repeats : UNIQUEMENT cibles TX vidéo (cf. is_video_tx ci-dessus) — toute autre
        * cible (RX, audio, ANC) n'émet PAS ces champs. */
       char repbuf[64]; repbuf[0] = '\0';
       if (is_video_tx)
         snprintf(repbuf, sizeof(repbuf), ", \"fps_source\": %.1f, \"repeats\": %llu",
-                 fps_source, (unsigned long long)t->repeats);
+                 fps_source, (unsigned long long)reps);
       FILE* sf = fopen(t->stats_path, "w");
       if (sf) {
         char latbuf[32];
