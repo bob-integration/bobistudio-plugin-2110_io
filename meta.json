@@ -1,7 +1,14 @@
 {
-  "version": "0.78.0",
-  "date": "2026-07-28",
+  "version": "0.82.0",
+  "date": "2026-07-30",
   "changes": {
+    "Sorties 2110 : la mort silencieuse du mode tranche (0.81.0 + 0.82.0)": [
+      "Un slot TX CÂBLÉ mourait définitivement en ~40 s : plus rien sur le fil, insensible au décâblage, au retour de la source et au changement de port ; seul un redéploiement du moteur rétablissait l'émission. Cause : le worker du mode tranche publiait le framebuffer PRÊT avant de l'avoir rempli (lines_ready=0, stat=1), la lib pouvait s'en saisir vide, et ce slot devenait la trame de TENUE — re-servie sans une seule ligne à chaque époque.",
+      "0.82.0 — publication après la PREMIÈRE bande, avec barrière mémoire, comme le faisaient déjà les chemins statiques. Mesuré contre un EVS Neuron : PIT max 12 000-27 000 → 821, et les erreurs de séquence RTP s'arrêtent (74 / 45 s → 0).",
+      "0.81.0 — filet : une trame sans lignes prêtes ne peut plus devenir trame de tenue (compteur hold_empty_kept). Conserve la tenue précédente, périmée mais complète.",
+      "Instrumentation : l'état de l'anneau est publié dans les stats de cible TX (ring.prod/cons/hold, stat et lines_ready par slot). C'est ce qui a permis de nommer le défaut ; sans lui, deux correctifs livrés à l'aveugle avaient échoué.",
+      "RESTE : la cadence de contenu neuf plafonne à ~37,5 fps au lieu de 50 (une course subsiste, non fatale), et le profil d'émission wide laisse une sortie câblée à PIT ~2300 en régime permanent là où narrow tient 819-825 — bascule de réglage, pas de code."
+    ],
     "Les receivers AUDIO apparaissent enfin dans :8080 (0.78.0)": [
       "`receivers[]` n'énumérait que la vidéo et l'ANC. L'audio était pourtant bien servi — `rl` comptait 12 sessions RX pour 6 vidéo, les six flux MXL `*_audio_*` étaient écrits — mais aucun consommateur du contrat :8080 ne pouvait le savoir.",
       "Conséquence directe : le voyant de signal de la page Câbles affichait « pas de signal » sur des sorties audio parfaitement alimentées. Un indicateur qui se trompe dans le sens rassurant est pire que pas d'indicateur.",

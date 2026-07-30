@@ -689,6 +689,11 @@ struct sess {
   uint64_t sl_wedge_log_ns;    /* TX : throttle du log wedge — instant du dernier log émis (0 = session
                                 * saine, le prochain wedge logue en entier). Reset par tx_sl_frame_done. */
   uint32_t sl_wedge_log_n;     /* TX : resyncs wedge survenus depuis le dernier log émis (agrégat) */
+  uint64_t sl_hold_empty_kept; /* TX : promotions en tenue REFUSÉES parce que la trame était vide
+                                * (cf. tx_sl_frame_done). Non nul = la lib a émis un framebuffer
+                                * publié avant remplissage, et on vient d'éviter une sortie muette
+                                * définitive. Doit rester à 0 depuis 0.82.0 (publication après la
+                                * 1ʳᵉ bande) ; s'il grimpe, une autre fenêtre reste ouverte. */
   uint8_t* sl_scratch;         /* TX source 8-bit : bande planar10 up-shiftée avant pack SIMD */
 };
 
@@ -1832,6 +1837,34 @@ static int tx_sl_frame_done(void* priv, uint16_t frame_idx, struct st20_tx_frame
     pthread_mutex_unlock(&s->sl_mx);
     return 0;                                   /* rejeu de la tenue : rien à libérer */
   }
+  /* ★ NE JAMAIS PROMOUVOIR UNE TRAME VIDE EN TENUE — sortie muette DÉFINITIVE (banc 2026-07-29).
+   *
+   * MÉCANISME (corrigé après mesure — une première explication par le resync du watchdog était
+   * FAUSSE : le compteur ci-dessous grimpe à ~8/s alors qu'aucun resync ne se produit).
+   * Le worker du mode tranche publie le framebuffer PRÊT **avant** de l'avoir rempli — c'est le
+   * principe même du slice : `lines_ready = 0; stat = 1;` puis remplissage bande par bande, la lib
+   * émettant au fil des lignes. Il existe donc une fenêtre où un slot est READY avec ZÉRO ligne. Si
+   * la lib s'en saisit dans cette fenêtre, elle n'émet rien, rappelle notify_frame_done, et ce slot
+   * VIDE devenait la trame de tenue. Dès lors chaque époque re-servait une trame sans une seule
+   * ligne : plus rien sur le fil, les autres slots s'accumulaient pleins et jamais consommés.
+   * Définitif — ni décâblage, ni retour de la source, ni changement de port n'y changeaient rien ;
+   * seul un redéploiement du moteur rétablissait l'émission (~90 s de coupure du nœud).
+   * Signature instrumentée : ring.stat=[1,1,1,2] avec lines=[1080,1080,1080,0].
+   *
+   * La course est FRÉQUENTE (mesurée à ~8 fois par seconde pour 50 trames, soit ~16 %) : ce n'est
+   * pas un cas limite, c'est le régime normal du mode tranche. Ce qui était rare, c'est qu'elle
+   * tombe sur la promotion en tenue — et une seule suffisait à éteindre la sortie pour de bon.
+   *
+   * Une tenue périmée mais COMPLÈTE vaut infiniment mieux qu'une tenue fraîche mais vide : on garde
+   * l'ancienne et on rend le slot au worker, qui le remplira. */
+  if (!s->sl_fb[frame_idx].lines_ready) {
+    s->sl_fb[frame_idx].stat = 0;               /* rendue au worker, PAS promue */
+    s->sl_hold_empty_kept++;
+    pthread_mutex_lock(&s->sl_mx);
+    pthread_cond_signal(&s->sl_cv);
+    pthread_mutex_unlock(&s->sl_mx);
+    return 0;                                   /* la tenue précédente reste en place */
+  }
   if (s->sl_hold_valid) {                       /* l'ancienne tenue redevient disponible */
     s->sl_fb[s->sl_hold_idx].lines_ready = 0;
     s->sl_fb[s->sl_hold_idx].stat = 0;
@@ -2197,14 +2230,16 @@ static void* video_tx_slice_thread(void* arg) {
       uint32_t slh_r = (uint32_t)H / total_r; if (!slh_r) { slh_r = (uint32_t)H; total_r = 1; }
       size_t _gsr = (size_t)gi.grainSize;
       int src8_r = (_gsr > 0 && _gsr == (size_t)2 * (size_t)W * (size_t)H);
+      /* Même règle qu'au chemin nominal : PRÊT seulement quand il y a de quoi émettre (cf. la
+       * note détaillée plus bas). Publier à zéro ligne coûtait ici aussi PIT et erreurs de séquence. */
       s->sl_fb[idx].lines_ready = 0;
-      s->sl_fb[idx].stat = 1;
       s->sl_fb_prod = (uint16_t)((idx + 1) % s->sl_fb_cnt);
       for (uint16_t k = 1; k <= total_r; k++) {
         uint32_t l0 = (uint32_t)(k - 1) * slh_r;
         uint32_t nl = (k == total_r) ? (uint32_t)H - l0 : slh_r;
         sl_pack_band(s, pay, src8_r, l0, nl, fb);
         s->sl_fb[idx].lines_ready = l0 + nl;
+        if (k == 1) { __sync_synchronize(); s->sl_fb[idx].stat = 1; }
       }
       sl_note_fresh_pack(s, idx);                /* grain SOURCE réel (relu), éligible au repli répétition */
       t->recv++;                                /* trame (gelée) émise — fps reste nominal */
@@ -2224,9 +2259,19 @@ static void* video_tx_slice_thread(void* arg) {
               t->shm_path, _gs, (unsigned)total, (unsigned)slice_h, src8);
       t->dbg_depth_logged = 1;
     }
-    /* publier le framebuffer (remplissage progressif : la lib émettra au fil de lines_ready) */
+    /* ★ PUBLIER SEULEMENT QUAND IL Y A DE QUOI ÉMETTRE (banc 2026-07-29).
+     * On posait `stat = 1` AVANT la boucle de remplissage, donc avec lines_ready = 0. La lib peut
+     * se saisir du framebuffer dans cette fenêtre : elle n'a alors aucune ligne à envoyer. Mesuré
+     * en production sur un EVS Neuron : PIT max 12 000 à 27 000 (le récepteur refuse au-delà de
+     * 1500) et 74 erreurs de séquence RTP par 45 s, sur une sortie dont le DÉBIT était pourtant
+     * nominal — la même sortie sans producteur reste à 819 et zéro erreur. La course touche ~16 %
+     * des trames (mesurée à ~8/s pour 50), et coûtait aussi 8 fps de contenu neuf.
+     * Elle pouvait en outre être FATALE : une trame émise vide devenait la trame de tenue, et la
+     * sortie se taisait définitivement (cf. tx_sl_frame_done).
+     * On publie donc après la PREMIÈRE bande : la lib a de quoi commencer, et le remplissage
+     * progressif continue derrière — la latence sous-trame du mode tranche est préservée, on ne
+     * perd qu'une bande (1/30ᵉ de trame à 36 lignes). */
     s->sl_fb[idx].lines_ready = 0;
-    s->sl_fb[idx].stat = 1;
     s->sl_fb_prod = (uint16_t)((idx + 1) % s->sl_fb_cnt);
     int fully_fresh = 1;   /* faux si le producteur meurt EN COURS de trame (bande noire, cf. break) */
     for (uint16_t k = 1; k <= total && !s->stop; k++) {
@@ -2244,6 +2289,10 @@ static void* video_tx_slice_thread(void* arg) {
       uint32_t nl = (k == total) ? (uint32_t)H - l0 : slice_h;
       sl_pack_band(s, pay, src8, l0, nl, fb);
       s->sl_fb[idx].lines_ready = l0 + nl;
+      /* Barrière AVANT publication, comme les chemins statiques (`contenu EN PLACE avant
+       * d'annoncer le slot prêt`) : sans elle l'écriture de la bande peut être réordonnée après
+       * le store de `stat`, et la lib émettrait du contenu non encore écrit. */
+      if (k == 1) { __sync_synchronize(); s->sl_fb[idx].stat = 1; }
     }
     /* n'alimenter le carrier QUE si la trame est intégralement réelle (pas de bande noire partielle
      * de secours) : sinon une répétition ailleurs dans l'anneau republierait une image mi-noire. */
@@ -3085,7 +3134,11 @@ static void write_stats(struct sess* reg, uint64_t last[][MAX_TG], uint64_t last
        * dans video_tx_slice_thread) n'est PAS « holding » : il n'a jamais eu de producteur à perdre,
        * c'est son fonctionnement nominal — traité à part, jamais via last_fresh_ns (qui ne concerne
        * que le chemin avec reader). */
-      char livebuf[256]; livebuf[0] = '\0';
+      /* 384 : le bloc `ring` (ci-dessous) s'ajoute à `srv` ; une troncature de snprintf produirait
+       * un JSON invalide que le contrôleur rejetterait EN SILENCE — la sortie paraîtrait alors sans
+       * métriques plutôt qu'en panne. Marge volontaire. */
+      char livebuf[384]; livebuf[0] = '\0';
+      char ringbuf[192]; ringbuf[0] = '\0';
       if (is_video_tx && s->slice_on) {
         int statique = (!t->shm_path[0] && t->static_frame[0]);
         int source_live, holding;
@@ -3097,6 +3150,27 @@ static void write_stats(struct sess* reg, uint64_t last[][MAX_TG], uint64_t last
                         (now_ns - t->last_fresh_ns) < 3 * s->sl_period_ns;
           holding = !source_live;
         }
+        /* ÉTAT DE L'ANNEAU — ajouté 2026-07-29 pour instrumenter le blocage du chemin par tranches
+         * (un slot CÂBLÉ meurt en ~40 s, un slot statique jamais ; mesuré au banc). Le journal du
+         * watchdog dit « 4/4 slots occupés » sans dire QUI les occupe : `stat` par slot (0=libre,
+         * 1=prêt/en vol, 2=tenue), `lines_ready` par slot, et les deux curseurs. Lecture seule de
+         * champs volatile déjà partagés entre le worker et le tasklet — aucune synchronisation
+         * ajoutée, aucune décision prise ici. */
+        char slots[64] = ""; char lignes[80] = "";
+        int nfb = (s->sl_fb_cnt > 0 && s->sl_fb_cnt <= SL_Q) ? s->sl_fb_cnt : SL_Q;
+        for (int k = 0; k < nfb; k++) {
+          char frag[20];
+          snprintf(frag, sizeof(frag), "%s%d", k ? "," : "", s->sl_fb[k].stat);
+          strncat(slots, frag, sizeof(slots) - strlen(slots) - 1);
+          snprintf(frag, sizeof(frag), "%s%u", k ? "," : "", s->sl_fb[k].lines_ready);
+          strncat(lignes, frag, sizeof(lignes) - strlen(lignes) - 1);
+        }
+        snprintf(ringbuf, sizeof(ringbuf),
+                 ", \"ring\": {\"prod\": %u, \"cons\": %u, \"hold\": %d, \"stat\": [%s]"
+                 ", \"lines\": [%s]}",
+                 (unsigned)s->sl_fb_prod, (unsigned)s->sl_fb_cons,
+                 s->sl_hold_valid ? (int)s->sl_hold_idx : -1, slots, lignes);
+
         /* + DIAGNOSTIC du service de trames : ce que le callback a rendu, par branche, et l'état
          * d'amorçage de la tenue. C'est ce qui permet de dire, quand une sortie se tait, si la lib
          * sollicite encore le callback et quelle branche il prend — au lieu de le deviner. Le TÉMOIN
@@ -3104,11 +3178,12 @@ static void write_stats(struct sess* reg, uint64_t last[][MAX_TG], uint64_t last
          * trame FRAÎCHE de plus (srv.fresh), publiée par le worker (cf. `morte`). */
         snprintf(livebuf, sizeof(livebuf),
                  ", \"source_live\": %s, \"holding\": %s, \"hold_ok\": %s"
-                 ", \"srv\": {\"fresh\": %llu, \"hold\": %llu, \"busy\": %llu}",
+                 ", \"srv\": {\"fresh\": %llu, \"hold\": %llu, \"busy\": %llu}%s, \"hold_empty_kept\": %llu",
                  source_live ? "true" : "false", holding ? "true" : "false",
                  s->sl_hold_valid ? "true" : "false",
                  (unsigned long long)s->srv_fresh, (unsigned long long)s->srv_hold,
-                 (unsigned long long)s->srv_busy);
+                 (unsigned long long)s->srv_busy, ringbuf,
+                 (unsigned long long)s->sl_hold_empty_kept);
       }
       FILE* sf = fopen(t->stats_path, "w");
       if (sf) {
