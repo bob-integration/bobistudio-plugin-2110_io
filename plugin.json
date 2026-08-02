@@ -14,7 +14,7 @@
   "split_io": true,
   "deploy_order": 0,
   "auto_provision": true,
-  "version": "0.78.0",
+  "version": "0.79.0",
   "adapts_input": true,
   "aggregate_fps": false,
   "description": "Receiver ST 2110 via Media Transport Library (MTL/DPDK, kernel-bypass). Réception st20p/st30p écrite en zéro-copie dans le ring shared memory par un binaire C natif (libmtl), exposé en NMOS IS-04/05. Variante haute performance de receiver_2110 (mêmes shm produits). Mode simulation par slot tant que la source n'est pas activée.",
@@ -142,5 +142,20 @@
     ],
     "mode": "hot-wire",
     "state_endpoint": "/state"
+  },
+  "resources": {
+    "signature_keys": [
+      "active_rx_count",
+      "active_tx_count",
+      "audio_count",
+      "anc_count",
+      "width",
+      "height",
+      "fps",
+      "scan",
+      "chroma",
+      "bit_depth",
+      "smpte_2022_7"
+    ]
   }
 }

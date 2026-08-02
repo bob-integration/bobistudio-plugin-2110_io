@@ -1,7 +1,11 @@
 {
-  "version": "0.83.0",
+  "version": "0.79.0",
   "date": "2026-08-02",
   "changes": {
+    "Paramètres déterminant le coût CPU déclarés (0.79.0)": [
+      "`resources.signature_keys` : nombre de sessions RX/TX/audio/ANC et format. L'étalonnage CPU (`app/etalonnage.py`) indexe ses profils sur ces clés au lieu de condenser TOUS les paramètres.",
+      "Sans cette déclaration, `rx_flows` et `rx_fmt` — réécrits depuis l'état runtime à chaque rattachement de flux — faisaient périmer le profil mesuré à chaque redémarrage du nœud, alors que le coût du moteur n'avait pas bougé d'un point."
+    ],
     "Le plafond à ~38 fps devient DIAGNOSTICABLE : la contre-pression de l'anneau est publiée (0.83.0)": [
       "Une sortie en mode tranche plafonne à ~37,5 fps de contenu neuf pour une source à 50, et rien ne permettait de dire POURQUOI : worker affamé par sa source, ou étranglé par l'aval ? Les deux hypothèses produisent le même symptôme, et aucune des deux n'est visible depuis l'extérieur.",
       "Le temps passé bloqué à attendre un slot d'anneau libre était pourtant déjà mesuré (`slot_wait_ns`), mais le calcul de `late` le remet à zéro à chaque trame — mesuré et aussitôt perdu. Deux compteurs l'ACCUMULENT désormais sur la fenêtre de stats et le publient dans les stats de cible TX : `slot_wait_ms` (temps cumulé) et `slot_wait_n` (nombre d'attentes).",
