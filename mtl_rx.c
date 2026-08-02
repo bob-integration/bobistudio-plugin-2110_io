@@ -451,6 +451,13 @@ struct target {
   uint64_t slot_wait_ns;   /* TX tranche : temps cumulé (ns) passé BLOQUÉ en attente d'un slot fb
                             * libre depuis le dernier feed — contre-pression de l'anneau (epoch-shift :
                             * la lib retient chaque trame `shift` plus tard), EXCLU du gap `late`. */
+  /* Les deux compteurs ci-dessous sont l'ACCUMULATION de `slot_wait_ns`, que le calcul de `late`
+   * remet à zéro à chaque trame. Sans eux, la contre-pression de l'anneau est mesurée mais
+   * INVISIBLE — et c'est précisément l'inconnue qui bloque le diagnostic du plafond à ~38 fps pour
+   * une source à 50 : worker affamé par la source, ou étranglé par l'anneau ? Publiés en
+   * `slot_wait_ms` / `slot_wait_n` (write_stats), remis à zéro à chaque fenêtre de stats. */
+  uint64_t slot_wait_cum_ns;
+  uint64_t slot_wait_cnt;
   uint64_t alive_ns;       /* TX (tous kinds) : dernier signe de vie du thread (get_frame OK ou
                             * attente de câblage). Figé session démarrée = queue TX morte (wedge). */
   int      dbg_depth_logged; /* TX vidéo : log one-shot grainSize/out_size/_src8 au 1er grain */
@@ -2135,7 +2142,12 @@ static void* video_tx_slice_thread(void* arg) {
       }
       pthread_mutex_unlock(&s->sl_mx);
       t->alive_ns = mono_ns();
-      t->slot_wait_ns += t->alive_ns - w0;   /* contre-pression anneau : pas un retard SOURCE */
+      {
+        uint64_t w = t->alive_ns - w0;
+        t->slot_wait_ns += w;              /* contre-pression anneau : pas un retard SOURCE */
+        t->slot_wait_cum_ns += w;          /* … et accumulation pour la publier (cf. champ) */
+        t->slot_wait_cnt++;
+      }
       continue;
     }
     s->sl_wedge_ns = 0;                      /* un slot s'est libéré : anneau vivant */
@@ -3137,7 +3149,7 @@ static void write_stats(struct sess* reg, uint64_t last[][MAX_TG], uint64_t last
       /* 384 : le bloc `ring` (ci-dessous) s'ajoute à `srv` ; une troncature de snprintf produirait
        * un JSON invalide que le contrôleur rejetterait EN SILENCE — la sortie paraîtrait alors sans
        * métriques plutôt qu'en panne. Marge volontaire. */
-      char livebuf[384]; livebuf[0] = '\0';
+      char livebuf[448]; livebuf[0] = '\0';
       char ringbuf[192]; ringbuf[0] = '\0';
       if (is_video_tx && s->slice_on) {
         int statique = (!t->shm_path[0] && t->static_frame[0]);
@@ -3178,12 +3190,18 @@ static void write_stats(struct sess* reg, uint64_t last[][MAX_TG], uint64_t last
          * trame FRAÎCHE de plus (srv.fresh), publiée par le worker (cf. `morte`). */
         snprintf(livebuf, sizeof(livebuf),
                  ", \"source_live\": %s, \"holding\": %s, \"hold_ok\": %s"
-                 ", \"srv\": {\"fresh\": %llu, \"hold\": %llu, \"busy\": %llu}%s, \"hold_empty_kept\": %llu",
+                 ", \"srv\": {\"fresh\": %llu, \"hold\": %llu, \"busy\": %llu}%s, \"hold_empty_kept\": %llu"
+                 ", \"slot_wait_ms\": %.1f, \"slot_wait_n\": %llu",
                  source_live ? "true" : "false", holding ? "true" : "false",
                  s->sl_hold_valid ? "true" : "false",
                  (unsigned long long)s->srv_fresh, (unsigned long long)s->srv_hold,
                  (unsigned long long)s->srv_busy, ringbuf,
-                 (unsigned long long)s->sl_hold_empty_kept);
+                 (unsigned long long)s->sl_hold_empty_kept,
+                 /* Temps passé bloqué à attendre un slot d'anneau pendant la fenêtre de stats.
+                  * Rapporté à la durée de la fenêtre, ça donne directement la part du temps où le
+                  * worker est étranglé par l'aval plutôt que par sa source. */
+                 t->slot_wait_cum_ns / 1e6, (unsigned long long)t->slot_wait_cnt);
+      t->slot_wait_cum_ns = 0; t->slot_wait_cnt = 0;
       }
       FILE* sf = fopen(t->stats_path, "w");
       if (sf) {

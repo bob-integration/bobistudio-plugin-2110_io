@@ -1,7 +1,13 @@
 {
-  "version": "0.82.0",
-  "date": "2026-07-30",
+  "version": "0.83.0",
+  "date": "2026-08-02",
   "changes": {
+    "Le plafond à ~38 fps devient DIAGNOSTICABLE : la contre-pression de l'anneau est publiée (0.83.0)": [
+      "Une sortie en mode tranche plafonne à ~37,5 fps de contenu neuf pour une source à 50, et rien ne permettait de dire POURQUOI : worker affamé par sa source, ou étranglé par l'aval ? Les deux hypothèses produisent le même symptôme, et aucune des deux n'est visible depuis l'extérieur.",
+      "Le temps passé bloqué à attendre un slot d'anneau libre était pourtant déjà mesuré (`slot_wait_ns`), mais le calcul de `late` le remet à zéro à chaque trame — mesuré et aussitôt perdu. Deux compteurs l'ACCUMULENT désormais sur la fenêtre de stats et le publient dans les stats de cible TX : `slot_wait_ms` (temps cumulé) et `slot_wait_n` (nombre d'attentes).",
+      "Rapporté à la durée de la fenêtre, `slot_wait_ms` donne directement la part du temps où le worker est étranglé par l'anneau plutôt que par sa source. C'est la mesure qui manquait pour trancher — et le motif est le même qu'en 0.81/0.82, où c'est l'instrumentation de l'anneau qui avait permis de nommer le défaut après deux correctifs livrés à l'aveugle.",
+      "Le tampon JSON des stats live passe de 384 à 448 octets pour absorber les deux champs. La marge reste volontaire : une troncature produirait un JSON invalide que le contrôleur rejetterait EN SILENCE, et la sortie paraîtrait sans métriques plutôt qu'en panne."
+    ],
     "Sorties 2110 : la mort silencieuse du mode tranche (0.81.0 + 0.82.0)": [
       "Un slot TX CÂBLÉ mourait définitivement en ~40 s : plus rien sur le fil, insensible au décâblage, au retour de la source et au changement de port ; seul un redéploiement du moteur rétablissait l'émission. Cause : le worker du mode tranche publiait le framebuffer PRÊT avant de l'avoir rempli (lines_ready=0, stat=1), la lib pouvait s'en saisir vide, et ce slot devenait la trame de TENUE — re-servie sans une seule ligne à chaque époque.",
       "0.82.0 — publication après la PREMIÈRE bande, avec barrière mémoire, comme le faisaient déjà les chemins statiques. Mesuré contre un EVS Neuron : PIT max 12 000-27 000 → 821, et les erreurs de séquence RTP s'arrêtent (74 / 45 s → 0).",
