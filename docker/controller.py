@@ -445,6 +445,16 @@ def _port_profile_effectif(ifn):
                  and _profs_env[IFACES.index(ifn)] in ("narrow", "narrow_linear", "wide"))
     return demande if explicite else "wide"
 
+
+# Classe 2110-21 → jeton `TP=` du SDP (ST 2110-21 §7). UNE seule table, pour que la session et la
+# déclaration ne puissent plus diverger.
+_TP_SDP = {"narrow": "2110TPN", "narrow_linear": "2110TPNL", "wide": "2110TPW"}
+
+
+def _tp_sdp(ifn):
+    """Jeton `TP=` à annoncer pour une sortie émise sur le port `ifn` (vide → port primaire)."""
+    return _TP_SDP.get(_port_profile_effectif(ifn or (IFACES[0] if IFACES else "")), "2110TPW")
+
 # Ports encore sur le chemin kernel/AF-XDP : SEULS concernés par la plomberie kernel (purge XDP,
 # ntuple, restriction RSS PTP, contrôle d'IP). Un port dpdk n'a PLUS d'iface kernel (vfio-pci) —
 # toute commande ip/ethtool y échouerait — et MTL y gère lui-même ses joins IGMP (PMD DPDK :
@@ -2602,10 +2612,15 @@ def _tx_sdp(i, t):
     # TCS/RANGE : optionnels selon ST 2110-20 mais plusieurs récepteurs Blackmagic refusent de
     # locker un flux dont le SDP ne les déclare pas explicitement (repli implicite ambigu côté
     # device). Valeurs par défaut de la norme (SDR / NARROW) déclarées en toutes lettres.
+    # TP (classe 2110-21) : DÉDUIT du port de sortie, jamais écrit en dur. C'était le cas jusqu'en
+    # 0.80.0 — `TP=2110TPN` littéral dans la chaîne de format — et la classe réellement appliquée à
+    # la session (`ops.transport_pacing`) vivait ailleurs : rien ne reliait les deux. On pouvait
+    # donc émettre en wide en annonçant narrow, ce qui est précisément la promesse que le récepteur
+    # fait payer. La même valeur alimente maintenant la session ET la déclaration.
     fmtp  = ("sampling=YCbCr-4:2:2; width={w}; height={h}; exactframerate={fr}; depth=10; "
              "{scan}TCS=SDR; colorimetry=BT709; RANGE=NARROW; "
-             "PM=2110GPM; SSN=ST2110-20:2017; TP=2110TPN;").format(
-             w=w, h=h, fr=fr, scan=scan)
+             "PM=2110GPM; SSN=ST2110-20:2017; TP={tp};").format(
+             w=w, h=h, fr=fr, scan=scan, tp=_tp_sdp(t.get("iface") or ""))
     dual = bool(t.get("mcast2") and t.get("udp_port2"))
     # SSRC fixe (même valeur que ops.port.ssrc côté mtl_rx, cf. _tx_session) : certains récepteurs
     # (Blackmagic) valident le SSRC des paquets RTP contre le a=ssrc annoncé et rejettent le flux
@@ -2667,12 +2682,12 @@ def _anc_sdp(i, t):
         "{mid}"
         "{sfilter}"
         "a=rtpmap:{pt} smpte291/90000\r\n"
-        "a=fmtp:{pt} TP=2110TPN; SSN=ST2110-40:2018;\r\n"
+        "a=fmtp:{pt} TP={tp}; SSN=ST2110-40:2018;\r\n"
         "{refclk}"
         "a=mediaclk:direct=0\r\n"
         "{ssrc}"
     ).format(port=int(t.get("anc_port") or 0), pt=pt,
-             mcast=t.get("anc_mcast") or "0.0.0.0",
+             mcast=t.get("anc_mcast") or "0.0.0.0", tp=_tp_sdp(t.get("iface") or ""),
              sfilter=_sf_line(t.get("anc_mcast"), sip),
              refclk=_LOCALMAC_REFCLK, ssrc=ssrc_line,
              mid="a=mid:PRIMARY\r\n" if dual else "")
@@ -2686,11 +2701,12 @@ def _anc_sdp(i, t):
             "a=mid:SECONDARY\r\n"
             "{sfilter}"
             "a=rtpmap:{pt} smpte291/90000\r\n"
-            "a=fmtp:{pt} TP=2110TPN; SSN=ST2110-40:2018;\r\n"
+            "a=fmtp:{pt} TP={tp}; SSN=ST2110-40:2018;\r\n"
             "{refclk}"
             "a=mediaclk:direct=0\r\n"
             "{ssrc}"
         ).format(port=int(t["anc_port2"]), pt=pt, mcast=t["anc_mcast2"],
+                 tp=_tp_sdp(t.get("iface") or ""),
                  sfilter=_sf_line(t["anc_mcast2"], sip1),
                  refclk=_LOCALMAC_REFCLK, ssrc=ssrc_line)
         sdp += leg1

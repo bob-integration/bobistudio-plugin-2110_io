@@ -1,7 +1,13 @@
 {
-  "version": "0.80.0",
+  "version": "0.80.1",
   "date": "2026-08-04",
   "changes": {
+    "Le `TP=` du SDP était écrit en dur — la moitié du correctif 0.80.0 manquait (0.80.1)": [
+      "0.80.0 corrigeait la classe 2110-21 appliquée À LA SESSION (`ops.transport_pacing`), et le journal comme :8080 affichaient bien `wide`. Mais le SDP continuait d'annoncer `TP=2110TPN` : la chaîne est fabriquée par `controller.py` avec le jeton écrit LITTÉRALEMENT dans la chaîne de format, sans aucun lien avec la classe appliquée. Vérifié en production : session en wide, déclaration en narrow.",
+      "Les deux valeurs vivaient à des endroits différents et rien ne les reliait — on pouvait donc émettre selon une classe et en promettre une autre, ce qui est exactement la promesse que le récepteur fait payer.",
+      "Une table unique `classe → jeton` (`_TP_SDP`) alimente désormais la session ET la déclaration, pour la vidéo comme pour les deux SDP ANC (qui portaient aussi un `TP=2110TPN` en dur). Repli sur `2110TPW` : ne jamais promettre narrow par accident.",
+      "Mesuré la même nuit : passer la session de narrow à wide n'a RIEN changé au taux de perte du récepteur (0,0130 % → 0,0118 % sur la sortie la moins perturbée). Ce correctif rétablit la véracité du SDP ; il ne traite pas les bandes noires, dont la cause est ailleurs."
+    ],
     "Le SDP annonçait une régularité d'émission que la carte ne pouvait pas tenir (0.80.0)": [
       "La classe 2110-21 (`TP=2110TPN|TPNL|TPW` du SDP) n'était écrite dans le config du moteur que sur un nœud DPDK. Sur un nœud 100 % AF-XDP la clé était ABSENTE, et `mtl_rx` retombait sur son défaut `ST21_PACING_NARROW` : on annonçait `TP=2110TPN` — narrow — sans que personne ne l'ait décidé, et alors que le limiteur matériel de la carte, seule mécanique qui tient narrow, n'existe pas sur ce chemin.",
       "Un récepteur strict applique la fenêtre correspondant à ce qu'on annonce : la différence entre l'annonce et la réalité se paie chez lui, en paquets rejetés hors plage. Constaté sur le SNP de Horace : 136 millions de paquets « hors plage » sur un abonnement.",
