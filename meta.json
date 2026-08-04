@@ -1,7 +1,14 @@
 {
-  "version": "0.79.0",
-  "date": "2026-08-02",
+  "version": "0.80.0",
+  "date": "2026-08-04",
   "changes": {
+    "Le SDP annonçait une régularité d'émission que la carte ne pouvait pas tenir (0.80.0)": [
+      "La classe 2110-21 (`TP=2110TPN|TPNL|TPW` du SDP) n'était écrite dans le config du moteur que sur un nœud DPDK. Sur un nœud 100 % AF-XDP la clé était ABSENTE, et `mtl_rx` retombait sur son défaut `ST21_PACING_NARROW` : on annonçait `TP=2110TPN` — narrow — sans que personne ne l'ait décidé, et alors que le limiteur matériel de la carte, seule mécanique qui tient narrow, n'existe pas sur ce chemin.",
+      "Un récepteur strict applique la fenêtre correspondant à ce qu'on annonce : la différence entre l'annonce et la réalité se paie chez lui, en paquets rejetés hors plage. Constaté sur le SNP de Horace : 136 millions de paquets « hors plage » sur un abonnement.",
+      "La classe est désormais calculée depuis la CAPACITÉ RÉELLE du port (`_port_profile_effectif`) et écrite inconditionnellement : `wide` dès que le pacing matériel est absent, `narrow` conservé si le site l'a explicitement demandé via `PORT_PROFILES` — un site qui a mesuré sa régularité reste libre de l'annoncer.",
+      "Rendu OBSERVABLE : `nic.ports[].profile` (ce que le SDP annonce) et `nic.ports[].pacing_hw` (la mécanique est-elle là) sur :8080, plus une ligne par port au démarrage disant la classe retenue et, le cas échéant, pourquoi elle a été dégradée. Une annonce non tenable invisible dans les journaux est indétectable en exploitation — c'est ainsi qu'elle a survécu.",
+      "⚠ Le config d'un nœud AF-XDP n'est plus octet-identique à avant : c'est l'objet du correctif. REBUILD D'IMAGE requis (controller.py est dans l'image), puis redémarrage du moteur — les sessions TX sont recréées, donc coupure brève sur les sorties."
+    ],
     "Paramètres déterminant le coût CPU déclarés (0.79.0)": [
       "`resources.signature_keys` : nombre de sessions RX/TX/audio/ANC et format. L'étalonnage CPU (`app/etalonnage.py`) indexe ses profils sur ces clés au lieu de condenser TOUS les paramètres.",
       "Sans cette déclaration, `rx_flows` et `rx_fmt` — réécrits depuis l'état runtime à chaque rattachement de flux — faisaient périmer le profil mesuré à chaque redémarrage du nœud, alors que le coût du moteur n'avait pas bougé d'un point."

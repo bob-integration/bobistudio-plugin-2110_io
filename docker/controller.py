@@ -417,8 +417,33 @@ def _port_bdf(ifn):
     return PORT_BDFS[IFACES.index(ifn)] if ifn in IFACES else ""
 
 def _port_profile(ifn):
-    """Classe 2110-21 (profil d'émetteur) du port `ifn` : narrow|narrow_linear|wide (défaut narrow)."""
+    """Classe 2110-21 DEMANDÉE pour le port `ifn` : narrow|narrow_linear|wide (défaut narrow)."""
     return PORT_PROFILES[IFACES.index(ifn)] if ifn in IFACES else "narrow"
+
+
+def _pacing_materiel(ifn):
+    """Vrai si l'émission de ce port est cadencée par le LIMITEUR MATÉRIEL de la carte (RL).
+    C'est la seule mécanique qui permet de TENIR la classe narrow (cf. `_rl_is_active`)."""
+    return _port_pmd(ifn) == "dpdk" and _rl_is_active()
+
+
+def _port_profile_effectif(ifn):
+    """Classe 2110-21 RÉELLEMENT TENABLE par ce port — c'est ELLE qui part dans le SDP.
+
+    Le profil décide de ce qu'on ANNONCE au récepteur (`TP=2110TPN|TPNL|TPW`), et un récepteur
+    strict applique la fenêtre correspondante. Sans limiteur matériel (chemin AF-XDP), le pacing
+    est logiciel : on ne peut pas GARANTIR narrow, donc l'annoncer est une promesse qu'on ne tient
+    pas — c'est le récepteur qui paie la différence, en paquets rejetés hors plage.
+
+    Règle : `wide` dès que le pacing matériel est absent, SAUF si le site a explicitement demandé
+    une classe (PORT_PROFILES) — un site qui a mesuré sa régularité reste libre de déclarer narrow.
+    """
+    demande = _port_profile(ifn)
+    if _pacing_materiel(ifn):
+        return demande
+    explicite = (ifn in IFACES and IFACES.index(ifn) < len(_profs_env)
+                 and _profs_env[IFACES.index(ifn)] in ("narrow", "narrow_linear", "wide"))
+    return demande if explicite else "wide"
 
 # Ports encore sur le chemin kernel/AF-XDP : SEULS concernés par la plomberie kernel (purge XDP,
 # ntuple, restriction RSS PTP, contrôle d'IP). Un port dpdk n'a PLUS d'iface kernel (vfio-pci) —
@@ -1561,7 +1586,12 @@ class MetricsHandler(BaseHTTPRequestHandler):
                      # Sessions AF-XDP LIVE sur ce port (exact, fan-out compris) + plafond HW du port.
                      "active": _xdp_active_per_iface.get(_if, 0),
                      "hw_max_combined": (_hwq["max"] if _hwq else None),
-                     "primary": _if in _auto_ports}
+                     "primary": _if in _auto_ports,
+                     # Ce que le SDP de ce port ANNONCE, et si la mécanique qui le tient est là.
+                     # Sans ces deux champs, une déclaration non tenable n'est visible nulle part
+                     # (c'est ainsi qu'on a annoncé narrow en AF-XDP pendant des mois).
+                     "profile": _port_profile_effectif(_if),
+                     "pacing_hw": _pacing_materiel(_if)}
             if _is_dpdk:
                 # Clés ADDITIVES (les consommateurs actuels ignorent les clés inconnues) :
                 # budget="dpdk" = le plafond de files AF-XDP (16/48) est SANS OBJET sur ce port ;
@@ -2851,12 +2881,18 @@ def _write_config(sessions):
             tq = min(tq, RL_TX_QUEUES_CAP)
         _pe = {"iface": nic, "sip": SIPS[i] if i < len(SIPS) else "",
                "rx_queues": max(1, rq), "tx_queues": max(1, tq)}
-        # PMD par port (chantier DPDK) : clés émises SEULEMENT si ≥1 port dpdk sur le nœud →
-        # un nœud 100 % af_xdp produit un config OCTET-IDENTIQUE à avant (anti-régression).
+        # Classe 2110-21 : émise INCONDITIONNELLEMENT depuis 0.80.0. Auparavant la clé n'était
+        # écrite que sur un nœud dpdk ; un nœud 100 % AF-XDP n'en émettait AUCUNE et mtl_rx
+        # retombait sur son défaut `ST21_PACING_NARROW` → le SDP annonçait `TP=2110TPN` SANS que
+        # personne ne l'ait décidé, alors que le limiteur matériel — la seule mécanique qui tient
+        # narrow — était absent. On déclarait donc une régularité qu'on ne pouvait pas tenir.
+        # (Le config d'un nœud af_xdp n'est plus octet-identique à avant : c'est l'objet du
+        # correctif, et la valeur écrite est celle qui part dans le SDP.)
+        _pe["profile"] = _port_profile_effectif(nic)
+        # PMD par port (chantier DPDK) : clés émises SEULEMENT si ≥1 port dpdk sur le nœud.
         if _HAS_DPDK:
             _pe["pmd"] = _port_pmd(nic)
             _pe["bdf"] = _port_bdf(nic)
-            _pe["profile"] = _port_profile(nic)   # classe 2110-21 PAR PORT (#26 : ops.transport_pacing)
         ports.append(_pe)
         demand.append({"iface": nic, "rx_queues": d_rx, "tx_queues": d_tx})
     # Totaux (exposés :8080 xdp.allocated + réservation au lancement du daemon).
@@ -3825,6 +3861,20 @@ for _i in range(N_TX):
 
 print("2110_io (docker/af_xdp) multi-session : {}v iface={} lcores={} ring={}".format(
     N_VIDEO, IFACE, LCORES, V_RING), flush=True)
+
+# Classe 2110-21 annoncée par port : la tracer AU DÉMARRAGE, et dire quand elle est dégradée et
+# pourquoi. Une annonce non tenable qui ne se voit dans aucun journal est indétectable côté
+# exploitation — c'est exactement comment `TP=2110TPN` a survécu sur des nœuds sans limiteur.
+for _if in IFACES:
+    _eff = _port_profile_effectif(_if)
+    if _eff != _port_profile(_if):
+        print("2110-21 {} : classe ANNONCÉE ramenée à '{}' (demandée '{}') — pas de limiteur "
+              "matériel sur ce port (pmd={}, pacing={}), narrow ne serait pas tenable".format(
+                  _if, _eff, _port_profile(_if), _port_pmd(_if),
+                  (os.environ.get("MTL_PACING") or "auto").strip().lower()), flush=True)
+    else:
+        print("2110-21 {} : classe annoncée '{}' (limiteur matériel : {})".format(
+            _if, _eff, "oui" if _pacing_materiel(_if) else "non"), flush=True)
 
 while True:
     time.sleep(3600)
