@@ -535,7 +535,7 @@ window.MXLPlugins["2110_io"] = {
     }
 
     // Barre « Sessions TX (RL) » — socle DPDK narrow : budget TX = sessions sur le rate-limiter
-    // matériel (cap RL par port, limite dure de la carte — DPDK_NARROW.md §7). `dropped` =
+    // matériel (cap RL par port, limite dure de la carte — docs/chantiers/DPDK_NARROW.md §7). `dropped` =
     // sessions au-delà du cap IGNORÉES par le moteur → badge SUR-CAPACITÉ. Identique io2110.js.
     function _rlBar(active, cap, dropped, scope){
       active  = Math.max(0, active || 0);

@@ -77,7 +77,7 @@ _tx_budget_warned = False
 # `patch_tm_hierarchy.py` (arbre TM ramifié, 0.39.6). Le patch attache jusqu'à
 # MT_MAX_RL_ITEMS=128 feuilles réparties sur P nœuds queue-group (P×8), la file de contrôle
 # comprise (nb_tx_q = tx_queues+1). Capacité RÉELLE mesurée au banc dl360-1 (2026-07-07,
-# loopback E810, DDP comms 1.3.63) = >8 confirmé, ≥16 senders RL tenus (cf. DPDK_NARROW.md
+# loopback E810, DDP comms 1.3.63) = >8 confirmé, ≥16 senders RL tenus (cf. docs/chantiers/DPDK_NARROW.md
 # §Capacité RL réelle E810). Bornage conservateur : la file de contrôle + marge.
 RL_TX_QUEUES_CAP = int(os.environ.get("RL_TX_QUEUES_CAP") or 63)
 _cpu_last_usec = None
@@ -159,7 +159,7 @@ def _nic_hw_queues(iface):
 _mtl_ports_cache = {"t": 0.0, "data": None}
 
 def _mtl_ports_read():
-    """Contrat /tmp/mtl_ports.json (cf. DPDK_NARROW.md) : stats I/O PAR PORT écrites toutes les
+    """Contrat /tmp/mtl_ports.json (cf. docs/chantiers/DPDK_NARROW.md) : stats I/O PAR PORT écrites toutes les
     ~2 s par le daemon mtl_rx (source mtl_get_port_stats — compteurs CUMULÉS). Remplace
     ethtool -S pour un port en PMD DPDK (l'iface kernel a disparu en vfio). Cache court.
     Renvoie {"ts":…, "ports":[…]} ou None (daemon pas encore lancé / fichier absent)."""
@@ -379,7 +379,7 @@ for _i, _if in enumerate(IFACES):
 if SIPS:
     SIPS[0] = SIP or SIPS[0]
 
-# ── PMD PAR PORT (chantier DPDK, cf. DPDK_NARROW.md) ── `PORT_PMDS`/`PORT_BDFS` = CSV alignés
+# ── PMD PAR PORT (chantier DPDK, cf. docs/chantiers/DPDK_NARROW.md) ── `PORT_PMDS`/`PORT_BDFS` = CSV alignés
 # sur IFACES, émis par l'orchestrateur SEULEMENT si ≥1 port est en vfio-pci (node_interfaces.pmd
 # ='dpdk', BDF dans PORT_BDFS). Absents → tous les ports en af_xdp → STRICTEMENT iso-comportement
 # (règle anti-régression n°1 : tout le code dpdk est gaté par `_port_pmd(...) == "dpdk"`).
@@ -1610,7 +1610,7 @@ class MetricsHandler(BaseHTTPRequestHandler):
                 _pent["bdf"] = _port_bdf(_if)
                 _pent["budget"] = "dpdk"
                 # Supervision socle narrow : sessions RL TX live / cap RL du port (la limite dure,
-                # cf. DPDK_NARROW.md §7) + sessions RX (files RSS dimensionnées à la demande).
+                # cf. docs/chantiers/DPDK_NARROW.md §7) + sessions RX (files RSS dimensionnées à la demande).
                 _pent["rl_tx_cap"] = RL_TX_QUEUES_CAP if _rl_is_active() else None
                 _pent["tx_sessions_active"] = _tx_active_per_iface.get(_if, 0)
                 _pent["rx_sessions_active"] = _rx_active_per_iface.get(_if, 0)
@@ -1636,7 +1636,7 @@ class MetricsHandler(BaseHTTPRequestHandler):
                             "hw_current_combined": hw_q["current"]       if hw_q else None,
                             "hw_xdp_available":    hw_q["xdp_available"] if hw_q else None},
                    # Socle DPDK narrow : le budget TX pertinent = sessions RL par port (cap
-                   # RL_TX_QUEUES_CAP, la limite dure de la carte — DPDK_NARROW.md §7), le RX = files
+                   # RL_TX_QUEUES_CAP, la limite dure de la carte — docs/chantiers/DPDK_NARROW.md §7), le RX = files
                    # RSS (rx_queues_alloc). tx_dropped = sessions demandées au-delà du cap, IGNORÉES
                    # par la boucle de réconciliation → sur-capacité à surfacer côté UI. Bloc émis
                    # inconditionnellement (active=False sur un nœud af_xdp/tsc → l'UI garde la barre
@@ -2889,7 +2889,7 @@ def _write_config(sessions):
         # Le cap ne concerne QUE le mécanisme RL (arbre TM) : tsc/tsc_narrow ne construisent AUCUNE
         # hiérarchie → JAMAIS bornés. On re-gate donc sur le pacing (narrow-wins : "rl"/"auto" =
         # RL device-wide sur E810 dpdk ; "tsc"/"tsc_narrow"/"tsn" = pas de cap). Nouveau plafond =
-        # capacité réelle du patch mesurée au banc (dl360-1 2026-07-07, cf. DPDK_NARROW.md), + la
+        # capacité réelle du patch mesurée au banc (dl360-1 2026-07-07, cf. docs/chantiers/DPDK_NARROW.md), + la
         # file de contrôle (nb_tx_q = tx_queues+1). Sans objet en AF_XDP (budget 48 files).
         _pacing = (os.environ.get("MTL_PACING") or "auto").strip().lower()
         _rl_active = _pacing in ("rl", "auto")   # auto → RL sur port E810 dpdk (TM supporté)
@@ -3550,7 +3550,7 @@ def _simu_loop(idx):
                             # receiver. Ces clés N'EXISTENT que si TIMING_PARSER=1 (mtl_rx les écrit) :
                             # un moteur 2110_io normal (parser off) ne les a pas → receiver inchangé.
                             # Verdict `compliant` ABSOLU fiable seulement avec PTP ; sans grandmaster,
-                            # lire Cinst + vrx_span (invariants à la dérive, cf. PROBE_2110.md).
+                            # lire Cinst + vrx_span (invariants à la dérive, cf. docs/reference/PROBE_2110.md).
                             for _tk in ("compliant", "failed_cause", "cinst_max", "cinst_avg",
                                         "vrx_max", "vrx_min", "vrx_avg", "vrx_span",
                                         "fpt", "latency", "late"):

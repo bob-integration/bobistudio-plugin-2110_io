@@ -1029,7 +1029,7 @@ else:
 # Un filet qui retente indéfiniment épuise donc les 64 files en quelques minutes, puis toutes les
 # sessions meurent pour de bon (`get new txq fail`) : le filet se sabotait lui-même.
 #
-# NB : ceci ré-explique a posteriori une observation déjà consignée (DPDK_NARROW.md §7) — « les
+# NB : ceci ré-explique a posteriori une observation déjà consignée (docs/chantiers/DPDK_NARROW.md §7) — « les
 # st20_tx_queue_fatal_error s'accumulent sous la rafale de commits RL → backstop TX FIGÉ → exit
 # (q33 à tx_q=34, q42 à tx_q=44) ; ce n'est PAS le mur des leaves RL ». C'était bien un épuisement
 # de files par quarantaine cumulative, mal attribué à l'époque.

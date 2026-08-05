@@ -3,7 +3,7 @@
 
 Empile des senders sur le VRAI moteur (`controller.py`), UN par UN, via le plan de contrôle
 `:8081/tx` (spec complète du sender) — le MÊME chemin que l'orchestrateur. Contrairement à
-`mtl_rx --config` en brut (banc 2026-07-10, cf. DPDK_NARROW.md §7), on ne balance PAS une rafale de
+`mtl_rx --config` en brut (banc 2026-07-10, cf. docs/chantiers/DPDK_NARROW.md §7), on ne balance PAS une rafale de
 `st20p_tx_create` : chaque activation passe par le reconcile fichier + debounce du contrôleur, ce qui
 évite le commit-storm RL qui accumulait les `st20_tx_queue_fatal_error` → backstop « TX FIGÉ ».
 
@@ -21,7 +21,7 @@ le restent (aucun ne retombe à fps=0 : c'est la cascade de fatal_error).
     --lock-timeout). Le moteur RÉCUPÈRE (1-2 senders prouvés stables 50 fps / 2,23 Gb/s chacun), mais
     tous les senders blippent le temps du re-lock.
   → Un vrai banc capacité doit (i) nourrir les senders par de VRAIS flux MXL câblés (C, non Python) et
-    (ii) idéalement disposer d'un GM (re-lock PTP quasi instantané). CF. DPDK_NARROW.md §7.
+    (ii) idéalement disposer d'un GM (re-lock PTP quasi instantané). CF. docs/chantiers/DPDK_NARROW.md §7.
 Cet outil reste utile pour VALIDER 1-2 senders propres et OBSERVER la dynamique fatal_error/relance.
 
 PRÉREQUIS conteneur : lancer le moteur avec TX_COUNT et ACTIVE_TX_COUNT ≥ --max (sinon les slots

@@ -40,7 +40,7 @@
 # successifs d'un cold-batch) → rte_pktmbuf_alloc_bulk échoue pour toujours (build ret -207)
 # → le hang detector natif (video_trs_burst_fail) ne vit que dans le chemin burst, jamais
 # atteint puisqu'un builder en échec d'alloc ne construit aucun paquet → mort SILENCIEUSE,
-# invisible aussi du filet builder (patch_tx_builder_famine_recovery, étage 0 TX_LAYOUTS.md)
+# invisible aussi du filet builder (patch_tx_builder_famine_recovery, étage 0 docs/reference/TX_LAYOUTS.md)
 # qui la guérit après coup mais ne l'empêche pas.
 #
 # ── Le patch : rendez-vous burst/config par compteur atomique per-port ─────────────────────────

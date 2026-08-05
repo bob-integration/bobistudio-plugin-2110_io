@@ -5,7 +5,7 @@
 # Patch bobi.studio libmtl 0.50.0 — LA FUITE DE MBUFS AU COMMIT TM, À LA SOURCE.
 #
 # ── Ce que ce patch corrige (et où la fuite était VRAIMENT) ────────────────────────────────────
-# Hypothèse de chantier (TX_LAYOUTS.md, étage 4) : « le stop de port du commit TM perd les mbufs
+# Hypothèse de chantier (docs/reference/TX_LAYOUTS.md, étage 4) : « le stop de port du commit TM perd les mbufs
 # postés dans les descripteurs TX sans les libérer (memset de ice_reset_tx_queue) ». Cette
 # hypothèse est FAUSSE sur DPDK 26.03 (la version buildée dans cette image) :
 #   drivers/net/intel/ice/ice_rxtx.c:1196  ci_txq_release_all_mbufs(txq, false);   <-- FREE

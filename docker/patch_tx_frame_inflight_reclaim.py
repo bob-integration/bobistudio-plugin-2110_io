@@ -30,7 +30,7 @@
 # 2. Le commit TM (`rte_tm_hierarchy_commit` d'une AUTRE session) stoppe le PORT ENTIER ;
 #    `ice_reset_tx_queue` memset le sw_ring SANS free → les mbufs déjà postés dans les
 #    descripteurs TX sont PERDUS sans être libérés. C'est la MÊME fuite qui vide les mempools
-#    (-207, cf. TX_LAYOUTS.md « cause première de la vidange » : pools d'origine alloués et vides).
+#    (-207, cf. docs/reference/TX_LAYOUTS.md « cause première de la vidange » : pools d'origine alloués et vides).
 # 3. Conséquence côté trames : la ref extbuf de ces mbufs perdus n'est JAMAIS rendue ⇒
 #    `tv_frame_free_cb` n'est JAMAIS appelé ⇒ `frame->refcnt` reste à 1 **POUR TOUJOURS** ⇒ le
 #    framebuffer n'est JAMAIS rendu à l'app. L'app (mtl_rx.c) n'a plus de slot libre à remplir,
