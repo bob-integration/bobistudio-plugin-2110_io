@@ -1,7 +1,10 @@
 {
-  "version": "0.80.1",
-  "date": "2026-08-04",
+  "version": "0.80.2",
+  "date": "2026-08-06",
   "changes": {
+    "SDP : la profondeur annoncée est celle réellement émise (0.80.2)": [
+      "`depth=10` était écrit EN DUR dans la chaîne de format du fmtp vidéo — le dernier littéral de format du SDP, juste au-dessus du `TP=2110TPN` corrigé en 0.80.1. Constaté à Horace le 2026-08-06 : le site est câblé en 8 bits de bout en bout (les deux murs et les cinq shards du tissu en `bit_depth=8`, les deux sessions TX du moteur en `BIT_DEPTH=8`) et le SDP annonçait pourtant `depth=10`. En 4:2:2 le groupe de 2 pixels pèse 4 octets en 8 bits contre 5 en 10 bits : un récepteur qui CROIT la déclaration attend 25 % de données en plus par trame et ne peut que se tromper — mal parser, refuser le flux, ou compter la différence en paquets manquants. Le SNP du site déduit la structure réelle des paquets et tolère l'écart, mais c'est de la chance, pas de la conformité. ★ La valeur vient désormais de `t[\"bd\"]`, celle qui configure la session mtl_rx : la même valeur alimente la SESSION et la DÉCLARATION, comme pour `TP=`. Reste de la même famille, non corrigé faute de plomberie : `sampling=YCbCr-4:2:2` est aussi un littéral, et la session TX ne transporte pas de `chroma` — inoffensif sur un site 4:2:2, à reprendre si un flux non-422 apparaît."
+    ],
     "Le `TP=` du SDP était écrit en dur — la moitié du correctif 0.80.0 manquait (0.80.1)": [
       "0.80.0 corrigeait la classe 2110-21 appliquée À LA SESSION (`ops.transport_pacing`), et le journal comme :8080 affichaient bien `wide`. Mais le SDP continuait d'annoncer `TP=2110TPN` : la chaîne est fabriquée par `controller.py` avec le jeton écrit LITTÉRALEMENT dans la chaîne de format, sans aucun lien avec la classe appliquée. Vérifié en production : session en wide, déclaration en narrow.",
       "Les deux valeurs vivaient à des endroits différents et rien ne les reliait — on pouvait donc émettre selon une classe et en promettre une autre, ce qui est exactement la promesse que le récepteur fait payer.",

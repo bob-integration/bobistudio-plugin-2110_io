@@ -2617,10 +2617,21 @@ def _tx_sdp(i, t):
     # la session (`ops.transport_pacing`) vivait ailleurs : rien ne reliait les deux. On pouvait
     # donc émettre en wide en annonçant narrow, ce qui est précisément la promesse que le récepteur
     # fait payer. La même valeur alimente maintenant la session ET la déclaration.
-    fmtp  = ("sampling=YCbCr-4:2:2; width={w}; height={h}; exactframerate={fr}; depth=10; "
+    # depth : la PROFONDEUR RÉELLEMENT ÉMISE (`t["bd"]`, celle de la session mtl_rx), jamais une
+    # constante. C'était `depth=10` littéral jusqu'en 0.80.2 — sur un site câblé en 8 bits de bout
+    # en bout (murs en bit_depth=8, sessions TX en BIT_DEPTH=8) le SDP annonçait donc du 10 bits
+    # qu'on n'émettait pas. En 4:2:2 le groupe de 2 pixels pèse 4 octets en 8 bits contre 5 en
+    # 10 bits : un récepteur qui CROIT la déclaration attend 25 % de données en plus par trame et
+    # ne peut que se tromper — mal parser, refuser le flux, ou compter la différence en paquets
+    # manquants. Constaté à Horace le 2026-08-06 ; ce récepteur-là déduit la structure réelle des
+    # paquets et tolère l'écart, mais c'est de la chance, pas de la conformité.
+    # Même défaut, même correctif que `TP=` juste en dessous : la valeur qui alimente la SESSION
+    # alimente la DÉCLARATION.
+    bd = int(t.get("bd") or BIT_DEPTH)
+    fmtp  = ("sampling=YCbCr-4:2:2; width={w}; height={h}; exactframerate={fr}; depth={bd}; "
              "{scan}TCS=SDR; colorimetry=BT709; RANGE=NARROW; "
              "PM=2110GPM; SSN=ST2110-20:2017; TP={tp};").format(
-             w=w, h=h, fr=fr, scan=scan, tp=_tp_sdp(t.get("iface") or ""))
+             w=w, h=h, fr=fr, bd=bd, scan=scan, tp=_tp_sdp(t.get("iface") or ""))
     dual = bool(t.get("mcast2") and t.get("udp_port2"))
     # SSRC fixe (même valeur que ops.port.ssrc côté mtl_rx, cf. _tx_session) : certains récepteurs
     # (Blackmagic) valident le SSRC des paquets RTP contre le a=ssrc annoncé et rejettent le flux
