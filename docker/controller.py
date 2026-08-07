@@ -2239,10 +2239,17 @@ def _parse_sdp_anc(path):
         info["mcast2"], info["port2"] = leg2
     return info
 
-def _anc_session(idx, info, iface=IFACE):
-    """Session RX ANC st40 → /dev/shm/{hn}_anc_{idx} (meta+udw sérialisés par mtl_rx)."""
+def _anc_session(idx, info, iface=IFACE, fps=None):
+    """Session RX ANC st40 → /dev/shm/{hn}_anc_{idx} (meta+udw sérialisés par mtl_rx).
+
+    `fps` = cadence de la VIDÉO du même slot. Elle sert de `grain_rate` au flux MXL et de grille
+    TAI (`s->mrate` dans mtl_rx). On ne la transmettait PAS : le moteur retombait alors sur son
+    littéral `jdbl(j, "fps", 25.0)`, pensé pour le pacing d'ÉMISSION, et le flux ANC d'une entrée
+    1080p50 était annoncé — et cadencé — à 25/1. Mesuré le 2026-08-07 : vidéo 50,0 grains/s,
+    ANC 25,2. L'ANC d'une entrée suit la cadence de SA vidéo, pas une constante."""
     return _leg2({"kind": "data", "role": "rx", "iface": iface,
             "mcast": info["mcast"], "udp_port": info["port"], "payload_type": info["pt"],
+            "fps": float(fps) if fps else FPS,
             "ring": 8, "hdr": HDR,
             "targets": [{"idx": idx, "shm": "/dev/shm/{}_anc_{}".format(HOSTNAME, idx),
                          "stats": "/tmp/mtl_anc{}.json".format(idx)}]},
@@ -3353,6 +3360,15 @@ def _manager_loop():
                     del groups[key]
 
         sessions = [_video_session(g["info"], g["idxs"], _rx_iface(g["idxs"][0])) for g in groups.values()]
+        # Cadence VIDÉO par slot, pour les sessions ANC : l'ANC d'une entrée est la donnée
+        # ancillaire de SA vidéo, elle doit tourner sur la même grille. Construit après la
+        # finalisation de `groups` (des entrées ont pu en être retirées juste au-dessus).
+        _fps_slot = {}
+        for g in groups.values():
+            _f = (g.get("info") or {}).get("fps")
+            if _f:
+                for _i in g["idxs"]:
+                    _fps_slot[_i] = float(_f)
         active = set(t["idx"] for s in sessions if s["kind"] == "video" for t in s["targets"])
         for idx in range(N_VIDEO):
             _live[idx] = idx in active
@@ -3377,7 +3393,8 @@ def _manager_loop():
             dpath = "{}/nmos_recv_anc_{}.sdp".format(SDP_DIR, idx)
             dinfo = _parse_sdp_anc(dpath) if os.path.exists(dpath) else None
             if dinfo:
-                sessions.append(_anc_session(idx, dinfo, _rx_iface(idx)))
+                sessions.append(_anc_session(idx, dinfo, _rx_iface(idx),
+                                             fps=_fps_slot.get(idx)))
 
         # Sessions TX : un slot émet s'il est activé, a une destination et un shm d'entrée câblé.
         # Plafonné à ACTIVE_TX_C (budget de queues partagé RX+TX) — les slots provisionnés au-delà
