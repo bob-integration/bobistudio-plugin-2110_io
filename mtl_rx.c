@@ -1565,12 +1565,60 @@ static void tx_reopen_if_stale(struct target* t, uint64_t idx, uint64_t tnow) {
 
 /* Dernier grain dispo (NON bloquant) → 0 + (gi,payload), ou -1. Flux recréé (producteur redéployé)
  * → libère le reader pour forcer une recréation au tour suivant. */
+/* ─── Lecture du grain SOURCE d'un TX vidéo trame-entière (0.80.3) ───────────────────────────────
+ * ★ VISER LE GRAIN SUIVANT ET L'ATTENDRE, au lieu d'attraper la tête à l'instant du tour.
+ *
+ * Avant : `GetRuntimeInfo` puis `GetGrainNonBlocking(rt.headIndex)` — on prenait ce qui traînait, à
+ * l'instant du tour d'émission. Or deux horloges à 50 Hz sont en jeu (le commit du producteur MXL et
+ * le tour d'émission libmtl) et leur phase relative DÉRIVE lentement. Quand le tour tombe PENDANT le
+ * commit du producteur, la tête n'a pas encore avancé → on relit le MÊME grain (répétition VISIBLE)
+ * et au tour suivant la tête a avancé de deux → le grain intermédiaire est JETÉ, jamais émis.
+ *
+ * Mesuré à Horace les 6-7 août, cinq épisodes sur deux murs indépendants :
+ *   • déclenchement à la MÊME phase à chaque fois — +0,062 grain (1,24 ms après une frontière),
+ *     constant à 0,009 grain près (180 µs) sur 11 h et deux murs ;
+ *   • 40 à 46 min par épisode, 13 à 16 trames rejouées/s au pic, récurrence ~6 h par mur ;
+ *   • le producteur, lui, écrivait une suite d'index PARFAITE : zéro anomalie sur 1905 relevés
+ *     pendant une montée, même phase de commit que le mur témoin. Ce n'est pas lui.
+ *   • `fps_source = fps − répétitions/s` vérifié au centième → chaque répétition = un grain perdu.
+ *
+ * Après : on vise `tx_src_idx + 1` (le grain qu'on n'a pas encore émis) et on l'ATTEND avec
+ * `mxlFlowReaderGetGrain`, qui rend dès le commit. Coût : le résidu de commit, quelques ms, et
+ * seulement quand le tour tombe dans la fenêtre. AUCUNE latence permanente, AUCUN grain jeté.
+ * (`head − 1` aurait donné 20 ms de marge — mais 20 ms de latence sur CHAQUE trame : exclu.)
+ *
+ * Deux propriétés du code d'origine sont conservées, et elles sont essentielles :
+ *   1. RATTRAPAGE — au-delà de TX_CATCHUP_MAX grains de retard (ou si notre index est devant la
+ *      tête, ce qui arrive après une réouverture), on saute à la tête. Jamais à la traîne.
+ *   2. REPLI — si le grain visé ne vient pas dans le budget (producteur en retard ou mort), on relit
+ *      la tête en non bloquant, c'est-à-dire l'ANCIEN comportement. Ne JAMAIS renvoyer -1 sur une
+ *      simple attente expirée : l'appelant émettrait un `memset` — une trame NOIRE. Une répétition
+ *      vaut toujours mieux qu'un noir.
+ * Le correctif ne peut donc que faire mieux que l'ancien code, jamais pire.
+ */
+#define TX_WAIT_GRAIN_NS  5000000ULL   /* 5 ms : couvre la fenêtre de commit mesurée (~3 ms) en
+                                        * laissant 15 ms des 20 ms de budget de trame. */
+#define TX_CATCHUP_MAX    3            /* au-delà, on saute à la tête plutôt que rejouer l'histoire */
+
 static int reader_latest(struct target* t, mxlGrainInfo* gi, uint8_t** payload) {
   mxlFlowRuntimeInfo rt;
   mxlStatus st = mxlFlowReaderGetRuntimeInfo(t->reader, &rt);
   if (st == MXL_STATUS_OK && rt.headIndex != MXL_UNDEFINED_INDEX) {
-    st = mxlFlowReaderGetGrainNonBlocking(t->reader, rt.headIndex, gi, payload);
+    uint64_t cible = rt.headIndex;
+    if (t->tx_src_idx_init) {
+      uint64_t suivant = t->tx_src_idx + 1;
+      /* écart > 0 : on est en retard sur la tête ; == -1 : le suivant n'est pas encore publié
+       * (cas NOMINAL quand le producteur est en train de le commiter) → c'est lui qu'on attend. */
+      int64_t ecart = (int64_t)rt.headIndex - (int64_t)suivant;
+      if (ecart >= -1 && ecart <= TX_CATCHUP_MAX) cible = suivant;
+    }
+    st = mxlFlowReaderGetGrain(t->reader, cible, TX_WAIT_GRAIN_NS, gi, payload);
     if (st == MXL_STATUS_OK) return 0;
+    /* Budget épuisé : REPLI sur l'ancien comportement (cf. propriété 2 ci-dessus). */
+    if (cible != rt.headIndex) {
+      st = mxlFlowReaderGetGrainNonBlocking(t->reader, rt.headIndex, gi, payload);
+      if (st == MXL_STATUS_OK) return 0;
+    }
   }
   if (st == MXL_ERR_FLOW_NOT_FOUND || st == MXL_ERR_FLOW_INVALID) {
     mxlReleaseFlowReader(g_mxl, t->reader); t->reader = NULL;
