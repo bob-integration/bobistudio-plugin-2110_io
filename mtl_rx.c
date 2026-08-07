@@ -2714,20 +2714,19 @@ static int decode_atc(struct st40_frame_info* f, char* out, int* df) {
     if (md->did != 0x60 || md->sdid != 0x60) continue;
     if (md->udw_size < 16) continue;
     const uint8_t* w = f->udw_buff_addr + md->udw_offset;   /* 1 octet = 1 UDW (low 8 bits) */
-    uint8_t b[8];
-    /* Quartets HAUTS : convention corrigée le 2026-08-07 (cf. bobimxl.anc_atc_encode). On lisait
-     * les quartets BAS ; une source tierce reçue en production plaçait le timecode dans les
-     * hauts, et la lecture basse rendait un timecode FIGÉ à 00:00:00:00 avec un bit qui
-     * clignotait. Relevé sur douze grains consécutifs : la lecture haute donne 00:00:04:00, :01,
-     * :02 … :09 puis le passage des dizaines. Les trois implémentations (ici, bobimxl, recorder)
-     * suivent la même convention — elles doivent changer ENSEMBLE. */
-    for (int i = 0; i < 8; i++)
-      b[i] = (uint8_t)(((w[i*2] >> 4) & 0x0f) | (((w[i*2+1] >> 4) & 0x0f) << 4));
-    int frames  = (b[0] & 0x0f) + ((b[0] >> 4) & 0x03) * 10;
-    int seconds = (b[2] & 0x0f) + ((b[2] >> 4) & 0x07) * 10;
-    int minutes = (b[4] & 0x0f) + ((b[4] >> 4) & 0x07) * 10;
-    int hours   = (b[6] & 0x0f) + ((b[6] >> 4) & 0x03) * 10;
-    *df = (b[0] >> 6) & 0x01;
+    /* Disposition LTC : UN CHIFFRE BCD PAR QUARTET, dans le quartet HAUT de chaque UDW ; les
+     * UDW impairs portent les drapeaux. Deux erreurs successives corrigées le 2026-08-07 : on
+     * lisait les quartets BAS (timecode figé à 00:00:00:00, un bit qui clignotait), puis on a
+     * recollé deux quartets en un octet, ce qui PERDAIT LES DIZAINES D'IMAGES (00:01:05:21 lu
+     * 00:01:05:01) — invisible tant que le compteur restait sous dix. Miroir de
+     * bobimxl.anc_atc_encode ; les trois implémentations changent ENSEMBLE. */
+    uint8_t q[16];
+    for (int i = 0; i < 16; i++) q[i] = (uint8_t)((w[i] >> 4) & 0x0f);
+    int frames  = q[0]  + (q[2]  & 0x03) * 10;
+    int seconds = q[4]  + (q[6]  & 0x07) * 10;
+    int minutes = q[8]  + (q[10] & 0x07) * 10;
+    int hours   = q[12] + (q[14] & 0x03) * 10;
+    *df = (q[2] >> 2) & 0x01;
     snprintf(out, 16, "%02d:%02d:%02d%c%02d", hours, minutes, seconds, *df ? ';' : ':', frames);
     return 1;
   }
