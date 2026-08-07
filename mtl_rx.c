@@ -2715,7 +2715,14 @@ static int decode_atc(struct st40_frame_info* f, char* out, int* df) {
     if (md->udw_size < 16) continue;
     const uint8_t* w = f->udw_buff_addr + md->udw_offset;   /* 1 octet = 1 UDW (low 8 bits) */
     uint8_t b[8];
-    for (int i = 0; i < 8; i++) b[i] = (uint8_t)((w[i*2] & 0x0f) | ((w[i*2+1] & 0x0f) << 4));
+    /* Quartets HAUTS : convention corrigée le 2026-08-07 (cf. bobimxl.anc_atc_encode). On lisait
+     * les quartets BAS ; une source tierce reçue en production plaçait le timecode dans les
+     * hauts, et la lecture basse rendait un timecode FIGÉ à 00:00:00:00 avec un bit qui
+     * clignotait. Relevé sur douze grains consécutifs : la lecture haute donne 00:00:04:00, :01,
+     * :02 … :09 puis le passage des dizaines. Les trois implémentations (ici, bobimxl, recorder)
+     * suivent la même convention — elles doivent changer ENSEMBLE. */
+    for (int i = 0; i < 8; i++)
+      b[i] = (uint8_t)(((w[i*2] >> 4) & 0x0f) | (((w[i*2+1] >> 4) & 0x0f) << 4));
     int frames  = (b[0] & 0x0f) + ((b[0] >> 4) & 0x03) * 10;
     int seconds = (b[2] & 0x0f) + ((b[2] >> 4) & 0x07) * 10;
     int minutes = (b[4] & 0x0f) + ((b[4] >> 4) & 0x07) * 10;
