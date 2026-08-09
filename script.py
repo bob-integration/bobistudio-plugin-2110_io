@@ -59,8 +59,14 @@ def _auto_lcores():
 LCORES  = str(CONFIG.get("lcores") or "") or _auto_lcores()
 # Binaire mtl_rx : poussé/prébuildé par le déploiement (C3b) ; surchargeable pour les tests.
 MTL_RX  = str(CONFIG.get("mtl_rx_bin") or "/opt/script/mtl_rx")
+# ⚠ shm_video_ring : NE concerne PAS un flux MXL (2110_io ne passe pas par bobimxl — RX écrit
+# en zéro-copie dans le shm maison /dev/shm/{{hostname}}_{{idx}}, cf. en-tête du fichier). Dimensionne
+# UNIQUEMENT ce shm-là, ET seulement en mode SIMULATION (pas de SDP actif, cf. _simu_frame plus
+# bas) — quand mtl_rx tourne réellement, c'est lui (binaire C) qui possède/mmap le shm et gère
+# sa profondeur. Sans rapport avec le réglage de nœud mxl_history_ms (domaine MXL /dev/shm/mxl).
 V_RING  = min(int(CONFIG.get("shm_video_ring", 8) or 8), 8)   # MTL st20 : ring ≤ 8
-A_RING  = int(CONFIG.get("shm_audio_ring", 100) or 100)
+# (ex-shm_audio_ring/A_RING : jamais utilisé pour dimensionner quoi que ce soit — retiré
+# 2026-08-09, code mort. 2110_io n'a pas de sortie audio simulée sur ce chemin.)
 HDR     = 64
 SDP_DIR = "/tmp"
 
