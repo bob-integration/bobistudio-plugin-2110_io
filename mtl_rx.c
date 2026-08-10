@@ -702,6 +702,21 @@ struct sess {
                                 * définitive. Doit rester à 0 depuis 0.82.0 (publication après la
                                 * 1ʳᵉ bande) ; s'il grimpe, une autre fenêtre reste ouverte. */
   uint8_t* sl_scratch;         /* TX source 8-bit : bande planar10 up-shiftée avant pack SIMD */
+  /* VENTILATION DU TOUR DE WORKER (ajouté le 2026-08-09). Une itération de video_tx_slice_thread
+   * coûte : attente d'un slot libre (déjà mesurée par slot_wait_*) + ATTENTE DU GRAIN source +
+   * PACKING. Les deux dernières étaient confondues, si bien qu'un worker publiant 37/s pour une
+   * source à 50/s ne pouvait pas être attribué. Reset à chaque fenêtre de stats, comme slot_wait. */
+  uint64_t sl_getgrain_ns;     /* cumul du temps passé dans mxlFlowReaderGetGrainSlice (attente source) */
+  uint64_t sl_getgrain_cnt;
+  uint64_t sl_pack_ns;         /* cumul du temps de sl_pack_band (toutes bandes d'une trame) */
+  uint64_t sl_pack_cnt;
+  uint64_t sl_depth_sum, sl_depth_cnt; uint16_t sl_depth_max;  /* profondeur de file à la sollicitation */
+  uint64_t sl_dist_sum;  uint16_t sl_dist_max;                  /* distance servi → prod (sens de l'anneau) */
+  uint64_t sl_drained;         /* RÉSERVÉ : compteur du drain tenté le 2026-08-09 (servir la trame
+                                * la plus récente et rendre les autres). Retiré le même jour — il
+                                * produisait UNE RÉPÉTITION PAR TRAME DRAINÉE, donc il volait la
+                                * trame courante au lieu d'en jeter une périmée. Reste publié à 0
+                                * tant que le sens réel de l'anneau n'est pas établi (cf. dist_avg). */
 };
 
 /* Mode tranche demandé (SLICE_MODE=1) + géométrie de tranche (SLICE_LINES, défaut 36 lignes —
@@ -1842,6 +1857,23 @@ static int tx_sl_next_frame(void* priv, uint16_t* next_frame_idx, struct st20_tx
    * d'anneau, même raison que la garde du producteur. */
   for (uint16_t _k = 0; _k < s->sl_fb_cnt && s->sl_fb[s->sl_fb_cons].stat == 2; _k++)
     s->sl_fb_cons = (uint16_t)((s->sl_fb_cons + 1) % s->sl_fb_cnt);
+  /* ★ OBSERVATION D'ORDRE (2026-08-09) — aucune influence sur le comportement.
+   * Le drain tenté ce jour libérait, à chaque sollicitation, tous les slots prêts sauf « le plus
+   * récent » ; résultat : `drained` et les répétitions montaient au MÊME rythme (11/s), donc chaque
+   * trame jetée était précisément celle que la lib allait servir. Mon hypothèse sur le SENS de
+   * l'anneau est donc fausse quelque part. On mesure au lieu de re-déduire :
+   *   depth = nombre de slots prêts au moment de la sollicitation ;
+   *   dist  = distance du slot SERVI au slot de production (`prod`), modulo l'anneau.
+   * Si le servi est le plus ANCIEN, dist ≈ depth ; s'il est le plus RÉCENT, dist ≈ 1. */
+  {
+    uint16_t _d = 0;
+    for (uint16_t _k = 0; _k < s->sl_fb_cnt; _k++) if (s->sl_fb[_k].stat == 1) _d++;
+    uint16_t _dist = (uint16_t)((s->sl_fb_prod + s->sl_fb_cnt - s->sl_fb_cons) % s->sl_fb_cnt);
+    s->sl_depth_sum += _d; s->sl_depth_cnt++;
+    if (_d > s->sl_depth_max) s->sl_depth_max = _d;
+    s->sl_dist_sum += _dist;
+    if (_dist > s->sl_dist_max) s->sl_dist_max = _dist;
+  }
   uint16_t c = s->sl_fb_cons;
   if (s->sl_fb[c].stat != 1) {
     /* Rien de frais : RE-SERT la dernière trame intégralement émise (gel, comportement historique —
@@ -2261,8 +2293,13 @@ static void* video_tx_slice_thread(void* arg) {
     if (!fi_init || next_fi < rt.headIndex) { next_fi = rt.headIndex; fi_init = 1; }
     /* 1ʳᵉ tranche du grain visé (borné ~1 période ; réveil par le commit du producteur) */
     mxlGrainInfo gi; uint8_t* pay;
+    uint64_t _g0 = mono_ns();
     stx = mxlFlowReaderGetGrainSlice(t->reader, next_fi, 1, period_ns + period_ns / 4, &gi, &pay);
     uint64_t tnow = mono_ns();
+    /* Attente de la SOURCE seule (cf. champs) : ce que coûte l'obtention de la 1ʳᵉ tranche du grain
+     * visé. À comparer à sl_pack_ms et slot_wait_ms — la somme des trois doit expliquer la période
+     * du worker. Comptée même en échec : un timeout est de l'attente, et c'est ce qu'on cherche. */
+    s->sl_getgrain_ns += tnow - _g0; s->sl_getgrain_cnt++;
     t->alive_ns = tnow;
     if (stx != MXL_STATUS_OK) {
       if (stx == MXL_ERR_FLOW_NOT_FOUND || stx == MXL_ERR_FLOW_INVALID) {
@@ -2347,7 +2384,9 @@ static void* video_tx_slice_thread(void* arg) {
       }
       uint32_t l0 = (uint32_t)(k - 1) * slice_h;
       uint32_t nl = (k == total) ? (uint32_t)H - l0 : slice_h;
+      uint64_t _p0 = mono_ns();
       sl_pack_band(s, pay, src8, l0, nl, fb);
+      s->sl_pack_ns += mono_ns() - _p0; s->sl_pack_cnt++;   /* coût RÉEL du packing (cf. champs) */
       s->sl_fb[idx].lines_ready = l0 + nl;
       /* Barrière AVANT publication, comme les chemins statiques (`contenu EN PLACE avant
        * d'annoncer le slot prêt`) : sans elle l'écriture de la bande peut être réordonnée après
@@ -2388,8 +2427,24 @@ static int setup_video_slice_tx(struct sess* s) {
   /* 4 framebuffers : 1 seul reste immobilisé en permanence — la TRAME DE TENUE (horloge de sortie,
    * cf. tx_sl_next_frame) — le worker en garde 3. Le TÉMOIN DE REPLI (bobi.studio) ne réserve plus
    * de slot dédié : il est publié par le worker DANS ces 3 slots normaux (cf. video_tx_slice_thread),
-   * exactement comme la branche statique — donc aucun besoin d'agrandir l'anneau pour lui. */
-  s->sl_fb_cnt = 4; s->sl_fb_prod = 0; s->sl_fb_cons = 0;
+   * exactement comme la branche statique — donc aucun besoin d'agrandir l'anneau pour lui.
+   *
+   * ⚠ 2026-08-09 : ce 4 était CODÉ EN DUR et écrasait le `ring` de la config (8 demandé, 4 appliqué).
+   * Le raisonnement ci-dessus ne portait que sur la SUFFISANCE fonctionnelle de la tenue, jamais sur
+   * le DÉBIT. Or mesuré ce jour sur TX0 (source = mur, 50 grains neufs/s disponibles) : l'anneau est
+   * plein en permanence (stat [1,1,1,2]) et le worker passe 59 % du temps bloqué en attente de slot
+   * (slot_wait 1181 ms par fenêtre de stats de 2 s, 75 blocages) — la sortie se stabilise à 37 trames
+   * fraîches/s, une sur quatre étant répétée. On HONORE donc le `ring` du sig — ce qui, avec la
+   * config actuelle (ring=8), DOUBLE l'anneau de TX0 dès la reconstruction. Ce n'est pas un effet de
+   * bord : c'est le correctif, la valeur du sig était ignorée en silence. À mesurer avant/après sur
+   * `slot_wait_ms` et `srv.fresh`. Cesse de valoir si la lib change sa politique de libération. */
+  {
+    uint16_t _r = (uint16_t)s->ring;
+    if (_r < 4) _r = 4;                 /* 3 slots worker + la tenue : plancher fonctionnel */
+    if (_r > SL_Q) _r = SL_Q;
+    s->sl_fb_cnt = _r;
+  }
+  s->sl_fb_prod = 0; s->sl_fb_cons = 0;
   s->sl_hold_valid = 0; s->sl_hold_emitted = 0; s->sl_hold_last_ns = 0;
   s->sl_witness_switch_ns = 0; s->sl_witness_cur = 0; s->sl_witness_gen = 0;
   s->sl_carrier_valid = 0; s->sl_carrier_idx = 0; s->sl_content_gen = 0;
@@ -2518,7 +2573,19 @@ static int setup_video_tx(struct sess* s) {
   ops.input_fmt = ST_FRAME_FMT_YUV422PLANAR10LE;   /* on fournit du 10-bit (up-shift 8→10 nous-mêmes) */
   ops.transport_fmt = ST20_FMT_YUV_422_10BIT;
   ops.device = ST_PLUGIN_DEVICE_AUTO;
-  ops.framebuff_cnt = 3;
+  /* ★ 2026-08-09 : était `3` en dur — le `ring` du sig (donc le réglage `shm_video_ring`) n'arrivait
+   * pas jusqu'ici, exactement comme le `sl_fb_cnt = 4` du chemin TRANCHE corrigé le même jour. Là-bas,
+   * 3 slots utilisables ont coûté 59 % de blocage du worker et UNE TRAME SUR QUATRE répétée à
+   * l'antenne (mesuré sur TX0, 1080p50). Ce chemin-ci n'a PAS été mesuré — il n'est pas utilisé en
+   * production aujourd'hui (les TX vidéo tournent en mode tranche) — mais il portait la même
+   * constante, et rien ne justifiait qu'elle soit plus petite. Plancher 4 (au cas où le sig
+   * enverrait moins), plafond ST20_FB_MAX_COUNT = 8, seule contrainte énoncée par le SDK. */
+  {
+    uint16_t _r = (uint16_t)s->ring;
+    if (_r < 4) _r = 4;
+    if (_r > 8) _r = 8;                            /* ST20_FB_MAX_COUNT */
+    ops.framebuff_cnt = _r;
+  }
   ops.flags = ST20P_TX_FLAG_BLOCK_GET;             /* get_frame bloque → pacing à fps */
   /* CLASSE 2110-21 PAR SESSION (#26) : cible VRX (narrow/NL/wide) selon le profil de la NIC de
    * sortie (node_interfaces.output_profile → ports[].profile). NARROW par défaut (memset l'a déjà
@@ -3245,7 +3312,10 @@ static void write_stats(struct sess* reg, uint64_t last[][MAX_TG], uint64_t last
         snprintf(livebuf, sizeof(livebuf),
                  ", \"source_live\": %s, \"holding\": %s, \"hold_ok\": %s"
                  ", \"srv\": {\"fresh\": %llu, \"hold\": %llu, \"busy\": %llu}%s, \"hold_empty_kept\": %llu"
-                 ", \"slot_wait_ms\": %.1f, \"slot_wait_n\": %llu",
+                 ", \"slot_wait_ms\": %.1f, \"slot_wait_n\": %llu"
+                 ", \"getgrain_ms\": %.1f, \"getgrain_n\": %llu"
+                 ", \"pack_ms\": %.1f, \"pack_n\": %llu, \"fb_slots\": %u"
+                 ", \"drained\": %llu, \"depth_avg\": %.2f, \"depth_max\": %u, \"dist_avg\": %.2f, \"dist_max\": %u",
                  source_live ? "true" : "false", holding ? "true" : "false",
                  s->sl_hold_valid ? "true" : "false",
                  (unsigned long long)s->srv_fresh, (unsigned long long)s->srv_hold,
@@ -3254,8 +3324,22 @@ static void write_stats(struct sess* reg, uint64_t last[][MAX_TG], uint64_t last
                  /* Temps passé bloqué à attendre un slot d'anneau pendant la fenêtre de stats.
                   * Rapporté à la durée de la fenêtre, ça donne directement la part du temps où le
                   * worker est étranglé par l'aval plutôt que par sa source. */
-                 t->slot_wait_cum_ns / 1e6, (unsigned long long)t->slot_wait_cnt);
+                 t->slot_wait_cum_ns / 1e6, (unsigned long long)t->slot_wait_cnt,
+                 /* Les trois postes du tour de worker, sur la MÊME fenêtre : attente d'un slot,
+                  * attente du grain source, packing. Rapportés à la fenêtre (2 s), ils disent
+                  * lequel étrangle la cadence — la question à laquelle aucun compteur ne répondait. */
+                 s->sl_getgrain_ns / 1e6, (unsigned long long)s->sl_getgrain_cnt,
+                 s->sl_pack_ns / 1e6, (unsigned long long)s->sl_pack_cnt,
+                 (unsigned)s->sl_fb_cnt, (unsigned long long)s->sl_drained,
+                 s->sl_depth_cnt ? (double)s->sl_depth_sum / s->sl_depth_cnt : 0.0,
+                 (unsigned)s->sl_depth_max,
+                 s->sl_depth_cnt ? (double)s->sl_dist_sum / s->sl_depth_cnt : 0.0,
+                 (unsigned)s->sl_dist_max);
       t->slot_wait_cum_ns = 0; t->slot_wait_cnt = 0;
+      s->sl_getgrain_ns = 0; s->sl_getgrain_cnt = 0;
+      s->sl_pack_ns = 0; s->sl_pack_cnt = 0;
+      s->sl_depth_sum = 0; s->sl_depth_cnt = 0; s->sl_depth_max = 0;
+      s->sl_dist_sum = 0; s->sl_dist_max = 0;
       }
       FILE* sf = fopen(t->stats_path, "w");
       if (sf) {
