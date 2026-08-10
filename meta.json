@@ -1,7 +1,16 @@
 {
-  "version": "0.86.1",
-  "date": "2026-08-09",
+  "version": "0.87.0",
+  "date": "2026-08-10",
   "changes": {
+    "Le lot de synchronisation RDMA était laissé au défaut du SDK — SLICE_MODE ne rendait rien sur le fil (0.87.0)": [
+      "★ `mxlCreateFlowWriter` recevait NULL à la place du JSON d'options, depuis toujours. Or `maxSyncBatchSizeHint` — combien de tranches l'initiateur RDMA accumule avant de transférer — a pour DÉFAUT `totalSlices`. Conséquence : l'initiateur attendait la trame ENTIÈRE. Le moteur découpait ses grains en 30 tranches (`SLICE_MODE=1`, `slice_height` 36 lignes) et ce découpage ne rapportait RIEN sur le fil : on en payait le coût sans en tirer la latence.",
+      "★ CE N'ÉTAIT PAS THÉORIQUE. Constaté en production le 2026-08-10 : le flux RX brut `2110-io-dl360-1_0` (1920×1080) est répliqué par RDMA de dl360-1 vers dell-1 — ce n'est pas seulement le proxy de la pyramide qui traverse, c'est la source pleine résolution, sur le premier bond de la chaîne 2110 → mur → 2110.",
+      "Mesuré au banc le 2026-08-09 (1080p50 en 30 tranches, horodatage écrit DANS chaque tranche, décalage d'horloge TAI/UTC soustrait) : 1ʳᵉ bande lisible sur la réplique à 22,63 ms au lot par défaut, 0,54 ms à un lot de 2, 0,06 ms à un lot de 1. La latence de la 1ʳᵉ bande suit `lot/30 × 20 ms` — l'initiateur attend simplement d'avoir son lot.",
+      "`sync_batch_opts()` lit `MXL_SYNC_BATCH` et construit les options ; UN SEUL point d'application (`open_writer`), donc valable pour TOUS les writers du moteur — vidéo, audio, ANC — sans risque d'oubli par essence. MÊME CONTRAT que le côté Python (`bobimxl._flow_options`) : vide, illisible ou ≤ 0 ⇒ NULL ⇒ comportement historique octet-identique. Les deux implémentations doivent rester alignées.",
+      "Côté orchestrateur, `docker_driver` injecte `MXL_SYNC_BATCH` depuis le réglage `mxl_sync_batch`, comme le faisait déjà `docker_compute`. Ce site manquait : l'injection n'avait été faite que pour les conteneurs de calcul, alors que le moteur crée des flux par DEUX chemins qui lisent tous les deux la variable — `mtl_rx.c` (RX 2110, C) et `bobimxl` (simu/txgen du contrôleur, Python).",
+      "⚠ N'agit que sur les flux CRÉÉS ENSUITE : un flux existant garde le lot fixé à sa création. Vérifiable avec `mxl-info -d /dev/shm/mxl -f <uuid>` → ligne `Sync batch size`.",
+      "⚠ NON VALIDÉ À L'ÉCHELLE : le banc portait sur UN flux, dans le sens de lien qui a de la marge (1,77 sur 10 Gb/s). La production, c'est seize flux tranchés et un sens à 95 % d'occupation — la configuration même où la panne du 2026-08-09 au matin s'est produite. Le réglage reste VIDE par défaut ; ne pas le poser en production avant le banc d'échelle."
+    ],
     "Drain retiré ; on MESURE le sens de l'anneau au lieu de le déduire (0.86.1)": [
       "Le drain de 0.86.0 (servir la trame la plus récente, rendre les autres) a été DÉPLOYÉ ET RETIRÉ le même soir : la file est bien tombée à 1, mais les répétitions sont revenues à 8-13/s et le compteur `drained` montait au MÊME rythme — UNE RÉPÉTITION PAR TRAME DRAINÉE. Chaque trame jetée était donc celle que la lib allait servir : le drain volait la trame courante au lieu d'écarter une périmée. La lecture du SENS de l'anneau était fausse quelque part.",
       "Mesuré au passage, sans toucher au moteur : la gigue d'arrivée des grains au TX va de 13,6 à 28,5 ms autour de 20, mais elle se compense — le retard CUMULÉ le plus profond est de 11 ms, soit 0,55 trame sur 1499 arrivées. Une file d'UNE trame suffirait donc à ne jamais répéter ; la file stationne à 2-5, soit 40 à 100 ms de délai qui ne servent à rien. Le gain est réel, la voie était la bonne, l'implémentation était fausse.",

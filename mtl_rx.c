@@ -855,6 +855,46 @@ static char* build_data_flowdef(struct sess* s, struct target* t) {
   return out;
 }
 
+/* ── Lot de synchronisation RDMA (`maxSyncBatchSizeHint`) ────────────────────────────────────
+ * Option de FLUX, posée à la CRÉATION, dans le JSON d'options (3ᵉ argument de
+ * mxlCreateFlowWriter) — l'emplacement où ce fichier passait NULL depuis toujours.
+ *
+ * Elle fixe `slicesPerBatch` : combien de tranches l'initiateur RDMA accumule avant de
+ * transférer. SON DÉFAUT VAUT `totalSlices`. Conséquence, mesurée au banc le 2026-08-09
+ * (dell-1 → dl360-1, 1080p50 en 30 tranches, horodatage écrit dans chaque tranche) :
+ *
+ *     lot 30 (= défaut) → 1ʳᵉ bande lisible sur la réplique à 22,63 ms
+ *     lot 2            → 0,54 ms
+ *     lot 1            → 0,06 ms
+ *
+ * Autrement dit : SANS cette option, découper le flux ne rapporte RIEN sur le fil. Le moteur
+ * publie ses 30 tranches (SLICE_MODE=1, slice_height) et l'initiateur les rassemble toutes avant
+ * d'en transférer une seule — on paie le découpage sans en tirer la latence. C'est le cas en
+ * production sur le flux RX répliqué dl360-1 → dell-1, constaté le 2026-08-10.
+ *
+ * MÊME CONTRAT QUE LE CÔTÉ PYTHON (`script_templates/bobimxl.py:_flow_options`) : variable
+ * d'environnement MXL_SYNC_BATCH, vide/illisible/≤ 0 ⇒ NULL, donc comportement historique
+ * octet-identique. Les deux implémentations doivent rester alignées — un producteur C et un
+ * producteur Python sur le même domaine MXL ne doivent pas avoir des lots différents sans raison.
+ *
+ * ⚠ N'agit que sur les flux CRÉÉS ENSUITE : un flux existant garde le lot fixé à sa création.
+ * Vérifiable avec `mxl-info -d /dev/shm/mxl -f <uuid>` → ligne `Sync batch size`.
+ *
+ * Renvoie une chaîne heap (à libérer par l'appelant) ou NULL. */
+static char* sync_batch_opts(void) {
+  const char* e = getenv("MXL_SYNC_BATCH");
+  if (!e || !*e)
+    return NULL;
+  int n = atoi(e);
+  if (n <= 0)
+    return NULL;                 /* valeur absente de sens → défaut du SDK, jamais un lot bancal */
+  struct json_object* o = json_object_new_object();
+  json_object_object_add(o, "maxSyncBatchSizeHint", json_object_new_int(n));
+  char* out = strdup(json_object_to_json_string(o));
+  json_object_put(o);
+  return out;
+}
+
 /* Crée le writer MXL d'une cible à partir d'un flowDef (RX/simu). Renvoie 0 si OK.
  * GC-AND-RETRY : l'id du flux ne dépend que du NOM du slot (pas de l'interlace_mode/grain_rate).
  * Quand un slot passe d'un producteur SIMU progressif (contrôleur) à un RX entrelacé (ce process),
@@ -864,12 +904,16 @@ static char* build_data_flowdef(struct sess* s, struct target* t) {
  * (progressif↔progressif : attache au flux simu existant) : succès au 1er essai, boucle non exécutée. */
 static int open_writer(struct target* t, char* flowdef) {
   bool created = false;
-  mxlStatus st = mxlCreateFlowWriter(g_mxl, flowdef, NULL, &t->writer, NULL, &created);
+  /* Le lot de synchronisation vaut pour TOUS les writers du moteur (vidéo, audio, ANC) : c'est
+   * précisément pour ça qu'ils passent tous par ici — un seul point, pas un oubli par essence. */
+  char* opts = sync_batch_opts();
+  mxlStatus st = mxlCreateFlowWriter(g_mxl, flowdef, opts, &t->writer, NULL, &created);
   for (int attempt = 0; st != MXL_STATUS_OK && attempt < 10; attempt++) {
     mxlGarbageCollectFlows(g_mxl);          /* récupère le flux périmé une fois son producteur libéré */
     usleep(200000);                         /* laisse la simu du contrôleur se fermer (slot devenu live) */
-    st = mxlCreateFlowWriter(g_mxl, flowdef, NULL, &t->writer, NULL, &created);
+    st = mxlCreateFlowWriter(g_mxl, flowdef, opts, &t->writer, NULL, &created);
   }
+  free(opts);
   free(flowdef);
   if (st != MXL_STATUS_OK) {
     fprintf(stderr, "mtl_rx: mxlCreateFlowWriter(%s) -> %d\n", flow_name(t->shm_path), (int)st);
