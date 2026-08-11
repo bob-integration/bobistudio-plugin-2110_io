@@ -2484,7 +2484,24 @@ static int setup_video_slice_tx(struct sess* s) {
    * `slot_wait_ms` et `srv.fresh`. Cesse de valoir si la lib change sa politique de libération. */
   {
     uint16_t _r = (uint16_t)s->ring;
-    if (_r < 4) _r = 4;                 /* 3 slots worker + la tenue : plancher fonctionnel */
+    /* ★ PLANCHER ABAISSÉ À 3 (2026-08-11) — c'est la LATENCE DE SORTIE qu'il fixait.
+     * ÉTABLI le même jour : l'anneau sert la trame la plus ANCIENNE (FIFO). Mesuré sur trois
+     * émetteurs et douze relevés, `dist` = `depth` − 1 SANS EXCEPTION — la règle de lecture posée
+     * par le commentaire de `tx_sl_next_frame` (« servi le plus ancien ⇒ dist ≈ depth »). Donc
+     * la profondeur de l'anneau EST la latence : 3 slots worker = 2 images de retard à l'antenne.
+     * Le plancher de 4 n'était pas un choix de latence, c'était « 3 slots worker + la tenue »,
+     * hérité d'une époque où le sens de service était inconnu (cf. l'échec du drain de juillet,
+     * qui jetait précisément la trame que la lib allait servir).
+     * 3 = 2 slots worker + la tenue → 1 image. Le SDK n'exige que `framebuff_cnt >= 2`.
+     * ⚠ CE N'EST PAS GRATUIT : moins d'avance, c'est moins d'amorti. Si le producteur hoquette,
+     * la lib ne trouve rien de frais et RÉPÈTE. Les deux compteurs qui arbitrent sont déjà
+     * publiés — `slot_wait_ms` (le worker s'étrangle-t-il ?) et `repeats` (l'antenne répète-t-elle ?).
+     * Mesuré à ring=8 avant la bascule : slot_wait 0,0 ms, 0 répétition en régime, depth 2,9 —
+     * donc de la marge. À re-mesurer sur CHAQUE émetteur après changement : un TX alimenté par
+     * une source irrégulière n'a pas la même réserve qu'un TX alimenté par un mur genlocké.
+     * Le défaut reste 4 (`t.get("ring") or 8` côté orchestrateur, puis ce plancher) : descendre
+     * est un ACTE, jamais un effet de bord d'un redéploiement. */
+    if (_r < 3) _r = 3;
     if (_r > SL_Q) _r = SL_Q;
     s->sl_fb_cnt = _r;
   }

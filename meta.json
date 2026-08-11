@@ -1,7 +1,14 @@
 {
-  "version": "0.87.0",
-  "date": "2026-08-10",
+  "version": "0.88.0",
+  "date": "2026-08-11",
   "changes": {
+    "Le plancher de l'anneau TX fixait la LATENCE DE SORTIE — abaissé à 3 (0.88.0)": [
+      "★ ÉTABLI D'ABORD, CHANGÉ ENSUITE. `tx_sl_next_frame` posait la règle de lecture : « si le servi est le plus ANCIEN, dist ≈ depth ; s'il est le plus RÉCENT, dist ≈ 1 ». Mesuré le 2026-08-11 sur TROIS émetteurs et DOUZE relevés : `dist` = `depth` − 1, sans une exception. L'anneau sert donc la trame la plus ANCIENNE — c'est un FIFO, et sa profondeur EST la latence de sortie.",
+      "Le plancher de 4 (« 3 slots worker + la tenue ») datait d'une époque où ce sens était inconnu — c'est d'ailleurs pourquoi le drain de juillet a échoué : il jetait tous les slots prêts sauf le plus récent, c'est-à-dire précisément la trame que la lib allait servir au tour suivant, d'où une répétition par trame drainée.",
+      "Abaissé à 3 = 2 slots worker + la tenue, soit UNE image de sortie au lieu de deux. Le SDK n'exige que `framebuff_cnt >= 2`.",
+      "⚠ CE N'EST PAS GRATUIT et le défaut ne bouge pas (4) : descendre doit rester un ACTE. Moins d'avance = moins d'amorti ; si le producteur hoquette, la lib répète. Les deux compteurs d'arbitrage sont déjà publiés : `slot_wait_ms` (worker étranglé) et `repeats` (antenne). Relevé à ring=8 avant bascule : slot_wait 0,0 ms, 0 répétition en régime, depth 2,9 — il y a de la marge, mais elle est à re-mesurer PAR ÉMETTEUR (un TX sur source irrégulière n'a pas la réserve d'un TX sur mur genlocké).",
+      "Le champ `ring` était déjà câblé de bout en bout (deploy_config → push_tx_slots → contrôleur → session) : régler un émetteur ne demande aucun code, seulement de poser `tx_slots[i].ring`."
+    ],
     "Le lot de synchronisation RDMA était laissé au défaut du SDK — SLICE_MODE ne rendait rien sur le fil (0.87.0)": [
       "★ `mxlCreateFlowWriter` recevait NULL à la place du JSON d'options, depuis toujours. Or `maxSyncBatchSizeHint` — combien de tranches l'initiateur RDMA accumule avant de transférer — a pour DÉFAUT `totalSlices`. Conséquence : l'initiateur attendait la trame ENTIÈRE. Le moteur découpait ses grains en 30 tranches (`SLICE_MODE=1`, `slice_height` 36 lignes) et ce découpage ne rapportait RIEN sur le fil : on en payait le coût sans en tirer la latence.",
       "★ CE N'ÉTAIT PAS THÉORIQUE. Constaté en production le 2026-08-10 : le flux RX brut `2110-io-dl360-1_0` (1920×1080) est répliqué par RDMA de dl360-1 vers dell-1 — ce n'est pas seulement le proxy de la pyramide qui traverse, c'est la source pleine résolution, sur le premier bond de la chaîne 2110 → mur → 2110.",
