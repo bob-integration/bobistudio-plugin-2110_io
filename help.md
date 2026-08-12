@@ -75,6 +75,21 @@ la synchronisation son/image. Il exige un peu de marge de tampon chez le récept
 ⚠ Ces deux réglages **recréent la session** du slot concerné : bref silence à l'antenne sur cette
 sortie. À ne pas enchaîner pendant une émission.
 
+### Le budget d'une image, pour les étages en amont
+
+L'émetteur vient chercher le contenu à un instant fixe du créneau : environ **16,4 ms** après son
+début, à 50 images/s. Tout ce qu'un étage amont publie avant part à l'image suivante ; tout ce qui
+arrive après attend une image de plus. La chaîne dispose donc d'un **budget d'environ 16 ms par
+image**, et un étage ne coûte rien tant qu'il y reste — puis une image pleine dès qu'il le
+franchit. C'est un escalier, pas une pente.
+
+Conséquence utile au moment de dimensionner une chaîne : ajouter un traitement léger est gratuit,
+et c'est le cumul qui compte, pas le nombre d'étages. Mesuré sur cette installation : la pyramide
+et la réplication RDMA ne consomment rien, un correcteur de couleur 2 ms (deux en cascade
+restent additifs), un multiview de 2 à 11 ms selon sa configuration — c'est lui qui fait
+généralement basculer le budget. Le détail et la règle de vérification par mur sont dans l'aide
+du **Multiviewer**, section « Latence ».
+
 ## Boutons par slot (à chaud, port :8082)
 
 | Bouton | Côté | Action |
