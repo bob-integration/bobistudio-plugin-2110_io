@@ -44,6 +44,37 @@ Les adresses multicast/ports sont **auto-allouées** au déploiement (pool multi
 cf. Réglages → Cluster & Réseau) et modifiables à chaud via `POST /api/mtl/<vmid>/tx/<slot>/dest`.
 Les senders NMOS IS-04 correspondants sont enregistrés automatiquement.
 
+### Latence de sortie : deux réglages par slot
+
+Chaque sortie porte deux sélecteurs, à côté de son format.
+
+**Choix de la trame émise.** Le moteur prépare quelques trames d'avance pour ne jamais laisser
+le fil à sec. Le réglage dit laquelle il sert.
+
+| | |
+|---|---|
+| ⚡ **Trame la plus récente** *(défaut)* | Émet la dernière trame prête et libère celles qu'elle a dépassées |
+| ⏱ Trame la plus ancienne | Comportement historique : émet dans l'ordre d'arrivée |
+
+Servir la plus récente **rend environ une image de latence**. La raison est une question de
+calendrier : une source publie sa trame peu après le début de son créneau, alors que le transport
+ne vient la chercher qu'un peu avant la fin — la trame fraîche est donc prête à temps, mais en
+servant la plus ancienne on émettait une trame périmée pendant qu'elle attendait. Mesuré sur banc
+le 2026-08-12 : l'âge du contenu chez le récepteur passe de 62,4 à 42,4 ms, sans perte de cadence.
+
+Revenir à « la plus ancienne » n'a de sens que si une source **irrégulière** provoque des
+répétitions : les trames dépassées étant libérées sans être émises, une source qui hoquette peut
+laisser le moteur sans rien de frais à envoyer. Les deux témoins sont `repeats` (l'antenne
+répète-t-elle ?) et `skipped` (combien de trames périmées libérées) dans les statistiques du slot.
+
+**Rythme d'émission.** « Image suivante » aligne l'émission sur l'instant nominal — c'est le
+réglage d'interopérabilité stricte. « Décalée » fait partir l'image dès que ses premières tranches
+sont prêtes, avec le décalage déclaré au SDP (TROFF) et l'horodatage inchangé, donc sans effet sur
+la synchronisation son/image. Il exige un peu de marge de tampon chez le récepteur.
+
+⚠ Ces deux réglages **recréent la session** du slot concerné : bref silence à l'antenne sur cette
+sortie. À ne pas enchaîner pendant une émission.
+
 ## Boutons par slot (à chaud, port :8082)
 
 | Bouton | Côté | Action |
