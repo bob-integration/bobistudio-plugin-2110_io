@@ -39,7 +39,18 @@ window.MXLPlugins["2110_io"] = {
       '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'
     }[c]));
 
-    const VIDEO_PATTERNS = {
+/* Le lecteur de flux (cadence, état) est un fichier partagé, chargé par layout.html. S'il
+     * manque — gabarit servi depuis le cache après un ajout, fichier non déployé — la vue entière
+     * s'arrêtait sur la première cellule. Un point commun ne doit pas pouvoir emporter tout ce qui
+     * s'appuie dessus : à défaut, on rend une cellule qui DIT qu'elle est dégradée (jamais un
+     * repli discret qui ferait croire à un affichage normal) et le reste de la ligne survit. */
+    const FLUX = () => window.IOFlux || {
+      circule: o => Number(o && o.fps) > 0,
+      cadence: () => '<span style="color:var(--status-warning-fg)" title="Lecteur de flux non chargé (io_flux.js) : cette valeur est indisponible, pas nulle.">?</span>',
+      badge: (t, l) => '<span class="badge" title="Lecteur de flux non chargé (io_flux.js).">' + l + '</span>',
+    };
+
+        const VIDEO_PATTERNS = {
       bars:     'Barres SMPTE',
       gradient: 'Dégradé gris',
       black:    'Fond noir',
@@ -55,14 +66,29 @@ window.MXLPlugins["2110_io"] = {
       const col = n >= 24 ? 'var(--status-running-fg)' : n > 0 ? '#e8a33d' : 'var(--status-stopped-fg)';
       return `<span style="color:${col}">${n.toFixed(1)}</span>`;
     }
-    // Taille IDENT (10..120 px) → angle du rotatif (course 270°, de -135° à +135°).
-    function _identAngle(v){ v = Math.max(10, Math.min(120, Number(v) || 12)); return -135 + (v - 10) / 110 * 270; }
+    // Taille IDENT (10..120 px) ramenée à 0..1 pour le tracé du catalogue.
+    const IDENT_MIN = 10, IDENT_MAX = 120;
+    const _identClamp = v => Math.max(IDENT_MIN, Math.min(IDENT_MAX, Number(v) || IDENT_MIN));
+    const _ident01 = v => (_identClamp(v) - IDENT_MIN) / (IDENT_MAX - IDENT_MIN);
+    // Tracé du rotatif — DÉLÉGUÉ au catalogue (MXLControls.knobSvg). `kind` vient de la classe
+    // `.ctl-knob--*` quand on a l'élément sous la main ; à la construction du HTML il n'existe pas
+    // encore, d'où l'arc explicite. Repli silencieux si le catalogue n'est pas chargé : on rend un
+    // cadran vide plutôt que de casser toute la carte.
+    function _identSvg(v, def, kind){
+      if (!window.MXLControls) return '';
+      return window.MXLControls.knobSvg(kind || 'arc', _ident01(v), def == null ? null : _ident01(def));
+    }
     function fmtVideoFormat(o){
       if (o.width && o.height) {
         const sc = (o.scan === 'i') ? 'i' : 'p';      // p ou i TOUJOURS affiché (notation broadcast)
-        const fpsTxt = (o.fps != null) ? String(Number(o.fps)).replace(/\.0$/, '') : '';
-        // Résolution + scan + fps fusionnés : « 1920×1080p25 ». fps coloré selon l'état.
-        const res = `${o.width}×${o.height}${sc}<span style="color:${Number(o.fps) >= 24 ? 'var(--status-running-fg)' : Number(o.fps) > 0 ? '#e8a33d' : 'var(--status-stopped-fg)'}">${fpsTxt}</span>`;
+        // La cadence reste dans la chaîne — c'est celle que la source ANNONCE dans son SDP — mais
+        // elle n'est plus COLORÉE (2026-08-06) : la couleur disait la santé d'une mesure sur un
+        // nombre qui est une déclaration. La cadence réellement reçue a désormais son propre
+        // badge à côté, et c'est leur ÉCART qui est intéressant : annoncer 50 et livrer 25 se voit
+        // maintenant, alors qu'un seul chiffre coloré le cachait.
+        const fpsTxt = (o.fps_sdp != null) ? String(Number(o.fps_sdp)).replace(/\.0$/, '')
+                     : (o.fps != null) ? String(Number(o.fps)).replace(/\.0$/, '') : '';
+        const res = `${o.width}×${o.height}${sc}${fpsTxt}`;
         // Tout ce que le SDP donne en plus : chroma, profondeur, colorimétrie, transfert(HDR), range.
         const chroma = o.chroma ? String(o.chroma).replace(/^(\d)(\d)(\d)$/, '$1:$2:$3') : '';
         const extra = [
@@ -77,13 +103,22 @@ window.MXLPlugins["2110_io"] = {
       }
       return `${fmtFps(o.fps)} fps`;
     }
-    function stateBadge(active, stalled){
-      if (active && stalled)
-        // Abonné (IS-05) mais aucun flux ne remonte : création RX ratée (budget lcores) ou pas de trafic.
-        return `<span class="badge" style="background:rgba(251,146,60,0.7); color:#3d1500" title="Abonné (IS-05) mais aucun flux ne remonte : création RX échouée (budget lcores du nœud) ou pas de trafic réseau (source/switch).">⚠ sans flux</span>`;
-      return active
-        ? `<span class="badge" style="background:var(--status-running-bg); color:var(--status-running-fg)">subscribed</span>`
-        : `<span class="badge" style="background:var(--border-soft); color:var(--text-muted)">idle</span>`;
+    // État d'un flux REÇU. Il ne disait qu'« abonné ou non » : sur une piste audio, un flux
+    // souscrit dont plus aucun échantillon n'arrivait affichait toujours « subscribed », et le
+    // silence ne se lisait qu'à la COULEUR du format à côté — un état porté par la seule teinte,
+    // donc invisible pour qui la distingue mal. L'arrivée réelle est désormais dite en toutes
+    // lettres. Vocabulaire commun aux deux sens (reçoit ↔ émet), rendu par le socle partagé.
+    function stateBadge(r){
+      const F = FLUX();
+      const estVideo = r.essence !== 'audio' && r.essence !== 'anc';
+      if (!r.active) return F.badge('inactif', 'inactif', "Aucun abonnement sur ce flux : rien n'est demandé à la source.");
+      if (estVideo && r.rx_stalled)
+        return F.badge('alerte', '⚠ sans flux',
+          'Abonné (IS-05) mais aucun flux ne remonte : création RX échouée (budget lcores du nœud) ou pas de trafic réseau (source/switch).');
+      if (F.circule(r)) return F.badge('ok', 'reçoit', 'Abonné, et les données arrivent.');
+      return F.badge('attente', estVideo ? 'abonné' : 'muet',
+        estVideo ? 'Abonné, mais aucune image ne remonte encore.'
+                 : "Abonné, mais aucun échantillon n'arrive : la source est silencieuse ou absente.");
     }
     function genTooltip(r, isAudio, genOn){
       const g = r.gen || {};
@@ -143,7 +178,7 @@ window.MXLPlugins["2110_io"] = {
       // Une adresse multicast par ligne (lisibilité des flux DUP/2022-7) : chaque
       // couple reste insécable (pas de coupure mid-octet), tronqué en ellipse si trop long.
       const net = flows.length
-        ? `<span class="net-flows">${flows.map(f => `<span class="flow-addr">${esc(f)}</span>`).join('')}</span>`
+        ? flows.map(f => `<span><span class="io-flow-addr">${esc(f)}</span></span>`).join('')
         : '<span style="color:var(--text-muted)">—</span>';
       const mxl = r.shm_path ? esc(r.shm_path) : '<span style="color:var(--text-muted)">—</span>';
       const isAudio = r.essence === 'audio';
@@ -152,13 +187,16 @@ window.MXLPlugins["2110_io"] = {
       // Nommage d'AFFICHAGE uniforme avec les slots TX (« Tx #n ») : « Rx #1 » ; « Rx #1 AUD 1 » =
       // Rx 1, 1ʳᵉ piste audio ; « Rx #1 ANC ». Index 1-based. Le nom technique du flux (shm) reste
       // visible dans la colonne MXL — jamais comme nom du flux.
-      const tag = isAnc
-        ? `Rx #${(r.video_idx != null ? r.video_idx : r.idx) + 1} ANC`
+      // Tag PAR ESSENCE, identique aux sorties (2026-08-06) : le numéro de l'ensemble est déjà
+      // dans le titre juste au-dessus, le répéter sur chaque ligne volait la largeur du libellé.
+      // Un flux audio INDÉPENDANT (sans vidéo d'attache) garde son numéro : il n'a pas de titre
+      // d'ensemble pour le porter.
+      const tag = isAnc ? 'ANC'
         : isAudio
         ? ((r.video_idx != null && r.audio_sub_idx != null)
-            ? `Rx #${r.video_idx + 1} AUD ${r.audio_sub_idx + 1}`
-            : `Rx AUD #${r.idx + 1}`)
-        : `Rx #${r.idx + 1}`;
+            ? `AUD ${r.audio_sub_idx + 1}`
+            : `AUD #${r.idx + 1}`)
+        : 'VIDÉO';
       // LIBELLÉ DE LA SOURCE, sous le tag : le nom que l'exploitant reconnaît (UMD reçu par TSL,
       // nom d'antenne…). Le NIVEAU affiché est celui choisi dans la barre de navigation — on
       // n'en impose aucun, un même flux porte plusieurs noms selon le métier. La règle de repli
@@ -187,7 +225,7 @@ window.MXLPlugins["2110_io"] = {
       // tag : la colonne du tag fait 64 px, un nom d'antenne y était tronqué dès quelques
       // caractères. Sous GÉN et IDENT il dispose de ~230 px, et la place était libre.
       const labelLine = _lab.value
-        ? `<small class="flow-label ${isAnc ? 'd' : isAudio ? 'a' : 'v'}${
+        ? `<small class="io-flow-lab${
                   _lab.level !== (window.SourceLabels || {}).level ? ' fallback' : ''}"
                   title="${esc(_lab.value + (_labTip ? ' — ' + _labTip : ''))}">${esc(_lab.value)}</small>`
         : '';
@@ -200,28 +238,48 @@ window.MXLPlugins["2110_io"] = {
       // VIDÉO : le badge GÉN reflète l'état LIVE du moteur (mire réellement émise, mode='simu') —
       // honnête, ≠ config. AUDIO : inchangé (config `simulated`, déjà clair). Le clic toggle le gen.
       const _genOn = isAudio ? !!r.simulated : !!r.generating;
-      const genIcon = isAnc ? '<span class="gen-wrap"></span>' : `<span class="gen-wrap">
-          <span class="gen-badge ${_genOn ? 'on' : 'off'}" role="button" tabindex="0"
-                data-essence="${ess}" data-idx="${r.idx}" data-enable="${_genOn ? '0' : '1'}">GÉN</span>
-          ${(!isAudio && _genOn) ? `<span class="gen-pat-wrap"><select class="gen-pat-sel" data-essence="video" data-idx="${r.idx}">${_patOpts}</select></span>` : ''}
+      // GÉN : geste d'EXPLOITATION à accrochage (mettre une mire à l'antenne) → poussoir du
+      // catalogue, `.ctl-push--led`. C'est un vrai <button role="switch"> : Entrée et Espace
+      // l'actionnent, le focus se voit, l'état est annoncé. Le <span role="button" tabindex="0">
+      // d'avant n'écoutait que le clic — annoncé actionnable, il ne l'était qu'à la souris.
+      const genIcon = isAnc ? '<span class="io-flow-gen gen-wrap"></span>' : `<span class="io-flow-gen gen-wrap">
+          <button type="button" class="ctl-push ctl-push--led io-gen" role="switch"
+                aria-pressed="${_genOn}"
+                data-essence="${ess}" data-idx="${r.idx}" data-enable="${_genOn ? '0' : '1'}"><span
+                class="ctl-led"></span>GÉN</button>
+          ${(!isAudio && _genOn) ? `<span class="gen-pat-wrap"><select class="ctl-select io-patsel" data-essence="video" data-idx="${r.idx}">${_patOpts}</select></span>` : ''}
           ${genTooltip(r, isAudio, _genOn)}
         </span>`;
       // IDENT : incrustation 3 lignes (nom/source/format) — slots vidéo uniquement.
       // IDENT : badge marche/arrêt + petit rotatif compact pour la taille du texte
       // (glisser ↕ ou molette) — reste dans sa colonne, ne décale pas le badge GÉN.
-      const identSz = r.ident_size || Math.max(12, Math.round((r.height || 720) / 28));
+      // Taille AUTOMATIQUE, dérivée de la hauteur de l'image : c'est à la fois la valeur servie
+      // quand l'exploitant n'a rien réglé, et le DÉFAUT vers lequel le rotatif revient. Les deux
+      // sont calculés au même endroit — deux formules voisines auraient fini par diverger, et le
+      // repère de l'arc aurait alors désigné une valeur que la remise à zéro n'atteint pas.
+      const identDef = _identClamp(Math.max(12, Math.round((r.height || 720) / 28)));
+      const identSz  = _identClamp(r.ident_size || identDef);
       // Placeholder vide pour audio/ANC (pas d'IDENT) → réserve la colonne 3 de la grille,
-      // sinon le badge SDP (colonne 4) remonte et n'est plus aligné avec celui de la vidéo.
-      const identCtl = (isAudio || isAnc) ? '<span class="ident-wrap"></span>' : `<span class="ident-wrap">
-          <span class="ident-badge ${r.ident ? 'on' : 'off'}" role="button" tabindex="0"
-                data-idx="${r.idx}" data-enable="${r.ident ? '0' : '1'}"
-                title="Incrustation 3 lignes (nom · source/multicast · format), fond noir, haut-droite">IDENT</span>
-          ${r.ident ? `<span class="ident-knob" role="slider" tabindex="0"
-                aria-valuemin="10" aria-valuemax="120" aria-valuenow="${identSz}"
-                data-idx="${r.idx}" data-val="${identSz}"
-                title="Taille du texte IDENT — glisser ↕ ou molette">
-                <span class="ident-knob-dial" style="transform:rotate(${_identAngle(identSz)}deg)"></span></span>
-              <span class="ident-size-val">${identSz}px</span>` : ''}
+      // sinon le bouton SDP (colonne 4) remonte et n'est plus aligné avec celui de la vidéo.
+      // Le rotatif de taille IDENT vient du catalogue : `.ctl-knob--arc`, tracé par MXLControls.
+      // Il était en AIGUILLE et dessiné à la main — or la règle de parc du 2026-07-26 veut que
+      // TOUS les rotatifs du produit soient en arc, pour qu'un réglage se lise pareil partout.
+      // Le défaut est matérialisé par le repère de l'arc : on voit d'un coup d'œil si on s'en
+      // écarte, ce qui n'existait pas avec l'aiguille.
+      const identCtl = (isAudio || isAnc) ? '<span class="io-flow-ident ident-wrap"></span>' : `<span class="io-flow-ident ident-wrap">
+          <button type="button" class="ctl-push ctl-push--led io-ident" role="switch"
+                aria-pressed="${!!r.ident}" data-idx="${r.idx}" data-enable="${r.ident ? '0' : '1'}"
+                title="Incrustation 3 lignes (nom · source/multicast · format), fond noir, haut-droite"><span
+                class="ctl-led"></span>IDENT</button>
+          ${r.ident ? `<span class="ctl-knob ctl-knob--arc io-identknob"
+                data-idx="${r.idx}" data-min="${IDENT_MIN}" data-max="${IDENT_MAX}" data-step="2"
+                data-val="${identSz}" data-def="${identDef}" data-unit="px">
+                <button type="button" class="ctl-knob-hit" role="slider"
+                  aria-label="Taille du texte IDENT" aria-valuemin="${IDENT_MIN}" aria-valuemax="${IDENT_MAX}"
+                  aria-valuenow="${identSz}" aria-valuetext="${identSz}px"
+                  title="Taille du texte IDENT — glisser ↕, molette, flèches (Maj = pas large). Entrée = taille automatique.">${
+                  _identSvg(identSz, identDef)}</button>
+                <span class="ctl-knob-val">${identSz}px</span></span>` : ''}
         </span>`;
       // SDP (vidéo, audio ET ANC) : badge ouvrant une modale d'affichage/édition.
       // Le SDP n'est PAS inliné dans le HTML (multiligne) — on le garde en cache par
@@ -231,39 +289,37 @@ window.MXLPlugins["2110_io"] = {
       // audio/ANC sans contrôleur NMOS externe → shm non alimenté → streamer muet.
       const sdpEss = isAnc ? 'anc' : isAudio ? 'audio' : 'video';
       _sdpByIdx[sdpEss + ':' + r.idx] = r.sdp || '';
-      const sdpCtl = `<span class="sdp-wrap">
-          <span class="sdp-badge ${r.sdp ? 'on' : 'off'}" role="button" tabindex="0"
+      // SDP : il n'y a RIEN à activer ici. Le clic OUVRE une fenêtre, et le témoin vert n'est pas
+      // ce que le clic bascule — c'est un constat (un SDP est posé, ou non). D'où un bouton de
+      // COMMANDE (`.btn .btn-sm`), l'ellipsis « … » qui annonce une fenêtre, `aria-haspopup` qui
+      // l'annonce à qui n'a pas l'écran, et la LED du catalogue pour l'état. En faire un
+      // `role="switch"` aurait fait annoncer « interrupteur, activé » sur un contrôle qui n'active
+      // rien : le contrôle aurait menti sur sa propre nature.
+      const sdpCtl = `<span class="io-flow-sdp sdp-wrap">
+          <button type="button" class="btn btn-sm io-sdp" aria-haspopup="dialog"
                 data-essence="${sdpEss}" data-idx="${r.idx}"
-                title="Afficher / coller le SDP (abonnement NMOS manuel)">SDP</span>
+                title="${r.sdp ? 'Un SDP est posé sur ce slot' : 'Aucun SDP sur ce slot'} — afficher / coller (abonnement NMOS manuel)"><span
+                class="ctl-led${r.sdp ? ' on' : ''}" style="--ctl-led-col:var(--status-running-fg)"></span>SDP…</button>
         </span>`;
       const rateCell = isAnc
         ? (() => {
             // ANC 2110-40 : on ne cherche pas à afficher un timecode. On confirme la réception
             // et on précise le type de métadata SI on le connaît (timecode ATC décodé, sinon SMPTE 291).
-            const flowing = Number(r.fps) > 0;
-            const col = flowing ? 'var(--status-running-fg)' : (r.sdp ? 'var(--text-muted)' : 'var(--status-stopped-fg)');
-            let txt = '—', tip = 'Aucun abonnement ANC sur ce slot';
-            if (r.sdp) {
-              const type = r.timecode ? 'timecode (SMPTE ST 12M)' : 'SMPTE ST 291 (type non décodé)';
-              txt = flowing ? ('reçu' + (r.timecode ? ' · timecode' : '')) : 'abonné';
-              tip = flowing ? `ANC 2110-40 reçu · ${type}` : 'ANC 2110-40 abonné · aucun paquet reçu';
-            }
-            return `<span style="color:${col}" title="${tip}">${esc(txt)}</span>`;
+            // La colonne FORMAT dit ce que le flux TRANSPORTE, pas s'il arrive — ça, c'est le
+            // badge d'état, désormais présent sur chaque essence. Elle disait les deux, et disait
+            // l'arrivée par la couleur.
+            if (!r.sdp) return '<span style="color:var(--text-muted)">—</span>';
+            const type = r.timecode ? 'timecode (SMPTE ST 12M)' : 'SMPTE ST 291';
+            return `<span title="Métadonnées ANC 2110-40 : ${esc(type)}">${esc(type)}</span>`;
           })()
         : isAudio
         ? (() => {
             // Format AUDIO 2110-30 lu du SDP : « 48kHz / L24 / 8ch ». Affiché dès l'abonnement
             // (r.sdp), même sans flux ; couleur = état de réception.
-            const flowing = Number(r.fps) > 0;
-            const col = flowing ? 'var(--status-running-fg)' : (r.sdp ? 'var(--text-muted)' : 'var(--status-stopped-fg)');
-            let txt = '— / —', tip = 'Aucun abonnement audio sur ce slot';
-            if (r.sdp && r.sample_rate) {
-              const khz = (r.sample_rate / 1000).toString().replace(/\.0$/, '');
-              const ch  = r.channels || 1;
-              txt = `${khz}kHz / L${r.bit_depth || 24} / ${ch}ch`;
-              tip = flowing ? `${esc(txt)} — flux actif` : `${esc(txt)} — abonné, aucun chunk reçu`;
-            }
-            return `<span style="color:${col}" title="${tip}">${esc(txt)}</span>`;
+            if (!(r.sdp && r.sample_rate)) return '<span style="color:var(--text-muted)">— / —</span>';
+            const khz = (r.sample_rate / 1000).toString().replace(/\.0$/, '');
+            const txt = `${khz}kHz / L${r.bit_depth || 24} / ${r.channels || 1}ch`;
+            return `<span title="Format audio annoncé par le SDP reçu">${esc(txt)}</span>`;
           })()
         : (() => {
             // VIDÉO : ni abonné (IS-05) ni générateur actif → pas de signal. On n'affiche PAS un
@@ -273,17 +329,25 @@ window.MXLPlugins["2110_io"] = {
             }
             return `<span title="format vidéo${r.generating ? ' (mire générée)' : ''}">${fmtVideoFormat(r)}</span>`;
           })();
-      const rowCls = isAnc ? 'flow-anc' : isAudio ? 'flow-audio' : 'flow-video';
-      return `<div class="flow-row ${rowCls}">
-        <span class="flow-tag ${isAnc ? 'd' : isAudio ? 'a' : 'v'}">${tag}</span>
+      // Cadence MESURÉE, face au format qui, lui, est déclaré. Rendue par le socle partagé — et
+      // seulement pour la vidéo : sur une session audio, le compteur du moteur totalise des
+      // CHUNKS de 1 ms, ce qui s'affichait « 1000.0 fps ». Le nombre était juste, son unité non.
+      const fpsCell = FLUX().cadence(
+        isAnc ? 'anc' : isAudio ? 'audio' : 'video', r.fps, null, {sens: 'rx'});
+      const essCls = isAnc ? 'd' : isAudio ? 'a' : 'v';
+      // Gabarit PARTAGÉ avec les sorties (`.io-flow`, static/css/base.css). Toute cellule est
+      // posée même vide : c'est ce qui garde les colonnes alignées d'une ligne à l'autre.
+      return `<div class="io-flow io-flow--${essCls}">
+        <span class="io-flow-tag">${tag}</span>
         ${labelLine}
         ${genIcon}
         ${identCtl}
         ${sdpCtl}
-        <span>${stateBadge(r.active, r.rx_stalled)}</span>
-        ${rateCell}
-        <span class="net-addr" title="entrée 2110"><span class="net-arrow">↘</span>${portSelector('rx', r.idx, r.port)}${net}</span>
-        <span class="mxl-path" title="sortie MXL (shared memory)">→ ${mxl}</span>
+        <span class="io-flow-state">${stateBadge(r)}</span>
+        <span class="io-flow-fmt">${rateCell}</span>
+        <span class="io-flow-fps">${fpsCell}</span>
+        <span class="io-flow-net" title="adresses 2110 reçues">${net}</span>
+        <span class="io-flow-mxl${r.shm_path ? '' : ' vide'}" title="nom du flux sur le bus MXL">${mxl}</span>
       </div>`;
     }
     function groupEnsembles(receivers){
@@ -330,17 +394,17 @@ window.MXLPlugins["2110_io"] = {
           return `<span style="color:var(--text-muted)">${esc(dest)}</span> ${fp} fps`;
         };
         const lines = [];
-        if (vid) lines.push(`<div class="flow-row" style="gap:8px;align-items:center">
+        if (vid) lines.push(`<div class="io-txsum">
           <span class="badge" style="background:var(--bg-input,var(--bg));border:1px solid var(--border)">2110-20</span>
           ${fmtDest(vid)}</div>`);
-        auds.forEach((a,i) => lines.push(`<div class="flow-row" style="gap:8px;align-items:center">
+        auds.forEach((a,i) => lines.push(`<div class="io-txsum">
           <span class="badge" style="background:var(--bg-input,var(--bg));border:1px solid var(--border)">2110-30 #${i+1}</span>
           ${fmtDest(a)}</div>`));
-        if (anc) lines.push(`<div class="flow-row" style="gap:8px;align-items:center">
+        if (anc) lines.push(`<div class="io-txsum">
           <span class="badge" style="background:var(--bg-input,var(--bg));border:1px solid var(--border)">2110-40</span>
           ${fmtDest(anc)}</div>`);
         const _txPort = (vid && vid.port) || (auds[0] && auds[0].port) || (anc && anc.port) || null;
-        return `<div class="ens">
+        return `<div class="ens ctl-dense">
           <div class="ens-title">Slot Tx #${Number(ti) + 1}${portSelector('tx', Number(ti), _txPort)}</div>
           ${lines.join('')}
         </div>`;
@@ -349,16 +413,47 @@ window.MXLPlugins["2110_io"] = {
            + rows;
     }
 
+    // ─── Jauges de charge ────────────────────────────────────────────────────────────────────
+    // `.ctl-gauge` du catalogue. Ce qui change au-delà de l'apparence :
+    //  · les seuils ne sont plus des couleurs écrites à la main (#e8a33d, >60, >80) mais les états
+    //    `warn`/`over` du composant, et le seuil d'alerte est MATÉRIALISÉ par un trait — on voit
+    //    donc qu'on s'en approche avant qu'il se produise ;
+    //  · une mesure ABSENTE prend l'état `na` (estompé, « — ») au lieu d'une barre à zéro, qui se
+    //    lisait « tout va bien » alors qu'elle voulait dire « je ne sais pas ».
+    // Les seuils d'exploitation eux-mêmes sont INCHANGÉS (alerte 60 %, critique 80 %) : cette
+    // migration change la façon de le dire, pas ce qui est dit.
+    const NIC_SEUIL = 60, NIC_CRIT = 80;
+    function _nicEtat(pct){ return pct == null ? 'na' : pct >= NIC_CRIT ? 'over' : pct >= NIC_SEUIL ? 'warn' : ''; }
+    // Couleur du texte chiffré, accordée à l'état de la jauge — par TOKEN, jamais en dur.
+    function _nicCouleur(etat){
+      return etat === 'over' ? 'var(--status-stopped-fg)'
+           : etat === 'warn' ? 'var(--status-warning-fg)'
+           : etat === 'na'   ? 'var(--text-muted)' : 'var(--status-running-fg)';
+    }
+    // La jauge est rendue SANS `.ctl-gauge-val` : la règle du composant veut que la valeur reste
+    // affichée en permanence dès que ça alerte, or ici elle l'est déjà — en clair, à gauche, dans
+    // tous les cas. Ajouter la bulle du composant afficherait deux fois le même chiffre.
+    // `seuil === false` : grandeur dont l'approche du maximum ne se prévient pas (le plafond EST
+    // le bout de la barre, ex. les sessions du limiteur matériel) → variante sans trait, plutôt
+    // qu'un repère posé sur le bord qui n'apprendrait rien.
+    function _gauge(pct, etat, titre, seuil){
+      const p = Math.max(0, Math.min(1, (pct || 0) / 100));
+      const cls = 'ctl-gauge' + (etat ? ' ' + etat : '') + (seuil === false ? ' ctl-gauge--sans-seuil' : '');
+      return `<span class="${cls}" role="img"
+        style="--ctl-gauge-w:100%;flex:1${seuil === false ? '' : `;--ctl-gauge-seuil:${NIC_SEUIL}%`}"
+        aria-label="${esc(titre)}"><span class="ctl-gauge-fill" style="transform:scaleX(${p.toFixed(3)})"></span></span>`;
+    }
     function _nicBar(gbps, estGbps, cap, label) {
       const val = gbps != null ? gbps : estGbps;
       const isEst = gbps == null && estGbps != null;
       if (val == null) return '';
       const pct = Math.min(100, Math.round(val / cap * 100));
-      const col = pct > 80 ? 'var(--status-stopped-fg,#f87171)' : pct > 60 ? '#e8a33d' : 'var(--status-running-fg,#22c55e)';
+      const etat = _nicEtat(pct);
+      const txt = `${isEst ? '~' : ''}${val.toFixed(1)} / ${cap} Gbps (${pct}%)${isEst ? ' (estimation)' : ''}`;
       return `<div class="nic-bar-wrap">
         <span class="nic-bar-lbl">${label}</span>
-        <span class="nic-bar-val${isEst ? ' nic-bar-est' : ''}" style="color:${col}">${isEst ? '~' : ''}${val.toFixed(1)} / ${cap} Gbps (${pct}%)${isEst ? ' (estimation)' : ''}</span>
-        <div class="nic-bar-track"><div class="nic-bar-fill" style="width:${pct}%;background:${col}"></div></div>
+        <span class="nic-bar-val${isEst ? ' nic-bar-est' : ''}" style="color:${_nicCouleur(etat)}">${txt}</span>
+        ${_gauge(pct, etat, `${label} : ${txt}`)}
       </div>`;
     }
 
@@ -383,17 +478,22 @@ window.MXLPlugins["2110_io"] = {
       const cap   = p.port_capacity_gbps || 100;
       const val   = p.rx_gbps != null ? p.rx_gbps : p.rx_estimated_gbps;
       const isEst = p.rx_gbps == null && p.rx_estimated_gbps != null;
-      const pct   = val != null ? Math.min(100, Math.round(val / cap * 100)) : 0;
-      const bcol  = pct > 80 ? 'var(--status-stopped-fg,#f87171)' : pct > 60 ? '#e8a33d' : 'var(--status-running-fg,#22c55e)';
+      // Aucune mesure ⇒ PAS de pourcentage. Ce port affichait auparavant une barre à zéro, qui se
+      // lit « ce port ne reçoit rien » alors qu'elle voulait dire « je n'ai pas la mesure ».
+      const pct   = val != null ? Math.min(100, Math.round(val / cap * 100)) : null;
+      const etat  = _nicEtat(pct);
       const down  = p.link_up === false;
       return `<div class="io2110-portchip${down ? ' down' : ''}" style="border-left-color:${col}">
         <div class="pc-top"><span class="pc-name" style="color:${col}">${esc(p.iface)}</span>
           ${p.primary ? '<span class="pc-prim">PRIM</span>' : ''}
           <span class="pc-net">${esc(p.network || '')}</span>
           ${down ? '<span class="pc-down" title="Lien physique down">⚠ lien</span>' : ''}</div>
-        <div class="pc-load"><span class="pc-loadval${isEst ? ' est' : ''}">${
+        <div class="pc-load"><span class="pc-loadval${isEst ? ' est' : ''}"${
+          val == null ? ' style="color:var(--text-muted)"' : ''}>${
           val != null ? (isEst ? '~' : '') + val.toFixed(1) + ' / ' + cap + ' G' : '—'}</span>
-          <div class="pc-track"><div class="pc-fill" style="width:${pct}%;background:${bcol}"></div></div></div>
+          ${_gauge(pct, etat, val != null
+              ? `${p.iface} : ${val.toFixed(1)} sur ${cap} Gbps`
+              : `${p.iface} : débit non mesuré`)}</div>
         <div class="pc-meta">${p.rx_flow_count != null ? p.rx_flow_count + ' flux' : ''}${
           p.rx_queues != null ? ' · ' + p.rx_queues + ' files' : ''}</div>
       </div>`;
@@ -445,7 +545,7 @@ window.MXLPlugins["2110_io"] = {
             ${rxBar}${xdpBar}${flows}</div>`;
         }).join('')}</div>` : '';
       return `<div class="io2110-nicbar"><div class="io2110-portstrip">${strip}</div>
-        <button class="io2110-nictoggle${_nicOpen ? ' on' : ''}"
+        <button type="button" class="btn btn-sm io-nictoggle" aria-expanded="${_nicOpen}"
           title="Afficher / masquer le détail par port physique">${_nicOpen ? '▾' : '▸'} Par NIC</button>
         </div>${detail}`;
     }
@@ -467,7 +567,15 @@ window.MXLPlugins["2110_io"] = {
     // (« ifA ⇄ ifB », valeur = leg rouge), jamais ses membres séparément ; les ports non appariés
     // restent sélectionnables individuellement (aucune perte hors 2022-7).
     function _pairOf(ifn){ return _pairs227.find(pr => pr[0] === ifn || pr[1] === ifn); }
-    function portSelector(role, idx, port){
+    // Le choix de PORT se fait par ENSEMBLE, pas par essence (harmonisé avec les sorties le
+    // 2026-08-06). L'exploitant raisonne par SOURCE : recevoir la vidéo sur une carte pendant que
+    // son audio arrive sur l'autre n'est pas un réglage qu'on cherche, c'est un accident qu'on
+    // subit — et la page l'offrait ligne par ligne, donc trois fois par source, sans jamais dire
+    // que les trois devaient concorder. `idxs` porte tous les flux de l'ensemble : le serveur les
+    // épingle en UNE opération (une boucle de requêtes ici laisserait un ensemble à moitié posé).
+    // Les flux INDÉPENDANTS (audio/ANC sans vidéo) sont chacun leur propre ensemble : ils gardent
+    // donc leur sélecteur, sans exception à écrire.
+    function portSelector(role, idx, port, idxs){
       if (!_nodePorts || _nodePorts.length < 2) return '';
       const cur = (port && port.pinned) ? port.iface : '';   // '' = Auto
       const eff = (port && port.iface) || '';
@@ -488,14 +596,15 @@ window.MXLPlugins["2110_io"] = {
           opts.push(`<option value="${esc(p.ifname)}"${cur===p.ifname?' selected':''}>${esc(p.ifname)}${p.network?` · ${esc(p.network)}`:''}</option>`);
         }
       }
-      return `<span class="port-wrap"><select class="port-sel" data-role="${role}" data-idx="${idx}"
-                title="${_pairs227.length ? 'Paire 2022-7 (les deux legs) ou port de ce slot' : 'Port (NIC) de ce slot — Auto = répartition automatique entre les ports du réseau'}">${opts.join('')}</select></span>`;
+      return `<span class="port-wrap"><select class="ctl-select io-portsel" data-role="${role}" data-idx="${idx}"
+                data-idxs="${esc((idxs && idxs.length ? idxs : [idx]).join(','))}"
+                title="${_pairs227.length ? 'Paire 2022-7 (les deux legs) ou port de cet ensemble' : 'Port (NIC) de cet ensemble — Auto = répartition automatique entre les ports du réseau'}">${opts.join('')}</select></span>`;
     }
 
     // Ligne de flux audio/ANC avec bouton de retrait granulaire (« Option A »).
     function _rmWrap(html, fid){
       return `<div class="io2110-flowrow">${html}`
-           + (fid ? `<button class="io2110-flowrm" data-fid="${esc(fid)}" title="Retirer ce flux">✕</button>` : '')
+           + (fid ? `<button type="button" class="btn btn-sm io2110-flowrm" data-fid="${esc(fid)}" title="Retirer ce flux">✕</button>` : '')
            + `</div>`;
     }
 
@@ -543,16 +652,17 @@ window.MXLPlugins["2110_io"] = {
       dropped = Math.max(0, dropped || 0);
       const pct  = Math.min(100, Math.round(active / cap * 100));
       const over = dropped > 0 || active > cap;
-      const col  = over ? 'var(--status-stopped-fg,#f87171)'
-                 : (active >= cap ? '#e8a33d' : 'var(--status-running-fg,#22c55e)');
+      // Le plafond RL est une limite DURE de la carte : atteindre le cap est déjà l'alerte, le
+      // dépasser est la faute. Pas de seuil intermédiaire à matérialiser ici.
+      const etat = over ? 'over' : (active >= cap ? 'warn' : '');
       let txt = window.t('js.io2110.rl_val').replace('{act}', active).replace('{cap}', cap)
                 + ` (${pct}%)`;
       if (over) txt = window.t('js.io2110.rl_overcap').replace('{n}', dropped || (active - cap))
                       + ' — ' + txt;
       return `<div class="nic-bar-wrap">
         <span class="nic-bar-lbl" title="${esc(window.t('js.io2110.rl_tip'))}">${esc(window.t('js.io2110.rl_sessions'))}</span>
-        <span class="nic-bar-val" style="color:${col}">${esc(txt + (scope || ''))}</span>
-        <div class="nic-bar-track"><div class="nic-bar-fill" style="width:${pct}%;background:${col}"></div></div>
+        <span class="nic-bar-val" style="color:${_nicCouleur(etat)}">${esc(txt + (scope || ''))}</span>
+        ${_gauge(pct, etat, esc(txt), false)}
       </div>`;
     }
 
@@ -577,8 +687,13 @@ window.MXLPlugins["2110_io"] = {
             (g.ancs || []).forEach(d => rows.push(_rmWrap(rowReceiver(d, g.video), d.flow_id)));
             if (g.independent) {
               // Flux indépendants (audio/ANC non rattachés à une vidéo).
-              return `<div class="ens ens-indep">
-                <div class="ens-title">Flux indépendants</div>
+              // Flux indépendants : chacun EST son propre ensemble (aucune vidéo d'attache), donc
+              // le port se choisit flux par flux — pas une exception à la règle, son application.
+              return `<div class="ens ens-indep ctl-dense">
+                <div class="ens-title">Flux indépendants${
+                  g.audios.concat(g.ancs || []).map(x =>
+                    `<span class="io-indepport" title="Port du flux ${esc(String(x.shm_path || '').replace(/^\/dev\/shm\//, '') || ('#' + x.idx))}">${
+                      esc((x.essence || '').toUpperCase())} ${portSelector('rx', x.idx, x.port)}</span>`).join('')}</div>
                 ${rows.join('')}
               </div>`;
             }
@@ -588,12 +703,22 @@ window.MXLPlugins["2110_io"] = {
             const vfid = g.video ? (g.video.flow_id || '') : '';
             // Ajout/retrait granulaire par vidéo : + Audio / + ANC rattachés ; ✕ retire la source entière.
             const ctrls = vfid ? `<div class="io2110-flowctrls">
-              <button class="io2110-addflow" data-ess="audio" data-att="${esc(vfid)}">+ Audio</button>
-              <button class="io2110-addflow" data-ess="anc" data-att="${esc(vfid)}">+ ANC</button>
-              <button class="io2110-flowrm io2110-rmgrp" data-fid="${esc(vfid)}" title="Retirer cette source">✕ source</button>
+              <button type="button" class="btn btn-sm io2110-addflow" data-ess="audio" data-att="${esc(vfid)}">+ Audio</button>
+              <button type="button" class="btn btn-sm io2110-addflow" data-ess="anc" data-att="${esc(vfid)}">+ ANC</button>
+              <button type="button" class="btn btn-sm io2110-flowrm io2110-rmgrp" data-fid="${esc(vfid)}" title="Retirer cette source">✕ source</button>
             </div>` : '';
-            return `<div class="ens">
-              <div class="ens-title">Rx #${i + 1} — ${titleParts.join(' + ')}</div>
+            // `ctl-dense` : contexte du catalogue. Une carte porte N lignes de trois contrôles ;
+            // aux métriques de pupitre (poussoir 38 px), seize slots repoussent la carte hors de
+            // l'écran. La cible tactile n'est pas sacrifiée pour autant (cf. controls.css).
+            // Le port de l'ensemble : posé sur la vidéo ET sur tous ses flux attachés, en une
+            // opération serveur. Le sélecteur porte l'index de la vidéo (référence) et la liste
+            // complète dans `data-idxs`.
+            const _ensIdxs = [g.video && g.video.idx]
+              .concat(g.audios.map(a => a.idx), (g.ancs || []).map(d => d.idx))
+              .filter(x => x != null);
+            return `<div class="ens ctl-dense">
+              <div class="ens-title">Rx #${i + 1} — ${titleParts.join(' + ')}${
+                g.video ? portSelector('rx', g.video.idx, g.video.port, _ensIdxs) : ''}</div>
               ${rows.join('')}
               ${ctrls}
             </div>`;
@@ -601,24 +726,28 @@ window.MXLPlugins["2110_io"] = {
       const ensVideoCount = ens.filter(g => g.video).length;
       // Headroom = pool pré-provisionné (video_count). Au-delà → augmenter le pool (redéploiement).
       const moreBtn = ensVideoCount < _cachedVideoCount
-        ? `<button class="io2110-more-btn">+ Ajouter une source</button>`
+        ? `<button class="io-addrow">+ Ajouter une source</button>`
         : '';
       const delBtn = ensVideoCount > 0
-        ? `<button class="io2110-more-btn io2110-del-rx">− Retirer la dernière source</button>`
+        ? `<button class="io-addrow io2110-del-rx">− Retirer la dernière source</button>`
         : '';
       // Remède famine : ≥1 source abonnée mais sans flux (rx_stalled) → bouton de réalignement des
       // files (redéploiement du moteur). Disruptif → passe par mtlMutate (confirmation serveur).
       const _anyStalled = _cachedRecvs.some(r => r.rx_stalled);
       const realignBtn = _anyStalled
-        ? `<button class="io2110-more-btn io2110-realign" title="Une ou plusieurs sources sont abonnées mais ne reçoivent aucun flux. Redéployer le moteur réaligne les files (coupure brève de TOUS les flux).">⟳ Redéployer pour réaligner les files</button>`
+        ? `<button class="io-addrow io2110-realign" title="Une ou plusieurs sources sont abonnées mais ne reçoivent aucun flux. Redéployer le moteur réaligne les files (coupure brève de TOUS les flux).">⟳ Redéployer pour réaligner les files</button>`
         : '';
       // Création d'un flux INDÉPENDANT (audio/ANC sans vidéo d'attache).
       const indepAdd = `<div class="io2110-flowctrls io2110-indepadd">
         <span class="meta">Indépendant :</span>
-        <button class="io2110-addflow" data-ess="audio" data-att="">+ Audio</button>
-        <button class="io2110-addflow" data-ess="anc" data-att="">+ ANC</button>
+        <button type="button" class="btn btn-sm io2110-addflow" data-ess="audio" data-att="">+ Audio</button>
+        <button type="button" class="btn btn-sm io2110-addflow" data-ess="anc" data-att="">+ ANC</button>
       </div>`;
       body.innerHTML = _cachedMeta + _nicPortStrip(_lastNicPorts) + inner + indepAdd + moreBtn + delBtn + realignBtn + _cachedTxHtml;
+      // Le bouton de remise au défaut des rotatifs est posé par le CATALOGUE, pas écrit ici : c'est
+      // ce qui garantit qu'on ne l'oublie pas, et l'appel est idempotent (rien n'est doublé à
+      // chaque rendu). Il n'appelle rien du plugin, il émet `ctl-knob-reset` (cf. onKnobReset).
+      if (window.MXLControls) window.MXLControls.attachKnobGestures(body, 'Remettre à la taille automatique');
       const realignEl = body.querySelector('.io2110-realign');
       if (realignEl) {
         realignEl.onclick = async () => {
@@ -654,7 +783,7 @@ window.MXLPlugins["2110_io"] = {
         } catch(e) { toast('Erreur réseau', 'error'); }
         await refresh();
       });
-      const moreEl = body.querySelector('.io2110-more-btn:not(.io2110-del-rx)');
+      const moreEl = body.querySelector('.io-addrow:not(.io2110-del-rx):not(.io2110-realign)');
       if (moreEl) {
         moreEl.onclick = async () => {
           moreEl.disabled = true;
@@ -730,15 +859,18 @@ window.MXLPlugins["2110_io"] = {
         const _xdpDen     = _xdpHwMax || _xdpAlloc;
         const _xdpUsedPct = _xdpDen ? Math.min(100, Math.round(_xdpAlloc / _xdpDen * 100)) : 0;
         const _xdpOver    = (_xdpHwMax != null) && (_xdpAlloc > _xdpHwMax);
-        const _xdpColU = (_xdpOver || _xdpUsedPct >= 100) ? 'var(--status-stopped-fg,#f87171)' : _xdpUsedPct > 85 ? '#e8a33d' : 'var(--status-running-fg,#22c55e)';
+        // Seuil propre à ce repli : l'alerte est à 85 % des files, pas à 60 % comme un débit.
+        const _xdpEtat = (_xdpOver || _xdpUsedPct >= 100) ? 'over' : _xdpUsedPct > 85 ? 'warn' : '';
         const _xdpTxt  = (_xdpHwMax != null)
           ? (_xdpOver ? `${_xdpAlloc} / ${_xdpHwMax} files — SUR-CAPACITÉ (${_xdpAct} actives)`
                       : `${_xdpAlloc} / ${_xdpHwMax} files (${_xdpUsedPct}%)`)
           : `${_xdpAct} / ${_xdpAlloc} sessions`;
         _nicXdpBar = `<div class="nic-bar-wrap">
           <span class="nic-bar-lbl">Queues XDP</span>
-          <span class="nic-bar-val" style="color:${_xdpColU}">${_xdpTxt}</span>
-          <div class="nic-bar-track"><div class="nic-bar-fill" style="width:${_xdpUsedPct}%;background:${_xdpColU}"></div></div>
+          <span class="nic-bar-val" style="color:${_nicCouleur(_xdpEtat)}">${_xdpTxt}</span>
+          <span class="ctl-gauge${_xdpEtat ? ' ' + _xdpEtat : ''}" role="img" aria-label="${esc(_xdpTxt)}"
+            style="--ctl-gauge-w:100%;flex:1;--ctl-gauge-seuil:85%"><span class="ctl-gauge-fill"
+            style="transform:scaleX(${(Math.min(100, _xdpUsedPct) / 100).toFixed(3)})"></span></span>
         </div>`;
       }
       _lastNicPorts = (c && c.nic_ports) || [];   // mémorisé pour reconstruire la bande au toggle (sans refetch)
@@ -747,14 +879,16 @@ window.MXLPlugins["2110_io"] = {
       _renderBody();
     }
 
-    // Délégation : clic sur un badge IDENT → bascule l'incrustation de ce slot vidéo.
+    // Délégation : clic sur le poussoir IDENT → bascule l'incrustation de ce slot vidéo.
+    // L'attente se dit par `disabled` + `aria-busy` (le poussoir refuse le geste ET l'annonce),
+    // là où la classe `.busy` d'avant ne faisait que griser : au clavier, rien ne l'arrêtait.
     async function onClickIdent(e){
-      const badge = e.target.closest('.ident-badge');
+      const badge = e.target.closest('.io-ident');
       if (!badge || !body.contains(badge)) return;
-      if (badge.classList.contains('busy')) return;
+      if (badge.disabled) return;
       const idx = parseInt(badge.dataset.idx, 10);
       const enable = badge.dataset.enable === '1';
-      badge.classList.add('busy');
+      badge.disabled = true; badge.setAttribute('aria-busy', 'true');
       try {
         const resp = await fetch(`/api/containers/${vmid}/control/ident`, {
           method: 'POST', headers: {'Content-Type': 'application/json'},
@@ -765,7 +899,7 @@ window.MXLPlugins["2110_io"] = {
       } catch(err) {
         toast('Échec du basculement IDENT : ' + err.message, 'error');
       } finally {
-        badge.classList.remove('busy');
+        badge.disabled = false; badge.removeAttribute('aria-busy');
       }
     }
     // Taille IDENT via un petit rotatif (glisser ↕ ou molette) : aperçu live, POST throttlé.
@@ -779,75 +913,46 @@ window.MXLPlugins["2110_io"] = {
         });
       } catch(err) { toast('Échec taille IDENT : ' + err.message, 'error'); }
     }
-    function _setKnob(knob, val){
-      val = Math.max(10, Math.min(120, val));
-      knob.dataset.val = val; knob.setAttribute('aria-valuenow', val);
-      const dial = knob.querySelector('.ident-knob-dial');
-      if (dial) dial.style.transform = `rotate(${_identAngle(val)}deg)`;
-      const lbl = knob.parentElement.querySelector('.ident-size-val');
-      if (lbl) lbl.textContent = val + 'px';
-      return val;
-    }
     function _schedIdent(idx, val){
       clearTimeout(_identThrottle[idx]);
       _identThrottle[idx] = setTimeout(() => _postIdentSize(idx, val), 120);
     }
-    let knobDrag = null;
-    function onKnobDown(e){
-      const k = e.target.closest('.ident-knob');
+    // Le GESTE du rotatif (glisser, molette, clavier, remise au défaut) est celui du CATALOGUE :
+    // `MXLControls.attachKnobGestures` le lit dans les attributs du contrôle. Le plugin n'écoute
+    // que le résultat — il sait ce que la valeur commande, le catalogue sait comment elle se règle.
+    function onKnobInput(e){
+      const k = e.target.closest('.io-identknob');
       if (!k || !body.contains(k)) return;
-      knobDrag = {k, idx: parseInt(k.dataset.idx, 10), startY: e.clientY, startVal: parseInt(k.dataset.val, 10) || 12};
-      try { k.setPointerCapture(e.pointerId); } catch(_){}
-      e.preventDefault();
-    }
-    function onKnobMove(e){
-      if (!knobDrag) return;
-      // glisser vers le haut = augmenter ; pas de 2 px, ~0.7 px de valeur par px souris.
-      const v = _setKnob(knobDrag.k, Math.round((knobDrag.startVal + (knobDrag.startY - e.clientY) * 0.7) / 2) * 2);
-      _schedIdent(knobDrag.idx, v);
-    }
-    function onKnobUp(e){
-      if (!knobDrag) return;
-      try { knobDrag.k.releasePointerCapture(e.pointerId); } catch(_){}
-      knobDrag = null;
-    }
-    function onKnobWheel(e){
-      const k = e.target.closest('.ident-knob');
-      if (!k || !body.contains(k)) return;
-      e.preventDefault();
-      const idx = parseInt(k.dataset.idx, 10);
-      const v = _setKnob(k, (parseInt(k.dataset.val, 10) || 12) + (e.deltaY < 0 ? 2 : -2));
-      _schedIdent(idx, v);
+      _schedIdent(parseInt(k.dataset.idx, 10), e.detail.value);
     }
 
-    // Délégation : clic sur un badge GÉN → bascule le générateur de ce slot.
+    // Délégation : clic sur le poussoir GÉN → bascule le générateur de ce slot.
     async function onClick(e){
-      const badge = e.target.closest('.gen-badge');
+      const badge = e.target.closest('.io-gen');
       if (!badge || !body.contains(badge)) return;
-      if (badge.classList.contains('busy')) return;
+      if (badge.disabled) return;
       const essence = badge.dataset.essence;
       const idx = parseInt(badge.dataset.idx, 10);
       const enable = badge.dataset.enable === '1';
-      badge.classList.add('busy');
+      badge.disabled = true; badge.setAttribute('aria-busy', 'true');
       try {
         const resp = await fetch(`/api/containers/${vmid}/control/gen`, {
           method: 'POST', headers: {'Content-Type': 'application/json'},
           body: JSON.stringify({essence, idx, enabled: enable}),
         });
         if (!resp.ok) { const j = await resp.json().catch(()=>({})); throw new Error(j.error || ('HTTP ' + resp.status)); }
-        badge.classList.toggle('on', enable);
-        badge.classList.toggle('off', !enable);
+        badge.setAttribute('aria-pressed', String(enable));
         badge.dataset.enable = enable ? '0' : '1';
         setTimeout(refresh, 2500);   // le redéploiement côté container est asynchrone
       } catch(err) {
         toast('Échec du basculement du générateur : ' + err.message, 'error');
       } finally {
-        badge.classList.remove('busy');
+        badge.disabled = false; badge.removeAttribute('aria-busy');
       }
     }
     // Délégation : changement de pattern dans le <select> du tooltip GÉN.
     async function onPatternChange(e){
-      const sel = e.target.closest('.gen-pat-sel');
+      const sel = e.target.closest('.io-patsel');
       if (!sel || !body.contains(sel)) return;
       const essence = sel.dataset.essence;
       const idx = parseInt(sel.dataset.idx, 10);
@@ -863,24 +968,30 @@ window.MXLPlugins["2110_io"] = {
       }
     }
     // Délégation : toggle « Par NIC » — déplie/replie le détail des ports (sans refetch).
+    // Une RÉVÉLATION, pas un interrupteur : d'où `aria-expanded` sur un bouton de commande, et
+    // non un poussoir à accrochage. Le crochet est nommé `io-nictoggle` et NON `io2110-nictoggle`
+    // à dessein : ce dernier est restylé par la feuille embarquée de static/io2110.js, injectée
+    // APRÈS le socle sur la page /io — elle aurait silencieusement repris la main sur `.btn`.
     function onNicToggle(e){
-      const btn = e.target.closest('.io2110-nictoggle');
+      const btn = e.target.closest('.io-nictoggle');
       if (!btn || !body.contains(btn)) return;
       _nicOpen = !_nicOpen;
       _renderBody();
     }
     // Délégation : changement de PORT (NIC) d'un slot — épinglage / retour à l'auto (multi-NIC).
     async function onPortChange(e){
-      const sel = e.target.closest('.port-sel');
+      const sel = e.target.closest('.io-portsel');
       if (!sel || !body.contains(sel)) return;
       const role = sel.dataset.role;
       const idx = parseInt(sel.dataset.idx, 10);
+      // Tous les flux de l'ensemble, épinglés en une opération (cf. portSelector).
+      const idxs = String(sel.dataset.idxs || idx).split(',').map(Number).filter(n => !isNaN(n));
       const iface = sel.value;   // '' = Auto (répartition)
       sel.disabled = true;
       try {
         const resp = await fetch(`/api/mtl/${vmid}/pin`, {
           method: 'POST', headers: {'Content-Type': 'application/json'},
-          body: JSON.stringify({role, idx, iface}),
+          body: JSON.stringify({role, idx, idxs, iface}),
         });
         if (!resp.ok) { const j = await resp.json().catch(()=>({})); throw new Error(j.error || ('HTTP ' + resp.status)); }
         setTimeout(refresh, 700);   // laisse reconcile déplacer la session
@@ -980,7 +1091,7 @@ window.MXLPlugins["2110_io"] = {
         document.getElementById('rx-sdp-ta').focus();
     }
     function onClickSdp(e){
-        const badge = e.target.closest('.sdp-badge');
+        const badge = e.target.closest('.io-sdp');
         if (!badge || !body.contains(badge)) return;
         _openSdpModal(badge.dataset.essence || 'video', parseInt(badge.dataset.idx, 10));
     }
@@ -991,10 +1102,7 @@ window.MXLPlugins["2110_io"] = {
     body.addEventListener('click', onNicToggle);
     body.addEventListener('change', onPatternChange);
     body.addEventListener('change', onPortChange);
-    body.addEventListener('pointerdown', onKnobDown);
-    body.addEventListener('pointermove', onKnobMove);
-    body.addEventListener('pointerup', onKnobUp);
-    body.addEventListener('wheel', onKnobWheel, {passive: false});
+    body.addEventListener('ctl-knob-input', onKnobInput);   // émis par le catalogue
 
     // Changement de niveau de libellé (barre de navigation) → re-rendu immédiat, sans attendre
     // le prochain tick de 5 s : le sélecteur doit répondre à la volée.
