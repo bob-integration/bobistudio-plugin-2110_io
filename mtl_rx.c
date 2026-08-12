@@ -568,9 +568,16 @@ struct sess {
                               MESURÉ le 2026-08-12 : `depth_avg` 3,00 avec `slot_wait_ms` à 0,0 —
                               le worker n'attend jamais un slot, il a simplement trois trames
                               prêtes en permanence, niveau figé par le transitoire de démarrage
-                              (deux débits égaux ne vident jamais une file). La lib servant la plus
-                              ANCIENNE (`dist_avg` = `depth_avg` − 1, mesuré), cette avance est de
-                              la latence pure : 20 ms par trame stockée. */
+                              (deux débits égaux ne vident jamais une file).
+                              ⛔ CE QU'ON EN ATTENDAIT EST RÉFUTÉ. On a cru que cette avance était
+                              de la latence (`dist_avg` = `depth_avg` − 1 + « la lib sert la plus
+                              ancienne » ⇒ 20 ms par trame stockée). MESURÉ ensuite : ramener la
+                              file de 3 à 1 ne change PAS la latence (62,1 ms et +3 trames aux trois
+                              paliers) et, à 1, le TX ne consomme plus qu'une trame source sur deux.
+                              Le délai est dans l'ORDONNANCEMENT de l'émission, pas dans le stock —
+                              cf. `epoch_shift_us`, seul levier qui déplace réellement l'aiguille.
+                              LAISSER À 0. Le réglage n'est conservé que comme INSTRUMENT : c'est
+                              lui qui a permis d'écarter la file comme cause. */
   size_t   src_framesize; int conv8;
   size_t   shm_slotsize;   /* taille d'un slot shm = TRAME PLEINE (≠ slotsize = taille CHAMP en
                               entrelacé, côté libmtl). 0 ⇒ open_shm retombe sur slotsize (audio/data). */
@@ -2206,15 +2213,19 @@ static void* video_tx_slice_thread(void* arg) {
      * contre-pression visible à un thread qui part en vrille muet. */
     for (uint16_t _k = 0; _k < s->sl_fb_cnt && s->sl_fb[s->sl_fb_prod].stat == 2; _k++)
       s->sl_fb_prod = (uint16_t)((s->sl_fb_prod + 1) % s->sl_fb_cnt);
-    /* ── BRIDAGE D'AVANCE ─────────────────────────────────────────────────────────────────
-     * Tant que `advance` trames sont DÉJÀ prêtes, on ne commence pas la suivante. On ne DRAINE
-     * pas : l'essai du 2026-08-09 libérait tous les slots prêts sauf le plus récent, et les
-     * répétitions montaient au rythme exact des purges — chaque trame jetée était précisément
-     * celle que la lib allait servir. Ne pas produire en avance est autre chose que jeter ce
-     * qu'on a produit.
+    /* ── BRIDAGE D'AVANCE (instrument, PAS un levier de latence) ──────────────────────────
+     * Tant que `advance` trames sont DÉJÀ prêtes, on ne commence pas la suivante. Ce n'est pas
+     * la disponibilité d'un slot qu'on régule, c'est la PROFONDEUR de la file — le slot visé
+     * peut être libre et le bridage s'appliquer quand même.
      *
-     * Le slot visé peut être libre et le bridage s'appliquer quand même : c'est voulu. Ce n'est
-     * pas la disponibilité d'un slot qu'on régule, c'est la PROFONDEUR de la file. */
+     * ⛔ RÉSULTAT (2026-08-12, banc apparié au contenu) : ça marche mécaniquement — la file
+     * descend de 3 à 1 et `adv_wait_ms` monte à 1868 ms par fenêtre de 2 s — mais LA LATENCE NE
+     * BOUGE PAS (62,1 ms, +3 trames, aux trois paliers), et à 1 le TX ne consomme plus qu'une
+     * trame source sur deux. Garder 0. Ce qui déplace vraiment l'aiguille est `epoch_shift_us`.
+     *
+     * On ne draine pas non plus : l'essai du 2026-08-09 libérait tous les slots prêts sauf le
+     * plus récent, et les répétitions montaient au rythme exact des purges — chaque trame jetée
+     * était celle que la lib allait servir. */
     if (s->advance > 0 && !statique) {
       unsigned _occ = 0;
       for (uint16_t _k = 0; _k < s->sl_fb_cnt; _k++)
