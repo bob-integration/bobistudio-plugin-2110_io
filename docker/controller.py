@@ -1774,6 +1774,15 @@ class AgentHandler(BaseHTTPRequestHandler):
                 if "epoch_shift_us" in body:
                     try: t["epoch_shift_us"] = max(0, int(body.get("epoch_shift_us") or 0))
                     except Exception: t["epoch_shift_us"] = 0
+                # BRIDAGE D'AVANCE : plafond de trames prêtes que le worker TX s'autorise devant
+                # celle que la lib émet (0 = désactivé). ⚠ Ce relais est INDISPENSABLE : sans lui
+                # le réglage part de l'orchestrateur, arrive ici, et n'atteint jamais mtl_rx — le
+                # bridage reste silencieusement inactif (`adv_wait_ms` à 0,0 quel que soit le
+                # plafond demandé). C'est la même dette que celle déjà signalée pour `ring` sur
+                # les sessions TX pleine trame.
+                if "advance" in body:
+                    try: t["advance"] = max(0, int(body.get("advance") or 0))
+                    except Exception: t["advance"] = 0
                 if "audios" in body:
                     t["audios"] = [{"mcast": a.get("mcast") or None,
                                     "port": int(a.get("port") or 0),
@@ -2564,6 +2573,10 @@ def _tx_session(idx, t, iface=IFACE):
             # Rythme d'émission (mode tranche) : >0 = grille d'émission décalée de N µs (dans la
             # signature de session mtl_rx → changement = recréation propre de la session).
             "epoch_shift_us": int(t.get("epoch_shift_us") or 0),
+            # Plafond d'avance du worker (0 = désactivé). Comme `epoch_shift_us`, il entre dans la
+            # SIGNATURE de session : le changer recrée proprement la session TX — bref silence à
+            # l'antenne, à ne pas faire en direct sans prévenir.
+            "advance": int(t.get("advance") or 0),
             # ident_file TOUJOURS présent (sig stable → toggle IDENT sans recréer la session) ;
             # le fichier n'existe que quand l'IDENT est actif (mtl_rx libère le patch sinon).
             # static_frame TOUJOURS présent (comme ident_file : signature de session stable → passer
