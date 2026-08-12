@@ -3146,11 +3146,16 @@ static int parse_session_into(struct json_object* j, struct sess* s) {
  * on en recrée une (flow RX recyclé, device/XDP intacts ⇒ pas de faute PTP). */
 static void compute_sig(struct sess* s) {
   int n = snprintf(s->sig, sizeof(s->sig),
-                   "%d|%d|%s|%d|%d|%u|%dx%d|%.2f|i%d|f%d|bd%d|r%d|ch%d|ap%.3f|es%d|if%s|if2%s|mc2%s|p2%d|",
+                   /* `av` = bridage d'avance. Il DOIT être dans la signature : sans lui le moteur
+                    * reconnaît la session comme identique, ne la recrée pas, et `s->advance` garde
+                    * la valeur lue à la création — le réglage part de l'orchestrateur, traverse le
+                    * contrôleur, et n'a AUCUN effet, `adv_wait_ms` restant à 0,0 quoi qu'on demande.
+                    * Constaté le 2026-08-12 après deux rebuilds passés à chercher ailleurs. */
+                   "%d|%d|%s|%d|%d|%u|%dx%d|%.2f|i%d|f%d|bd%d|r%d|ch%d|ap%.3f|es%d|av%d|if%s|if2%s|mc2%s|p2%d|",
                    s->role, s->kind, s->mcast, s->udp_port, s->payload_type, s->ssrc,
                    s->width, s->height, s->fps, s->interlaced, s->tff, s->bit_depth, s->ring,
-                   s->channels, s->a_ptime, s->epoch_shift_us, s->iface, s->iface_r, s->mcast_r,
-                   s->udp_port_r);
+                   s->channels, s->a_ptime, s->epoch_shift_us, s->advance, s->iface, s->iface_r,
+                   s->mcast_r, s->udp_port_r);
   /* bobi.studio: pour un TX la SOURCE (tg[].shm_path) n'entre PAS dans l'identité de session → la
    * changer ne recrée plus la session (swap à chaud via tx_set_source/tx_take_source, pas de commit
    * RL / dé-lock PTP). Pour un RX les flux de SORTIE font partie de l'identité → on les garde. */
