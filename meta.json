@@ -1,7 +1,14 @@
 {
-  "version": "0.89.0",
+  "version": "0.90.0",
   "date": "2026-08-12",
   "changes": {
+    "★ Le TX servait la trame la plus ANCIENNE — une époque perdue (0.90.0)": [
+      "MESURÉ : la source publie sa trame à ~6 ms dans son créneau et libmtl vient la chercher à 16,4 ms du même créneau — elle est donc DISPONIBLE À TEMPS pour l'époque suivante. Elle partait pourtant deux époques plus tard, parce que `tx_sl_next_frame` rendait `sl_fb_cons`, la plus ANCIENNE trame prête : on émettait une trame périmée pendant qu'une plus fraîche attendait derrière.",
+      "Nouveau réglage `serve_newest` (0 = désactivé) : le callback rend la trame la plus récemment PUBLIÉE et libère celles qui sont strictement plus anciennes. RÉSULTAT sur banc mire → TX → Neuron → RX, âge du contenu mesuré aux bandeaux contre l'horloge TAI : **62,5 → 42,6 ms, exactement une époque**. `wait_pub_ms` 27,7 → 7,6. Cadence consommée inchangée (50,3), `repeats` et `late` figés à 2 après transitoire, sur 4 minutes.",
+      "⚠ CE N'EST PAS LE DRAIN DE JUILLET, qui jetait la trame que la lib allait servir (`drained` et `repeats` montaient au même rythme). On ne libère que des trames STRICTEMENT plus anciennes que celle qu'on sert, et jamais celle EN VOL — suivie par `sl_fb_inflight`, posée par ce callback et libérée par notify_frame_done. Les trames périmées libérées sont comptées (`skipped`).",
+      "Le reste de la journée, pour mémoire : six réglages essayés et RÉFUTÉS avant celui-ci (anneau, `advance`, `epoch_shift_us`, `publish_lead_us`, propagation d'origine du mur, drain). Tous jouaient sur des instants À L'INTÉRIEUR d'une époque, alors que le délai se compte EN ÉPOQUES — d'où leur inefficacité, et d'où l'importance de mesurer l'âge du contenu contre une HORLOGE et non par comparaison d'index entre flux.",
+      "REBUILD IMAGE REQUIS (mtl_rx.c, controller.py)."
+    ],
     "Bridage d'avance du worker TX : le réglage marche, l'hypothèse est FAUSSE (0.89.0)": [
       "⛔ RÉFUTÉ LE JOUR MÊME — à lire avant d'y revenir. Le réglage `advance` fonctionne (file 3 → 1, `adv_wait_ms` à 1868 ms par fenêtre de 2 s) mais LA LATENCE NE BOUGE PAS : 62,1 ms et +3 trames aux paliers 0, 2 et 1, mesurés au banc apparié au CONTENU. Et à `advance=1` le TX ne consomme plus qu'une trame source sur deux (fps_source 25,4 pour 50). LAISSER À 0.",
       "Le raisonnement fautif : `dist_avg` = `depth_avg` − 1 et « la lib sert la plus ancienne » ⇒ « la profondeur est du retard, 20 ms par trame stockée ». L'expérience dit non. Le délai est dans l'ORDONNANCEMENT de l'émission, pas dans le stock de trames prêtes — cohérent avec `epoch_shift_us`, seul levier qui déplace réellement l'aiguille (exactement une trame, sur deux sources différentes).",

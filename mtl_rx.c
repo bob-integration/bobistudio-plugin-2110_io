@@ -563,6 +563,19 @@ struct sess {
                               le contrôleur). Convention bobi libmtl (patch_epoch_shift) : porté par
                               ops.rtp_timestamp_delta_us NÉGATIF. Une chaîne interne à ~5 ms de phase
                               évite ainsi de payer +1 trame (« attendre l'image suivante »). */
+  int      serve_newest;   /* TX vidéo TRANCHE : servir la trame la PLUS RÉCEMMENT publiée au lieu
+                              de la plus ancienne (FIFO). 0 = désactivé (historique).
+                              POURQUOI. MESURÉ le 2026-08-12 : la mire publie sa trame à ~6 ms dans
+                              son créneau, libmtl vient la chercher à 16,4 ms du même créneau — elle
+                              est donc DISPONIBLE À TEMPS pour l'époque suivante. Elle part pourtant
+                              deux époques plus tard, parce que ce callback rend `sl_fb_cons`, la
+                              plus ANCIENNE prête : on émet une trame périmée pendant qu'une plus
+                              fraîche attend derrière.
+                              ⚠ La tentative de juillet a échoué en JETANT des trames — elle jetait
+                              celle que la lib allait servir (`drained` et `repeats` montaient au
+                              même rythme). Ici on ne jette que des trames STRICTEMENT plus
+                              anciennes que celle qu'on sert, et jamais celle en vol (`sl_fb_inflight`,
+                              posée par ce même callback et libérée par notify_frame_done). */
   int      publish_lead_us; /* TX vidéo TRANCHE : FREIN TEMPOREL. Le worker attend d'être à
                               `publish_lead_us` µs de la prochaine époque avant d'aller chercher
                               le grain source. 0 = désactivé (comportement historique).
@@ -746,6 +759,9 @@ struct sess {
    * coûte : attente d'un slot libre (déjà mesurée par slot_wait_*) + ATTENTE DU GRAIN source +
    * PACKING. Les deux dernières étaient confondues, si bien qu'un worker publiant 37/s pour une
    * source à 50/s ne pouvait pas être attribué. Reset à chaque fenêtre de stats, comme slot_wait. */
+  uint16_t sl_fb_inflight;     /* slot RENDU au dernier appel = trame en cours d'émission */
+  int      sl_fb_inflight_ok;  /* sl_fb_inflight est-il renseigné ? */
+  uint64_t sl_skipped;         /* trames périmées libérées sans être émises (serve_newest) */
   uint64_t sl_wait_pub_ns;     /* cumul publication → 1re sollicitation par la lib */
   uint64_t sl_wait_pub_cnt;
   uint64_t sl_wait_pub_max;
@@ -2012,7 +2028,37 @@ static int tx_sl_next_frame(void* priv, uint16_t* next_frame_idx, struct st20_tx
     }
     return 0;
   }
+  if (s->serve_newest) {
+    /* La plus RÉCEMMENT publiée parmi les slots prêts, en excluant celle en vol : elle est
+     * encore stat=1 mais la lib est en train de l'émettre, la libérer produirait du déchirement. */
+    int _best = -1;
+    for (uint16_t _k = 0; _k < s->sl_fb_cnt; _k++) {
+      if (s->sl_fb[_k].stat != 1) continue;
+      if (s->sl_fb_inflight_ok && _k == s->sl_fb_inflight) continue;
+      if (_best < 0 || s->sl_fb[_k].pub_ns > s->sl_fb[_best].pub_ns) _best = _k;
+    }
+    if (_best >= 0) {
+      /* Les prêtes STRICTEMENT plus anciennes que celle qu'on sert sont périmées : personne ne
+       * les émettra jamais (on vient de passer devant), et les laisser occuperait l'anneau
+       * jusqu'au watchdog. On les libère — c'est la différence avec un drain aveugle : on ne
+       * touche ni à celle qu'on sert, ni à celle en vol. */
+      for (uint16_t _k = 0; _k < s->sl_fb_cnt; _k++) {
+        if (_k == (uint16_t)_best || s->sl_fb[_k].stat != 1) continue;
+        if (s->sl_fb_inflight_ok && _k == s->sl_fb_inflight) continue;
+        if (s->sl_fb[_k].pub_ns < s->sl_fb[_best].pub_ns) {
+          s->sl_fb[_k].stat = 0;
+          s->sl_skipped++;
+        }
+      }
+      *next_frame_idx = (uint16_t)_best;
+      s->sl_fb_inflight = (uint16_t)_best; s->sl_fb_inflight_ok = 1;
+      s->sl_fb_cons = (uint16_t)((_best + 1) % s->sl_fb_cnt);
+      s->srv_fresh++;
+      return 0;
+    }
+  }
   *next_frame_idx = c;
+  s->sl_fb_inflight = c; s->sl_fb_inflight_ok = 1;
   s->sl_fb_cons = (uint16_t)((c + 1) % s->sl_fb_cnt);
   s->srv_fresh++;
   return 0;
@@ -3200,6 +3246,7 @@ static int parse_session_into(struct json_object* j, struct sess* s) {
    * `repeats`, pas d'un coup. Poussé par l'orchestrateur comme `ring`, sans recréation. */
   s->advance=jint(j,"advance", 0);
   s->publish_lead_us=jint(j,"publish_lead_us", 0);
+  s->serve_newest=jint(j,"serve_newest", 0);
   /* multi-NIC : `iface` (leg primaire) → portname résolu (vide = iface inconnu, détecté au create).
    * `iface` absent → port 0 (mono-NIC). 2022-7 : `iface2`/`mcast2`/`udp_port2` = 2ᵉ leg (red/blue). */
   snprintf(s->iface, sizeof(s->iface), "%s", jstr(j,"iface",""));
@@ -3261,10 +3308,10 @@ static void compute_sig(struct sess* s) {
                     * la valeur lue à la création — le réglage part de l'orchestrateur, traverse le
                     * contrôleur, et n'a AUCUN effet, `adv_wait_ms` restant à 0,0 quoi qu'on demande.
                     * Constaté le 2026-08-12 après deux rebuilds passés à chercher ailleurs. */
-                   "%d|%d|%s|%d|%d|%u|%dx%d|%.2f|i%d|f%d|bd%d|r%d|ch%d|ap%.3f|es%d|av%d|pl%d|if%s|if2%s|mc2%s|p2%d|",
+                   "%d|%d|%s|%d|%d|%u|%dx%d|%.2f|i%d|f%d|bd%d|r%d|ch%d|ap%.3f|es%d|av%d|pl%d|sn%d|if%s|if2%s|mc2%s|p2%d|",
                    s->role, s->kind, s->mcast, s->udp_port, s->payload_type, s->ssrc,
                    s->width, s->height, s->fps, s->interlaced, s->tff, s->bit_depth, s->ring,
-                   s->channels, s->a_ptime, s->epoch_shift_us, s->advance, s->publish_lead_us, s->iface, s->iface_r,
+                   s->channels, s->a_ptime, s->epoch_shift_us, s->advance, s->publish_lead_us, s->serve_newest, s->iface, s->iface_r,
                    s->mcast_r, s->udp_port_r);
   /* bobi.studio: pour un TX la SOURCE (tg[].shm_path) n'entre PAS dans l'identité de session → la
    * changer ne recrée plus la session (swap à chaud via tx_set_source/tx_take_source, pas de commit
@@ -3549,7 +3596,7 @@ static void write_stats(struct sess* reg, uint64_t last[][MAX_TG], uint64_t last
                  ", \"srv\": {\"fresh\": %llu, \"hold\": %llu, \"busy\": %llu}%s, \"hold_empty_kept\": %llu"
                  ", \"slot_wait_ms\": %.1f, \"slot_wait_n\": %llu"
                  ", \"advance\": %d, \"adv_wait_ms\": %.1f, \"adv_wait_n\": %llu"
-                 ", \"publish_lead_us\": %d"
+                 ", \"publish_lead_us\": %d, \"serve_newest\": %d, \"skipped\": %llu"
                  ", \"src_age_ms\": %.1f, \"src_age_max_ms\": %.1f"
                  ", \"lead_ms\": %.1f, \"lead_max_ms\": %.1f, \"lead_n\": %llu"
                  ", \"wait_pub_ms\": %.2f, \"wait_pub_max_ms\": %.2f, \"emit_ms\": %.2f"
@@ -3569,7 +3616,7 @@ static void write_stats(struct sess* reg, uint64_t last[][MAX_TG], uint64_t last
                   * fenêtre. À lire AVEC `slot_wait_ms` : l'un dit qu'on se retient, l'autre qu'on
                   * est retenu. Les confondre ferait passer un bridage pour un étranglement. */
                  s->advance, t->adv_wait_cum_ns / 1e6, (unsigned long long)t->adv_wait_cnt,
-                 s->publish_lead_us,
+                 s->publish_lead_us, s->serve_newest, (unsigned long long)s->sl_skipped,
                  /* Les trois postes du tour de worker, sur la MÊME fenêtre : attente d'un slot,
                   * attente du grain source, packing. Rapportés à la fenêtre (2 s), ils disent
                   * lequel étrangle la cadence — la question à laquelle aucun compteur ne répondait. */
