@@ -458,6 +458,13 @@ struct target {
    * `slot_wait_ms` / `slot_wait_n` (write_stats), remis à zéro à chaque fenêtre de stats. */
   uint64_t slot_wait_cum_ns;
   uint64_t slot_wait_cnt;
+  /* BRIDAGE D'AVANCE (`advance`) : temps passé à s'empêcher VOLONTAIREMENT de prendre de l'avance.
+   * Compté SÉPARÉMENT de `slot_wait_ns`, et ce n'est pas un détail : confondre les deux détruirait
+   * le seul compteur qui distingue « worker affamé par l'anneau » de « worker bridé exprès ».
+   * Soustrait du gap `late` au même titre — sinon chaque bridage compterait comme un retard SOURCE. */
+  uint64_t adv_wait_ns;
+  uint64_t adv_wait_cum_ns;
+  uint64_t adv_wait_cnt;
   uint64_t alive_ns;       /* TX (tous kinds) : dernier signe de vie du thread (get_frame OK ou
                             * attente de câblage). Figé session démarrée = queue TX morte (wedge). */
   int      dbg_depth_logged; /* TX vidéo : log one-shot grainSize/out_size/_src8 au 1er grain */
@@ -556,6 +563,14 @@ struct sess {
                               le contrôleur). Convention bobi libmtl (patch_epoch_shift) : porté par
                               ops.rtp_timestamp_delta_us NÉGATIF. Une chaîne interne à ~5 ms de phase
                               évite ainsi de payer +1 trame (« attendre l'image suivante »). */
+  int      advance;        /* TX vidéo TRANCHE : nombre MAXIMAL de framebuffers prêts (stat=1) que
+                              le worker s'autorise à avoir devant lui. 0 = désactivé (historique).
+                              MESURÉ le 2026-08-12 : `depth_avg` 3,00 avec `slot_wait_ms` à 0,0 —
+                              le worker n'attend jamais un slot, il a simplement trois trames
+                              prêtes en permanence, niveau figé par le transitoire de démarrage
+                              (deux débits égaux ne vident jamais une file). La lib servant la plus
+                              ANCIENNE (`dist_avg` = `depth_avg` − 1, mesuré), cette avance est de
+                              la latence pure : 20 ms par trame stockée. */
   size_t   src_framesize; int conv8;
   size_t   shm_slotsize;   /* taille d'un slot shm = TRAME PLEINE (≠ slotsize = taille CHAMP en
                               entrelacé, côté libmtl). 0 ⇒ open_shm retombe sur slotsize (audio/data). */
@@ -2165,7 +2180,7 @@ static void* video_tx_slice_thread(void* arg) {
     int morte = !statique && t->shm_path[0] != 0 &&
                 (now_lf - t->last_fresh_ns) > SL_FALLBACK_AFTER_NS;
     if (!statique && !t->reader) {
-      t->last_feed_ns = 0; t->slot_wait_ns = 0;
+      t->last_feed_ns = 0; t->slot_wait_ns = 0; t->adv_wait_ns = 0;
       t->alive_ns = mono_ns();                  /* attendre un câblage n'est pas un wedge */
       fi_init = 0;
       /* NE PAS sauter le tour même si la réouverture échoue — le thread doit quand même publier
@@ -2191,6 +2206,39 @@ static void* video_tx_slice_thread(void* arg) {
      * contre-pression visible à un thread qui part en vrille muet. */
     for (uint16_t _k = 0; _k < s->sl_fb_cnt && s->sl_fb[s->sl_fb_prod].stat == 2; _k++)
       s->sl_fb_prod = (uint16_t)((s->sl_fb_prod + 1) % s->sl_fb_cnt);
+    /* ── BRIDAGE D'AVANCE ─────────────────────────────────────────────────────────────────
+     * Tant que `advance` trames sont DÉJÀ prêtes, on ne commence pas la suivante. On ne DRAINE
+     * pas : l'essai du 2026-08-09 libérait tous les slots prêts sauf le plus récent, et les
+     * répétitions montaient au rythme exact des purges — chaque trame jetée était précisément
+     * celle que la lib allait servir. Ne pas produire en avance est autre chose que jeter ce
+     * qu'on a produit.
+     *
+     * Le slot visé peut être libre et le bridage s'appliquer quand même : c'est voulu. Ce n'est
+     * pas la disponibilité d'un slot qu'on régule, c'est la PROFONDEUR de la file. */
+    if (s->advance > 0 && !statique) {
+      unsigned _occ = 0;
+      for (uint16_t _k = 0; _k < s->sl_fb_cnt; _k++)
+        if (s->sl_fb[_k].stat == 1) _occ++;
+      if (_occ >= (unsigned)s->advance) {
+        uint64_t _a0 = mono_ns();
+        pthread_mutex_lock(&s->sl_mx);
+        struct timespec _tw; clock_gettime(CLOCK_REALTIME, &_tw);
+        _tw.tv_nsec += 2 * 1000000;        /* court : on veut reprendre dès qu'un slot part */
+        if (_tw.tv_nsec >= 1000000000) { _tw.tv_sec++; _tw.tv_nsec -= 1000000000; }
+        pthread_cond_timedwait(&s->sl_cv, &s->sl_mx, &_tw);
+        pthread_mutex_unlock(&s->sl_mx);
+        /* Un bridage VOLONTAIRE n'est pas un wedge : sans ce signe de vie, le watchdog de queue
+         * TX conclurait à un thread mort au bout de 2 s de fonctionnement parfaitement nominal. */
+        t->alive_ns = mono_ns();
+        {
+          uint64_t _w = t->alive_ns - _a0;
+          t->adv_wait_ns += _w;
+          t->adv_wait_cum_ns += _w;
+          t->adv_wait_cnt++;
+        }
+        continue;
+      }
+    }
     /* attendre un framebuffer libre (la lib libère via notify_frame_done) */
     uint16_t idx = s->sl_fb_prod;
     if (s->sl_fb[idx].stat != 0) {
@@ -2446,14 +2494,17 @@ static void* video_tx_slice_thread(void* arg) {
        * plus tard → faux `late` ~1,7/min alors que la sortie fil est parfaite — banc 2026-07-10).
        * On SOUSTRAIT cette attente pour ne mesurer que la SOURCE (seuil 1,5 période inchangé). */
       uint64_t gap = tnow - t->last_feed_ns;
-      uint64_t w = t->slot_wait_ns;
+      /* On soustrait AUSSI le bridage d'avance : c'est du temps qu'on s'impose, pas un retard de
+       * la source. Sans ça, activer `advance` ferait grimper `late` alors que la sortie fil est
+       * parfaite — exactement le faux positif déjà rencontré avec `epoch_shift_us`. */
+      uint64_t w = t->slot_wait_ns + t->adv_wait_ns;
       gap = gap > w ? gap - w : 0;
       if (gap > period_ns + period_ns / 2) {
         uint64_t missed = (gap + period_ns / 2) / period_ns;
         t->late += missed > 1 ? missed - 1 : 1;
       }
     }
-    t->slot_wait_ns = 0;
+    t->slot_wait_ns = 0; t->adv_wait_ns = 0;
     t->last_feed_ns = tnow;
     t->index = next_fi; t->recv++;
     tx_reopen_if_stale(t, next_fi, tnow);
@@ -3035,6 +3086,10 @@ static int parse_session_into(struct json_object* j, struct sess* s) {
   s->udp_port=jint(j,"udp_port",0); s->payload_type=jint(j,"payload_type",96);
   s->ssrc=(uint32_t)jint(j,"ssrc",0);   /* TX : 0=aléatoire (défaut libmtl), sinon fixe (borné 31 bits côté générateur) */
   s->ring=jint(j,"ring", s->kind==K_AUDIO?100:8); s->hdr=jint(j,"hdr",64);
+  /* Plafond d'avance du worker TX tranche (0 = désactivé). Réglage et non constante : cette file
+   * est aussi l'amortisseur d'un hoquet de la source — on descend par paliers en surveillant
+   * `repeats`, pas d'un coup. Poussé par l'orchestrateur comme `ring`, sans recréation. */
+  s->advance=jint(j,"advance", 0);
   /* multi-NIC : `iface` (leg primaire) → portname résolu (vide = iface inconnu, détecté au create).
    * `iface` absent → port 0 (mono-NIC). 2022-7 : `iface2`/`mcast2`/`udp_port2` = 2ᵉ leg (red/blue). */
   snprintf(s->iface, sizeof(s->iface), "%s", jstr(j,"iface",""));
@@ -3374,6 +3429,7 @@ static void write_stats(struct sess* reg, uint64_t last[][MAX_TG], uint64_t last
                  ", \"source_live\": %s, \"holding\": %s, \"hold_ok\": %s"
                  ", \"srv\": {\"fresh\": %llu, \"hold\": %llu, \"busy\": %llu}%s, \"hold_empty_kept\": %llu"
                  ", \"slot_wait_ms\": %.1f, \"slot_wait_n\": %llu"
+                 ", \"advance\": %d, \"adv_wait_ms\": %.1f, \"adv_wait_n\": %llu"
                  ", \"getgrain_ms\": %.1f, \"getgrain_n\": %llu"
                  ", \"pack_ms\": %.1f, \"pack_n\": %llu, \"fb_slots\": %u"
                  ", \"drained\": %llu, \"depth_avg\": %.2f, \"depth_max\": %u, \"dist_avg\": %.2f, \"dist_max\": %u",
@@ -3386,6 +3442,10 @@ static void write_stats(struct sess* reg, uint64_t last[][MAX_TG], uint64_t last
                   * Rapporté à la durée de la fenêtre, ça donne directement la part du temps où le
                   * worker est étranglé par l'aval plutôt que par sa source. */
                  t->slot_wait_cum_ns / 1e6, (unsigned long long)t->slot_wait_cnt,
+                 /* Bridage d'avance : le plafond en vigueur, et le temps qu'il a coûté sur la
+                  * fenêtre. À lire AVEC `slot_wait_ms` : l'un dit qu'on se retient, l'autre qu'on
+                  * est retenu. Les confondre ferait passer un bridage pour un étranglement. */
+                 s->advance, t->adv_wait_cum_ns / 1e6, (unsigned long long)t->adv_wait_cnt,
                  /* Les trois postes du tour de worker, sur la MÊME fenêtre : attente d'un slot,
                   * attente du grain source, packing. Rapportés à la fenêtre (2 s), ils disent
                   * lequel étrangle la cadence — la question à laquelle aucun compteur ne répondait. */
@@ -3397,6 +3457,7 @@ static void write_stats(struct sess* reg, uint64_t last[][MAX_TG], uint64_t last
                  s->sl_depth_cnt ? (double)s->sl_dist_sum / s->sl_depth_cnt : 0.0,
                  (unsigned)s->sl_dist_max);
       t->slot_wait_cum_ns = 0; t->slot_wait_cnt = 0;
+      t->adv_wait_cum_ns = 0; t->adv_wait_cnt = 0;
       s->sl_getgrain_ns = 0; s->sl_getgrain_cnt = 0;
       s->sl_pack_ns = 0; s->sl_pack_cnt = 0;
       s->sl_depth_sum = 0; s->sl_depth_cnt = 0; s->sl_depth_max = 0;
