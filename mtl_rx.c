@@ -563,6 +563,20 @@ struct sess {
                               le contrôleur). Convention bobi libmtl (patch_epoch_shift) : porté par
                               ops.rtp_timestamp_delta_us NÉGATIF. Une chaîne interne à ~5 ms de phase
                               évite ainsi de payer +1 trame (« attendre l'image suivante »). */
+  int      publish_lead_us; /* TX vidéo TRANCHE : FREIN TEMPOREL. Le worker attend d'être à
+                              `publish_lead_us` µs de la prochaine époque avant d'aller chercher
+                              le grain source. 0 = désactivé (comportement historique).
+                              POURQUOI. MESURÉ le 2026-08-12 : une trame publiée attend 27 ms que
+                              la lib vienne la chercher (`wait_pub_ms`) — celle-ci ne sollicite
+                              qu'UNE FOIS PAR ÉPOQUE, et le worker, cadencé par la SOURCE, publie
+                              juste après la sollicitation précédente. Les deux tournent à 50 Hz,
+                              donc l'écart de phase établi au démarrage ne se résorbe jamais.
+                              ⚠ CE N'EST PAS UN RETARD AJOUTÉ : l'instant d'émission est fixé par
+                              la grille PTP, pas par la publication. Publier plus tard met du
+                              contenu PLUS FRAIS dans le MÊME créneau. Le risque est de publier
+                              TROP tard et de rater la sollicitation — la lib rediffuse alors la
+                              trame de tenue (répétition à l'antenne). D'où un réglage, et deux
+                              compteurs qui arbitrent : `repeats` et `wait_pub_ms`. */
   int      advance;        /* TX vidéo TRANCHE : nombre MAXIMAL de framebuffers prêts (stat=1) que
                               le worker s'autorise à avoir devant lui. 0 = désactivé (historique).
                               MESURÉ le 2026-08-12 : `depth_avg` 3,00 avec `slot_wait_ms` à 0,0 —
@@ -2432,6 +2446,23 @@ static void* video_tx_slice_thread(void* arg) {
       sl_publish_repeat_or_witness(s, t, idx, fb, morte, now_lf);
       continue;
     }
+    /* ── FREIN TEMPOREL : attendre d'être proche de l'époque avant de saisir la source ──
+     * On ne bride pas un COMPTEUR de tampons (essayé, sans effet : l'attente vaut une époque
+     * qu'il y ait une ou trois trames prêtes) mais une ÉCHÉANCE D'HORLOGE. Le sommeil est
+     * borné à une période : si l'horloge PTP est indisponible ou la grille incohérente, on
+     * repart sans attendre plutôt que de figer l'émission. */
+    if (s->publish_lead_us > 0 && s->sl_period_ns) {
+      uint64_t _tai = mtl_ptp_read_time_raw(s->st);
+      uint64_t _per = s->sl_period_ns;
+      uint64_t _cible = ((_tai / _per) + 1) * _per;          /* prochaine frontière d'époque */
+      int64_t  _reste = (int64_t)_cible - (int64_t)_tai - (int64_t)s->publish_lead_us * 1000;
+      if (_reste > 0 && _reste < (int64_t)_per) {
+        struct timespec _ts = { (time_t)(_reste / 1000000000LL),
+                                (long)(_reste % 1000000000LL) };
+        nanosleep(&_ts, NULL);
+        t->alive_ns = mono_ns();   /* attente VOLONTAIRE : ce n'est pas un thread mort */
+      }
+    }
     /* viser le grain de tête (rattrape si on est en retard ; jamais en arrière) */
     mxlFlowRuntimeInfo rt;
     mxlStatus stx = mxlFlowReaderGetRuntimeInfo(t->reader, &rt);
@@ -3168,6 +3199,7 @@ static int parse_session_into(struct json_object* j, struct sess* s) {
    * est aussi l'amortisseur d'un hoquet de la source — on descend par paliers en surveillant
    * `repeats`, pas d'un coup. Poussé par l'orchestrateur comme `ring`, sans recréation. */
   s->advance=jint(j,"advance", 0);
+  s->publish_lead_us=jint(j,"publish_lead_us", 0);
   /* multi-NIC : `iface` (leg primaire) → portname résolu (vide = iface inconnu, détecté au create).
    * `iface` absent → port 0 (mono-NIC). 2022-7 : `iface2`/`mcast2`/`udp_port2` = 2ᵉ leg (red/blue). */
   snprintf(s->iface, sizeof(s->iface), "%s", jstr(j,"iface",""));
@@ -3229,10 +3261,10 @@ static void compute_sig(struct sess* s) {
                     * la valeur lue à la création — le réglage part de l'orchestrateur, traverse le
                     * contrôleur, et n'a AUCUN effet, `adv_wait_ms` restant à 0,0 quoi qu'on demande.
                     * Constaté le 2026-08-12 après deux rebuilds passés à chercher ailleurs. */
-                   "%d|%d|%s|%d|%d|%u|%dx%d|%.2f|i%d|f%d|bd%d|r%d|ch%d|ap%.3f|es%d|av%d|if%s|if2%s|mc2%s|p2%d|",
+                   "%d|%d|%s|%d|%d|%u|%dx%d|%.2f|i%d|f%d|bd%d|r%d|ch%d|ap%.3f|es%d|av%d|pl%d|if%s|if2%s|mc2%s|p2%d|",
                    s->role, s->kind, s->mcast, s->udp_port, s->payload_type, s->ssrc,
                    s->width, s->height, s->fps, s->interlaced, s->tff, s->bit_depth, s->ring,
-                   s->channels, s->a_ptime, s->epoch_shift_us, s->advance, s->iface, s->iface_r,
+                   s->channels, s->a_ptime, s->epoch_shift_us, s->advance, s->publish_lead_us, s->iface, s->iface_r,
                    s->mcast_r, s->udp_port_r);
   /* bobi.studio: pour un TX la SOURCE (tg[].shm_path) n'entre PAS dans l'identité de session → la
    * changer ne recrée plus la session (swap à chaud via tx_set_source/tx_take_source, pas de commit
@@ -3469,7 +3501,11 @@ static void write_stats(struct sess* reg, uint64_t last[][MAX_TG], uint64_t last
       /* 384 : le bloc `ring` (ci-dessous) s'ajoute à `srv` ; une troncature de snprintf produirait
        * un JSON invalide que le contrôleur rejetterait EN SILENCE — la sortie paraîtrait alors sans
        * métriques plutôt qu'en panne. Marge volontaire. */
-      char livebuf[448]; livebuf[0] = '\0';
+      /* 448 octets ne suffisaient plus : l'ajout des compteurs de segment (src_age, lead,
+       * wait_pub, emit) tronquait la fin du JSON — `snprintf` coupe SANS ERREUR, et le
+       * fichier devenait illisible pour un lecteur strict. Un tampon trop court ne se voit
+       * pas dans les logs : il se voit en aval, quand un champ manque sans raison. */
+      char livebuf[1024]; livebuf[0] = '\0';
       char ringbuf[192]; ringbuf[0] = '\0';
       if (is_video_tx && s->slice_on) {
         int statique = (!t->shm_path[0] && t->static_frame[0]);
@@ -3513,6 +3549,7 @@ static void write_stats(struct sess* reg, uint64_t last[][MAX_TG], uint64_t last
                  ", \"srv\": {\"fresh\": %llu, \"hold\": %llu, \"busy\": %llu}%s, \"hold_empty_kept\": %llu"
                  ", \"slot_wait_ms\": %.1f, \"slot_wait_n\": %llu"
                  ", \"advance\": %d, \"adv_wait_ms\": %.1f, \"adv_wait_n\": %llu"
+                 ", \"publish_lead_us\": %d"
                  ", \"src_age_ms\": %.1f, \"src_age_max_ms\": %.1f"
                  ", \"lead_ms\": %.1f, \"lead_max_ms\": %.1f, \"lead_n\": %llu"
                  ", \"wait_pub_ms\": %.2f, \"wait_pub_max_ms\": %.2f, \"emit_ms\": %.2f"
@@ -3532,6 +3569,7 @@ static void write_stats(struct sess* reg, uint64_t last[][MAX_TG], uint64_t last
                   * fenêtre. À lire AVEC `slot_wait_ms` : l'un dit qu'on se retient, l'autre qu'on
                   * est retenu. Les confondre ferait passer un bridage pour un étranglement. */
                  s->advance, t->adv_wait_cum_ns / 1e6, (unsigned long long)t->adv_wait_cnt,
+                 s->publish_lead_us,
                  /* Les trois postes du tour de worker, sur la MÊME fenêtre : attente d'un slot,
                   * attente du grain source, packing. Rapportés à la fenêtre (2 s), ils disent
                   * lequel étrangle la cadence — la question à laquelle aucun compteur ne répondait. */

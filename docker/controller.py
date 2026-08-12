@@ -1783,6 +1783,9 @@ class AgentHandler(BaseHTTPRequestHandler):
                 if "advance" in body:
                     try: t["advance"] = max(0, int(body.get("advance") or 0))
                     except Exception: t["advance"] = 0
+                if "publish_lead_us" in body:
+                    try: t["publish_lead_us"] = max(0, int(body.get("publish_lead_us") or 0))
+                    except Exception: t["publish_lead_us"] = 0
                 if "audios" in body:
                     t["audios"] = [{"mcast": a.get("mcast") or None,
                                     "port": int(a.get("port") or 0),
@@ -2577,6 +2580,7 @@ def _tx_session(idx, t, iface=IFACE):
             # SIGNATURE de session : le changer recrée proprement la session TX — bref silence à
             # l'antenne, à ne pas faire en direct sans prévenir.
             "advance": int(t.get("advance") or 0),
+            "publish_lead_us": int(t.get("publish_lead_us") or 0),
             # ident_file TOUJOURS présent (sig stable → toggle IDENT sans recréer la session) ;
             # le fichier n'existe que quand l'IDENT est actif (mtl_rx libère le patch sinon).
             # static_frame TOUJOURS présent (comme ident_file : signature de session stable → passer
