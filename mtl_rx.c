@@ -661,7 +661,11 @@ struct sess {
   /* stat : 0=FREE (le worker peut le remplir) 1=READY (rempli / en vol) 2=TENUE (dernière trame
    * intégralement émise, CONSERVÉE pour être re-servie si la source est en retard — le worker ne
    * doit jamais la reprendre, cf. HORLOGE DE SORTIE dans tx_sl_next_frame). */
-  struct sl_txfb { volatile int stat; volatile uint32_t lines_ready; uint32_t sf_stamp; uint32_t wit_stamp; uint32_t rep_stamp; } sl_fb[SL_Q];
+  /* `pub_ns` : instant où le WORKER publie ce framebuffer. `start_ns` : instant où la LIB le
+   * sollicite pour la première fois ensuite — donc où l'émission de CETTE trame commence.
+   * Leur écart est le DERNIER segment aveugle de la chaîne TX. Tout le reste a été éliminé
+   * par la mesure : source fraîche (src_age négatif), file sans effet, ordonnancement 7,6 ms. */
+  struct sl_txfb { volatile int stat; volatile uint32_t lines_ready; uint32_t sf_stamp; uint32_t wit_stamp; uint32_t rep_stamp; uint64_t pub_ns; uint64_t start_ns; } sl_fb[SL_Q];
   uint16_t sl_fb_cnt, sl_fb_prod, sl_fb_cons;
   /* ── HORLOGE DE SORTIE (trame de tenue) ────────────────────────────────────────────────────────
    * Une sortie 2110 est un appareil à HORLOGE : elle doit présenter une trame à CHAQUE époque de la
@@ -728,6 +732,17 @@ struct sess {
    * coûte : attente d'un slot libre (déjà mesurée par slot_wait_*) + ATTENTE DU GRAIN source +
    * PACKING. Les deux dernières étaient confondues, si bien qu'un worker publiant 37/s pour une
    * source à 50/s ne pouvait pas être attribué. Reset à chaque fenêtre de stats, comme slot_wait. */
+  uint64_t sl_wait_pub_ns;     /* cumul publication → 1re sollicitation par la lib */
+  uint64_t sl_wait_pub_cnt;
+  uint64_t sl_wait_pub_max;
+  uint64_t sl_emit_ns;         /* cumul 1re sollicitation → notify_frame_done */
+  uint64_t sl_emit_cnt;
+  int64_t  sl_lead_ns;         /* cumul de l'avance d'ordonnancement vue dans tx_sl_next_frame */
+  uint64_t sl_lead_cnt;
+  int64_t  sl_lead_max;
+  int64_t  sl_srcage_ns;       /* cumul de l'ÂGE du contenu saisi par le TX (TAI − index×période) */
+  uint64_t sl_srcage_cnt;
+  int64_t  sl_srcage_max;
   uint64_t sl_getgrain_ns;     /* cumul du temps passé dans mxlFlowReaderGetGrainSlice (attente source) */
   uint64_t sl_getgrain_cnt;
   uint64_t sl_pack_ns;         /* cumul du temps de sl_pack_band (toutes bandes d'une trame) */
@@ -1913,7 +1928,21 @@ static void* video_tx_thread(void* arg) {
  * rien à servir — ce -EBUSY ne devrait plus se produire en pratique. Conservé tel quel : il ne coûte
  * rien et couvre un cas qu'on n'aurait pas anticipé. */
 static int tx_sl_next_frame(void* priv, uint16_t* next_frame_idx, struct st20_tx_frame_meta* meta) {
-  struct sess* s = priv; (void)meta;
+  struct sess* s = priv;
+  /* AVANCE D'ORDONNANCEMENT DE LA LIB. Ce callback est appelé quand libmtl veut la PROCHAINE trame
+   * à émettre, et `meta` porte l'ÉPOQUE qu'elle lui assigne. L'écart entre cette époque et l'instant
+   * courant est le temps que la trame va passer À ATTENDRE SON TOUR DANS LA LIB, après que notre
+   * worker l'a remise — segment jamais mesuré jusqu'ici, et le seul qui reste après avoir éliminé
+   * la lecture de la source (`src_age_ms` NÉGATIF : on saisit du frais) et la profondeur de file
+   * (la réduire ne change rien). C'est là que doivent se trouver les ~50 ms manquantes. */
+  if (meta && s->sl_period_ns) {
+    uint64_t _now = mtl_ptp_read_time_raw(s->st);
+    int64_t _lead = (int64_t)meta->epoch * (int64_t)s->sl_period_ns - (int64_t)_now;
+    if (_lead > -1000000000LL && _lead < 1000000000LL) {
+      s->sl_lead_ns += _lead; s->sl_lead_cnt++;
+      if (_lead > s->sl_lead_max) s->sl_lead_max = _lead;
+    }
+  }
   /* ★ LE CONSOMMATEUR DOIT SAUTER LES SLOTS RÉSERVÉS (stat=2), exactement comme le producteur.
    * Sans ça il avance d'un cran par trame consommée, tombe sur un tampon de repli — figé à un index
    * FIXE, lui — et s'y arrête DÉFINITIVEMENT : plus aucune trame fraîche n'est jamais consommée.
@@ -1981,8 +2010,21 @@ static int tx_sl_next_frame(void* priv, uint16_t* next_frame_idx, struct st20_tx
  * slots NORMAUX du worker (cf. video_tx_slice_thread), il n'a besoin d'aucune réservation ici. Un
  * re-service de la tenue rappelle ce callback avec le MÊME index : on ne touche alors à rien (elle
  * reste tenue, ses lines_ready restent complètes). */
+/* Publication d'un framebuffer par le worker. Passe par un helper parce que QUATRE chemins
+ * publient (trame fraîche, répétition, témoin, mode bande) : dater à la main à chaque site
+ * invite l'oubli, et un site manquant fausserait la moyenne sans le dire. */
+static inline void sl_mark_pub(struct sess* s, uint16_t idx) {
+  s->sl_fb[idx].pub_ns = mono_ns();
+  s->sl_fb[idx].start_ns = 0;
+  __sync_synchronize();          /* contenu ET horodatage EN PLACE avant d'annoncer le slot */
+  s->sl_fb[idx].stat = 1;        /* ⚠ l'affectation DIRECTE, pas le helper : on EST le helper */
+}
+
 static int tx_sl_frame_done(void* priv, uint16_t frame_idx, struct st20_tx_frame_meta* meta) {
   struct sess* s = priv; (void)meta;
+  if (s->sl_fb[frame_idx].start_ns) {
+    s->sl_emit_ns += mono_ns() - s->sl_fb[frame_idx].start_ns; s->sl_emit_cnt++;
+  }
   if (s->sl_hold_valid && frame_idx == s->sl_hold_idx) {
     s->sl_wedge_log_ns = 0; s->sl_wedge_log_n = 0;
     pthread_mutex_lock(&s->sl_mx);
@@ -2034,6 +2076,15 @@ static int tx_sl_frame_done(void* priv, uint16_t frame_idx, struct st20_tx_frame
 /* lcore tasklet : combien de lignes de frame_idx sont prêtes à partir ? */
 static int tx_sl_lines_ready(void* priv, uint16_t frame_idx, struct st20_tx_slice_meta* meta) {
   struct sess* s = priv;
+  /* PREMIÈRE sollicitation depuis la publication = début d'émission. On ne date qu'une fois
+   * (start_ns remis à 0 à chaque publication) : la lib rappelle ensuite à chaque bande. */
+  if (!s->sl_fb[frame_idx].start_ns && s->sl_fb[frame_idx].pub_ns) {
+    uint64_t _n = mono_ns();
+    s->sl_fb[frame_idx].start_ns = _n;
+    uint64_t _w = _n - s->sl_fb[frame_idx].pub_ns;
+    s->sl_wait_pub_ns += _w; s->sl_wait_pub_cnt++;
+    if (_w > s->sl_wait_pub_max) s->sl_wait_pub_max = _w;
+  }
   meta->lines_ready = (uint16_t)s->sl_fb[frame_idx].lines_ready;
   return 0;
 }
@@ -2152,7 +2203,7 @@ static void sl_publish_repeat_or_witness(struct sess* s, struct target* t, uint1
   }
   s->sl_fb[idx].lines_ready = (uint32_t)H;   /* contenu EN PLACE avant d'annoncer le slot prêt */
   __sync_synchronize();
-  s->sl_fb[idx].stat = 1;
+  sl_mark_pub(s, idx);
   s->sl_fb_prod = (uint16_t)((idx + 1) % s->sl_fb_cnt);
   t->index++; t->recv++;                     /* trame réellement émise (fps reste nominal) */
   t->alive_ns = mono_ns();
@@ -2358,7 +2409,7 @@ static void* video_tx_slice_thread(void* arg) {
       }
       s->sl_fb[idx].lines_ready = (uint32_t)H;  /* contenu EN PLACE avant d'annoncer le slot prêt */
       __sync_synchronize();
-      s->sl_fb[idx].stat = 1;
+      sl_mark_pub(s, idx);
       s->sl_fb_prod = (uint16_t)((idx + 1) % s->sl_fb_cnt);
       t->index++; t->recv++;                    /* trame réellement émise (fps = nominal) */
       t->alive_ns = mono_ns();
@@ -2403,6 +2454,22 @@ static void* video_tx_slice_thread(void* arg) {
      * visé. À comparer à sl_pack_ms et slot_wait_ms — la somme des trois doit expliquer la période
      * du worker. Comptée même en échec : un timeout est de l'attente, et c'est ce qu'on cherche. */
     s->sl_getgrain_ns += tnow - _g0; s->sl_getgrain_cnt++;
+    /* ÂGE DU CONTENU À L'ENTRÉE DU TX, contre l'horloge PTP (TAI). L'index de grain MXL est
+     * normativement dérivé du temps (index × période = instant de la trame) : cet écart dit donc,
+     * en millisecondes et sans aucune comparaison d'index entre flux, l'âge de ce qu'on vient de
+     * saisir. C'EST LA MESURE QUI MANQUAIT. Le retour 2110 accuse ~60 ms de plus que la source
+     * lue localement ; ce compteur tranche entre les deux seules explications possibles :
+     *   • proche de 0   ⇒ le worker prend du frais, les 60 ms sont EN AVAL (ordonnancement libmtl) ;
+     *   • proche de 40  ⇒ le worker saisit déjà du vieux, et il faut chercher EN AMONT.
+     * Sans lui on ne peut que déduire — et deux déductions se sont déjà révélées fausses ici. */
+    if (period_ns && stx == MXL_STATUS_OK) {
+      uint64_t _tai = mtl_ptp_read_time_raw(s->st);
+      int64_t _age = (int64_t)_tai - (int64_t)(next_fi * period_ns);
+      if (_age > -1000000000LL && _age < 1000000000LL) {   /* garde-fou : grille incohérente */
+        s->sl_srcage_ns += _age; s->sl_srcage_cnt++;
+        if (_age > s->sl_srcage_max) s->sl_srcage_max = _age;
+      }
+    }
     t->alive_ns = tnow;
     if (stx != MXL_STATUS_OK) {
       if (stx == MXL_ERR_FLOW_NOT_FOUND || stx == MXL_ERR_FLOW_INVALID) {
@@ -2439,7 +2506,7 @@ static void* video_tx_slice_thread(void* arg) {
         uint32_t nl = (k == total_r) ? (uint32_t)H - l0 : slh_r;
         sl_pack_band(s, pay, src8_r, l0, nl, fb);
         s->sl_fb[idx].lines_ready = l0 + nl;
-        if (k == 1) { __sync_synchronize(); s->sl_fb[idx].stat = 1; }
+        if (k == 1) { __sync_synchronize(); sl_mark_pub(s, idx); }
       }
       sl_note_fresh_pack(s, idx);                /* grain SOURCE réel (relu), éligible au repli répétition */
       t->recv++;                                /* trame (gelée) émise — fps reste nominal */
@@ -2494,7 +2561,7 @@ static void* video_tx_slice_thread(void* arg) {
       /* Barrière AVANT publication, comme les chemins statiques (`contenu EN PLACE avant
        * d'annoncer le slot prêt`) : sans elle l'écriture de la bande peut être réordonnée après
        * le store de `stat`, et la lib émettrait du contenu non encore écrit. */
-      if (k == 1) { __sync_synchronize(); s->sl_fb[idx].stat = 1; }
+      if (k == 1) { __sync_synchronize(); sl_mark_pub(s, idx); }
     }
     /* n'alimenter le carrier QUE si la trame est intégralement réelle (pas de bande noire partielle
      * de secours) : sinon une répétition ailleurs dans l'anneau republierait une image mi-noire. */
@@ -3446,6 +3513,9 @@ static void write_stats(struct sess* reg, uint64_t last[][MAX_TG], uint64_t last
                  ", \"srv\": {\"fresh\": %llu, \"hold\": %llu, \"busy\": %llu}%s, \"hold_empty_kept\": %llu"
                  ", \"slot_wait_ms\": %.1f, \"slot_wait_n\": %llu"
                  ", \"advance\": %d, \"adv_wait_ms\": %.1f, \"adv_wait_n\": %llu"
+                 ", \"src_age_ms\": %.1f, \"src_age_max_ms\": %.1f"
+                 ", \"lead_ms\": %.1f, \"lead_max_ms\": %.1f, \"lead_n\": %llu"
+                 ", \"wait_pub_ms\": %.2f, \"wait_pub_max_ms\": %.2f, \"emit_ms\": %.2f"
                  ", \"getgrain_ms\": %.1f, \"getgrain_n\": %llu"
                  ", \"pack_ms\": %.1f, \"pack_n\": %llu, \"fb_slots\": %u"
                  ", \"drained\": %llu, \"depth_avg\": %.2f, \"depth_max\": %u, \"dist_avg\": %.2f, \"dist_max\": %u",
@@ -3465,6 +3535,19 @@ static void write_stats(struct sess* reg, uint64_t last[][MAX_TG], uint64_t last
                  /* Les trois postes du tour de worker, sur la MÊME fenêtre : attente d'un slot,
                   * attente du grain source, packing. Rapportés à la fenêtre (2 s), ils disent
                   * lequel étrangle la cadence — la question à laquelle aucun compteur ne répondait. */
+                 /* Âge du contenu AU MOMENT où le TX le saisit. Dit si les ~60 ms du retour
+                  * 2110 sont déjà là à l'entrée du TX, ou naissent en aval. */
+                 s->sl_srcage_cnt ? (double)s->sl_srcage_ns / s->sl_srcage_cnt / 1e6 : 0.0,
+                 s->sl_srcage_max / 1e6,
+                 /* Avance d'ordonnancement de la lib : combien de temps la trame attend son
+                  * époque APRÈS qu'on la lui a remise. Dernier segment non mesuré. */
+                 s->sl_lead_cnt ? (double)s->sl_lead_ns / s->sl_lead_cnt / 1e6 : 0.0,
+                 s->sl_lead_max / 1e6, (unsigned long long)s->sl_lead_cnt,
+                 /* Le segment qui restait aveugle : attente d'une trame PRÊTE avant que la lib
+                  * s'en saisisse, puis durée de son émission. */
+                 s->sl_wait_pub_cnt ? (double)s->sl_wait_pub_ns / s->sl_wait_pub_cnt / 1e6 : 0.0,
+                 s->sl_wait_pub_max / 1e6,
+                 s->sl_emit_cnt ? (double)s->sl_emit_ns / s->sl_emit_cnt / 1e6 : 0.0,
                  s->sl_getgrain_ns / 1e6, (unsigned long long)s->sl_getgrain_cnt,
                  s->sl_pack_ns / 1e6, (unsigned long long)s->sl_pack_cnt,
                  (unsigned)s->sl_fb_cnt, (unsigned long long)s->sl_drained,
@@ -3475,6 +3558,10 @@ static void write_stats(struct sess* reg, uint64_t last[][MAX_TG], uint64_t last
       t->slot_wait_cum_ns = 0; t->slot_wait_cnt = 0;
       t->adv_wait_cum_ns = 0; t->adv_wait_cnt = 0;
       s->sl_getgrain_ns = 0; s->sl_getgrain_cnt = 0;
+      s->sl_srcage_ns = 0; s->sl_srcage_cnt = 0; s->sl_srcage_max = 0;
+      s->sl_lead_ns = 0; s->sl_lead_cnt = 0; s->sl_lead_max = 0;
+      s->sl_wait_pub_ns = 0; s->sl_wait_pub_cnt = 0; s->sl_wait_pub_max = 0;
+      s->sl_emit_ns = 0; s->sl_emit_cnt = 0;
       s->sl_pack_ns = 0; s->sl_pack_cnt = 0;
       s->sl_depth_sum = 0; s->sl_depth_cnt = 0; s->sl_depth_max = 0;
       s->sl_dist_sum = 0; s->sl_dist_max = 0;
