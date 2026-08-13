@@ -1,5 +1,5 @@
 {
-  "version": "0.90.0",
+  "version": "0.91.0",
   "date": "2026-08-12",
   "changes": {
     "★ Le TX servait la trame la plus ANCIENNE — une époque perdue (0.90.0)": [

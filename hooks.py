@@ -10,6 +10,7 @@ Même contrat de topologie/ports que receiver_2110 (mêmes shm produits) — le 
 celle du receiver classique ; les params spécifiques ffmpeg n'existent pas ici (ingest MTL)."""
 
 import re
+from app.numerotation import cle_tx_shm, cle_tx_audio_shm, cle_tx_anc_shm
 
 from app.scripts import normalize_receiver_params
 
@@ -172,10 +173,10 @@ def before_deploy(params, context):
     # Câblage shm audio/ANC : un flux audio/ANC dont la vidéo est câblée mais sans câble explicite
     # hérite du shm DÉRIVÉ (suit la vidéo) → pas de sortie muette. setdefault : ne jamais écraser.
     for i in range(n_tx):
-        vshm = (params.get(f"tx{i}_shm") or "").strip()
+        vshm = (params.get(cle_tx_shm(i)) or "").strip()
         for ai, aidx in enumerate(_iof.tx_slot_audio_idxs(tx_flows, i)):
-            params.setdefault(f"tx_audio{aidx}_shm", _derive_audio_shm(vshm, ai))
-        params.setdefault(f"tx_anc{i}_shm", _derive_anc_shm(vshm))
+            params.setdefault(cle_tx_audio_shm(aidx), _derive_audio_shm(vshm, ai))
+        params.setdefault(cle_tx_anc_shm(i), _derive_anc_shm(vshm))
     return params
 
 
@@ -249,7 +250,7 @@ def topology_ports(hostname, params, ctx):
     for vf in [x for x in tx_flows if x["essence"] == "video"]:
         i = vf["idx"]
         t = txs[i] if i < len(txs) else {}
-        shm = params.get(f"tx{i}_shm") or ""
+        shm = params.get(cle_tx_shm(i)) or ""
         dest = "{}:{}".format(t.get("multicast_ip"), t.get("dest_port") or 5000) if t.get("multicast_ip") else ""
         port = {"kind": "video", "slot": i, "label": f"TX #{i + 1}", "shm": shm, "dest": dest,
                 "group": vf["id"]}
@@ -260,7 +261,7 @@ def topology_ports(hostname, params, ctx):
         aud_idxs = _iof.tx_slot_audio_idxs(tx_flows, i)
         audios = t.get("audios") or []
         for ai, ap in enumerate(aud_idxs):
-            ashm = params.get(f"tx_audio{ap}_shm") or ""
+            ashm = params.get(cle_tx_audio_shm(ap)) or ""
             a = audios[ai] if ai < len(audios) else {}
             adest = "{}:{}".format(a.get("multicast_ip"), a.get("dest_port") or 5004) if a.get("multicast_ip") else ""
             alabel = f"TX #{i + 1} AUD" + (f" {ai + 1}" if len(aud_idxs) > 1 else "")
@@ -270,7 +271,7 @@ def topology_ports(hostname, params, ctx):
             consumes.append(aport)
         # Port ANC (2110-40) — présent si un flux ANC est attaché ; slot = i (espace propre au kind data)
         if _iof.tx_slot_has_anc(tx_flows, i):
-            dshm = params.get(f"tx_anc{i}_shm") or ""
+            dshm = params.get(cle_tx_anc_shm(i)) or ""
             ddest = "{}:{}".format(t.get("anc_multicast_ip"), t.get("anc_dest_port") or 5008) if t.get("anc_multicast_ip") else ""
             dport = {"kind": "data", "slot": i, "label": f"TX #{i + 1} ANC", "shm": dshm, "dest": ddest,
                      "group": vf["id"]}
@@ -317,11 +318,11 @@ def wire_followers(kind, shm, slot, params, ctx):
     for ai, ap in enumerate(aud_idxs):
         followers.append({"essence": "audio", "slot": ap,
                           "shm": (prog_a[ai] if ai < len(prog_a) else ""),
-                          "state_field": f"tx_audio{ap}_shm"})
+                          "state_field": cle_tx_audio_shm(ap)})
     if has_anc:
         followers.append({"essence": "data", "slot": i,
                           "shm": (prog_d[0] if prog_d else ""),
-                          "state_field": f"tx_anc{i}_shm"})
+                          "state_field": cle_tx_anc_shm(i)})
     return followers
 
 

@@ -43,6 +43,20 @@ PORT_METRICS  = PORT_BASE       # rapport / métriques (contrat get_metrics)
 PORT_AGENT    = PORT_BASE + 1   # contrat agent : /nmos/subscribe (SDP IS-05), /status, /tx, /pin
 PORT_CONTROL  = PORT_BASE + 2   # contrôle à chaud : /gen, /ident, /input, /state…
 HOSTNAME   = os.environ.get("HOSTNAME_RX") or os.environ.get("HOSTNAME") or "mtlrx"
+
+# ── NUMÉROTATION PUBLIQUE : le 0 n'existe pas ────────────────────────────────────────────────
+# ⚠ MIROIR EXACT de `app/numerotation.py:numero()`, qui fait foi et documente la règle. Ce
+# fichier tourne DANS l'image du moteur : il ne peut pas importer `app`. Une divergence entre
+# les deux ne casserait rien au démarrage — le moteur nommerait simplement ses flux autrement
+# que l'orchestrateur ne les cherche, et tout le câblage tomberait en silence.
+#
+# `idx` reste l'indice de tableau 0-based (slots, pools) ; SEULE la mise en chaîne est décalée :
+# noms de flux, libellés RX/TX, noms de session SDP. Les graines de SSRC (`_ssrc(...)`) NE
+# passent PAS par ici : les laisser sur l'indice brut préserve l'identité RTP à la bascule.
+def _num(idx):
+    """Indice de tableau (0-based) → numéro PUBLIC (1-based)."""
+    return int(idx) + 1
+
 N_VIDEO    = int(os.environ.get("RX_COUNT") or os.environ.get("VIDEO_COUNT") or 1)   # slots RX vidéo
 N_TX       = int(os.environ.get("TX_COUNT") or 0)                                     # slots TX (senders)
 N_AUDIO    = int(os.environ.get("AUDIO_COUNT") or 0)                                   # slots RX audio (st30)
@@ -864,7 +878,7 @@ def _ident_lines(idx):
     """3 lignes : nom · source (mcast ou « Gen ») · format."""
     rt = _ctl[idx]
     info = rt.get("info")
-    l1 = "{} · RX{}".format(HOSTNAME, idx)
+    l1 = "{} · RX{}".format(HOSTNAME, _num(idx))
     if rt.get("gen") or not info:
         l2 = "Gen : mire"; w, h, fps = WIDTH, HEIGHT, FPS
     else:
@@ -900,7 +914,7 @@ def _render_ident(idx):
 
 
 def _ident_file(idx):
-    return "/dev/shm/{}_{}_ident".format(HOSTNAME, idx)
+    return "/dev/shm/{}_{}_ident".format(HOSTNAME, _num(idx))
 
 
 def _update_ident(idx):
@@ -1426,13 +1440,13 @@ def _signal_loop():
                 # Vidéo : un tick sur n_video. Le résultat précédent est CONSERVÉ entre deux
                 # calculs (il décrit un état, pas un événement) — sinon les drapeaux image
                 # clignoteraient au rythme de la cadence audio.
-                vres = _sig_video_probe(st, "{}_{}".format(HOSTNAME, idx), now) \
+                vres = _sig_video_probe(st, "{}_{}".format(HOSTNAME, _num(idx)), now) \
                     if (faire_video and v_on) else st.get("vres_last")
                 if faire_video and v_on and vres is not None:
                     st["vres_last"] = vres
                 sres = None
                 if a_on and idx < N_AUDIO and _audio_live[idx]:
-                    sres = _sig_audio_probe(st, "{}_audio_{}".format(HOSTNAME, idx), now)
+                    sres = _sig_audio_probe(st, "{}_audio_{}".format(HOSTNAME, _num(idx)), now)
                 elif not a_on:
                     st.pop("acur", None)          # sonde désarmée → le curseur repart proprement
                     st.pop("sres_last", None)
@@ -2217,7 +2231,7 @@ def _audio_session(idx, info, iface=IFACE):
             "mcast": info["mcast"], "udp_port": info["port"], "payload_type": info["pt"],
             "channels": info.get("channels", A_CHANNELS), "ptime": info.get("ptime", A_PTIME_DEF),
             "ring": A_RING, "hdr": HDR,
-            "targets": [{"idx": idx, "shm": "/dev/shm/{}_audio_{}".format(HOSTNAME, idx),
+            "targets": [{"idx": idx, "shm": "/dev/shm/{}_audio_{}".format(HOSTNAME, _num(idx)),
                          "stats": "/tmp/mtl_a{}.json".format(idx)}]},
             iface, info.get("mcast2"), info.get("port2"))
 
@@ -2266,7 +2280,7 @@ def _anc_session(idx, info, iface=IFACE, fps=None):
             "mcast": info["mcast"], "udp_port": info["port"], "payload_type": info["pt"],
             "fps": float(fps) if fps else FPS,
             "ring": 8, "hdr": HDR,
-            "targets": [{"idx": idx, "shm": "/dev/shm/{}_anc_{}".format(HOSTNAME, idx),
+            "targets": [{"idx": idx, "shm": "/dev/shm/{}_anc_{}".format(HOSTNAME, _num(idx)),
                          "stats": "/tmp/mtl_anc{}.json".format(idx)}]},
             iface, info.get("mcast2"), info.get("port2"))
 
@@ -2533,7 +2547,7 @@ def _kill_mtl():
 def _video_target(idx):
     """Une cible = un slot shm de sortie (avec son IDENT propre)."""
     return {"idx": idx,
-            "shm": "/dev/shm/{}_{}".format(HOSTNAME, idx),
+            "shm": "/dev/shm/{}_{}".format(HOSTNAME, _num(idx)),
             "stats": "/tmp/mtl_v{}.json".format(idx),
             "ident_file": _ident_file(idx)}
 
@@ -2689,7 +2703,7 @@ def _tx_sdp(i, t):
              mid="a=mid:PRIMARY\r\n" if dual else "")
     grp = "a=group:DUP PRIMARY SECONDARY\r\n" if dual else ""
     sdp = "v=0\r\no=- {origin} IN IP4 {sip}\r\ns={hn} TX{i}\r\nt=0 0\r\n{grp}".format(
-          origin=_sdp_origin(), sip=sip, hn=HOSTNAME, i=i, grp=grp) + leg0
+          origin=_sdp_origin(), sip=sip, hn=HOSTNAME, i=_num(i), grp=grp) + leg0
     if dual:
         leg1 = (
             "m=video {port} RTP/AVP {pt}\r\n"
@@ -2732,7 +2746,7 @@ def _anc_sdp(i, t):
              mid="a=mid:PRIMARY\r\n" if dual else "")
     grp = "a=group:DUP PRIMARY SECONDARY\r\n" if dual else ""
     sdp = "v=0\r\no=- {origin} IN IP4 {sip}\r\ns={hn} TX{i} ANC\r\nt=0 0\r\n{grp}".format(
-          origin=_sdp_origin(), sip=sip, hn=HOSTNAME, i=i, grp=grp) + leg0
+          origin=_sdp_origin(), sip=sip, hn=HOSTNAME, i=_num(i), grp=grp) + leg0
     if dual:
         leg1 = (
             "m=video {port} RTP/AVP {pt}\r\n"
@@ -2780,7 +2794,7 @@ def _aud_sdp(i, ai, acfg):
                  ch=A_CHANNELS, ptime=ptime_s, refclk=_LOCALMAC_REFCLK, mid=mid, ssrc=ssrc_line)
     grp = "a=group:DUP PRIMARY SECONDARY\r\n" if dual else ""
     sdp = "v=0\r\no=- {origin} IN IP4 {sip}\r\ns={hn} TX{i} AUDIO{ai}\r\nt=0 0\r\n{grp}".format(
-          origin=_sdp_origin(), sip=sip, hn=HOSTNAME, i=i, ai=ai, grp=grp)
+          origin=_sdp_origin(), sip=sip, hn=HOSTNAME, i=_num(i), ai=_num(ai), grp=grp)
     sdp += _leg(acfg.get("mcast"), acfg.get("port"), "a=mid:PRIMARY\r\n" if dual else "", sip)
     if dual:
         sdp += _leg(acfg.get("mcast2"), acfg.get("port2"), "a=mid:SECONDARY\r\n", sip1)
@@ -3059,7 +3073,7 @@ def _tx_gen_apply(idx):
             with _tx_gen_lock:
                 _tx_gen[idx]["enabled"] = False      # le thread txgen n'a plus lieu d'être
         else:
-            shm_name = "/dev/shm/{}_txgen_{}".format(HOSTNAME, idx)
+            shm_name = "/dev/shm/{}_txgen_{}".format(HOSTNAME, _num(idx))
             with _tx_lock:
                 _tx[idx]["shm_in"] = shm_name
                 _tx[idx]["enabled"] = True
@@ -3127,7 +3141,7 @@ def _tx_ident_lines(idx):
         port_s  = str(_tx[idx].get("udp_port") or 0)
         w, h, fps = _tx[idx]["w"], _tx[idx]["h"], _tx[idx]["fps"]
         scan = "i" if _tx[idx].get("scan") == "i" else "p"
-    return ["{} · TX{}".format(HOSTNAME, idx),
+    return ["{} · TX{}".format(HOSTNAME, _num(idx)),
             "{}:{}".format(mcast_s, port_s),
             "{}x{} {} {:.0f}{}".format(w, h, CHROMA, float(fps or FPS), scan)]
 
@@ -3144,12 +3158,12 @@ def _txgen_ident_patch(idx):
         user_gen  = _tx_gen[idx]["user_enabled"]
     mode_label = "GEN" if user_gen else "REPLI"
     size = max(12, HEIGHT // 28)
-    lines = ["{} TX{}".format(HOSTNAME, idx), "{} · {}".format(mode_label, pat_name), "{}:{}".format(mcast_s, port_s)]
+    lines = ["{} TX{}".format(HOSTNAME, _num(idx)), "{} · {}".format(mode_label, pat_name), "{}:{}".format(mcast_s, port_s)]
     return _render_patch_lines(lines, size)
 
 
 def _tx_ident_file(idx):
-    return "/dev/shm/{}_tx{}_ident".format(HOSTNAME, idx)
+    return "/dev/shm/{}_tx{}_ident".format(HOSTNAME, _num(idx))
 
 
 # ─── Trame STATIQUE d'un slot TX non câblé (noir de repli, mire) ──────────────────────────────
@@ -3165,7 +3179,7 @@ def _tx_ident_file(idx):
 #
 # Contrat identique à celui de l'IDENT : écriture atomique par rename, relecture sur mtime.
 def _tx_static_file(idx):
-    return "/dev/shm/{}_tx{}_static".format(HOSTNAME, idx)
+    return "/dev/shm/{}_tx{}_static".format(HOSTNAME, _num(idx))
 
 
 def _tx_static_applicable(idx):
@@ -3451,7 +3465,7 @@ def _manager_loop():
                         continue
                     _tone_on = bool(_tx_tone[i][ai]["enabled"]) if ai < len(_tx_tone[i]) else False
                     if _tone_on or (not t.get("cable_shm") and _tx_gen[i]["enabled"]):
-                        ashm = "/dev/shm/{}_audio_txgen_{}_{}".format(HOSTNAME, i, ai)
+                        ashm = "/dev/shm/{}_audio_txgen_{}_{}".format(HOSTNAME, _num(i), _num(ai))
                     else:
                         ashm = _acable[ai] if ai < len(_acable) else None
                     if t["enabled"]:
@@ -3558,7 +3572,7 @@ def _manager_loop():
 def _simu_loop(idx):
     """Écrit la mire de simu dans le FLUX MXL du slot TANT QU'IL N'EST PAS servi par mtl_rx (_live).
     Quand le slot est live, mtl_rx possède le flux ; on ne fait que relayer ses stats sur :8080."""
-    name = "{}_{}".format(HOSTNAME, idx)
+    name = "{}_{}".format(HOSTNAME, _num(idx))
     writer = None; sim_res = None; fi = 0
     def _close():
         nonlocal writer, sim_res
@@ -3647,7 +3661,7 @@ def _simu_loop(idx):
 def _txgen_loop(idx):
     """Écrit une mire SMPTE dans le FLUX MXL txgen d'un slot TX quand gen est actif → mtl_rx (TX)
     le lit comme n'importe quel flux d'entrée câblé. Overlay ident (nom + GEN + dest) via PIL."""
-    name = "{}_txgen_{}".format(HOSTNAME, idx)
+    name = "{}_txgen_{}".format(HOSTNAME, _num(idx))
     writer = None; res = None; fi = 0; patch = None; patch_age = 0
     next_t = None   # échéance absolue (monotone) du prochain GRAIN → pacing exact (compense le calcul)
     last_tai = -1   # entrelacé : dernier index TRAME TAI écrit (genlock PTP, anti-doublon/anti-saut)
@@ -3780,7 +3794,7 @@ def _txgen_audio_loop(idx, ai):
     (3) sinon silence. Ruptage = 0,9 s ON / 0,1 s OFF (mod sur la seconde), comme aux entrées."""
     SR = 48000
     N = SR // 1000                                # 48 éch. = 1 ms
-    name = "{}_audio_txgen_{}_{}".format(HOSTNAME, idx, ai)
+    name = "{}_audio_txgen_{}_{}".format(HOSTNAME, _num(idx), _num(ai))
     silence = np.zeros((N, A_CHANNELS), dtype=np.float32)
     writer = None; fi = 0
     sig = None; buf_on = None; buf_off = None        # buffers 1 s (ON-phase / OFF-phase ruptage)
@@ -3844,7 +3858,7 @@ def _simu_audio_loop(idx):
     Pendant RX de _txgen_audio_loop : mêmes buffers 1 s (ruptage 0,9 ON / 0,1 OFF), float32 8ch."""
     SR = 48000
     N = SR // 1000                                # 48 éch. = 1 ms
-    name = "{}_audio_{}".format(HOSTNAME, idx)
+    name = "{}_audio_{}".format(HOSTNAME, _num(idx))
     writer = None; fi = 0
     sig = None; buf_on = None; buf_off = None
     def _close():

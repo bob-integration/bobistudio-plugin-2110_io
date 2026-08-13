@@ -14,7 +14,7 @@
   "split_io": true,
   "deploy_order": 0,
   "auto_provision": true,
-  "version": "0.90.0",
+  "version": "0.91.0",
   "adapts_input": true,
   "aggregate_fps": false,
   "description": "Receiver ST 2110 via Media Transport Library (MTL/DPDK, kernel-bypass). Réception st20p/st30p écrite en zéro-copie dans le ring shared memory par un binaire C natif (libmtl), exposé en NMOS IS-04/05. Variante haute performance de receiver_2110 (mêmes shm produits). Mode simulation par slot tant que la source n'est pas activée.",
@@ -107,17 +107,17 @@
       {
         "essence": "video",
         "repeat": "video_count",
-        "shm": "{hostname}_{i}"
+        "shm": "{hostname}_{i1}"
       },
       {
         "essence": "audio",
         "repeat": "audio_count",
-        "shm": "{hostname}_audio_{i}"
+        "shm": "{hostname}_audio_{i1}"
       },
       {
         "essence": "data",
         "repeat": "anc_count",
-        "shm": "{hostname}_anc_{i}"
+        "shm": "{hostname}_anc_{i1}"
       }
     ],
     "consumes": [
@@ -125,19 +125,19 @@
         "essence": "video",
         "repeat": "tx_count",
         "label": "Émetteur 2110-20 #{i1}",
-        "state_field": "tx{i}_shm"
+        "state_field": "tx{i1}_shm"
       },
       {
         "essence": "audio",
         "repeat": "tx_audio_count",
         "label": "Émetteur audio #{i1}",
-        "state_field": "tx_audio{i}_shm"
+        "state_field": "tx_audio{i1}_shm"
       },
       {
         "essence": "data",
         "repeat": "tx_count",
         "label": "Émetteur ANC #{i1}",
-        "state_field": "tx_anc{i}_shm"
+        "state_field": "tx_anc{i1}_shm"
       }
     ],
     "mode": "hot-wire",
