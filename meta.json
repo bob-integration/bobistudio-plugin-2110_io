@@ -1,7 +1,12 @@
 {
-  "version": "0.91.0",
-  "date": "2026-08-12",
+  "version": "0.92.0",
+  "date": "2026-08-13",
   "changes": {
+    "libmxl v1.1.0-beta-1 → v1.1.0-rc1 (0.92.0)": [
+      "Le moteur embarque libmxl : même bump que les images compute (0.25.0) et média (0.14.0), pour que TOUT le parc partage une seule version de libmxl. Rien de spécifique au moteur 2110 dans ce bump — les patches libmtl/DPDK ne sont pas concernés.",
+      "Ce qui compte ici : la fuite de fd du lecteur de flux discret est corrigée (le moteur ouvre un lecteur par flux TX), et la notification futex des flux continus (audio) aussi.",
+      "REBUILD IMAGE bobi-mtl REQUIS. À déployer en même temps que bobi-compute/bobi-media si le nœud porte des liens RDMA (protocole fabrics modifié amont : beta-1 ↔ rc1 non supporté)."
+    ],
     "★ Le TX servait la trame la plus ANCIENNE — une époque perdue (0.90.0)": [
       "MESURÉ : la source publie sa trame à ~6 ms dans son créneau et libmtl vient la chercher à 16,4 ms du même créneau — elle est donc DISPONIBLE À TEMPS pour l'époque suivante. Elle partait pourtant deux époques plus tard, parce que `tx_sl_next_frame` rendait `sl_fb_cons`, la plus ANCIENNE trame prête : on émettait une trame périmée pendant qu'une plus fraîche attendait derrière.",
       "Nouveau réglage `serve_newest` (0 = désactivé) : le callback rend la trame la plus récemment PUBLIÉE et libère celles qui sont strictement plus anciennes. RÉSULTAT sur banc mire → TX → Neuron → RX, âge du contenu mesuré aux bandeaux contre l'horloge TAI : **62,5 → 42,6 ms, exactement une époque**. `wait_pub_ms` 27,7 → 7,6. Cadence consommée inchangée (50,3), `repeats` et `late` figés à 2 après transitoire, sur 4 minutes.",

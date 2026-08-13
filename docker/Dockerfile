@@ -22,15 +22,36 @@
 
 # ---------------------------------------------------------------- étage builder : compiler libmxl
 FROM debian:trixie-slim AS mxl-builder
-ARG MXL_REF=v1.1.0-beta-1
+ARG MXL_REF=v1.1.0-rc1
 ENV DEBIAN_FRONTEND=noninteractive
 ENV VCPKG_ROOT=/opt/vcpkg
 RUN apt-get update && apt-get install -y --no-install-recommends \
       git ca-certificates build-essential cmake ninja-build pkg-config \
       autoconf automake autoconf-archive libtool nasm bison flex libpcap-dev \
-      libfabric-dev \
+      libibverbs-dev librdmacm-dev \
       curl zip unzip tar \
  && rm -rf /var/lib/apt/lists/*
+
+# ─── libfabric COMPILÉE DEPUIS LES SOURCES ───────────────────────────────────────────────────
+# MXL rc1 exige `FI_SOCKADDR_IP`, absent de la libfabric 2.1.0 de Debian trixie → la compilation
+# de libmxl échoue net. L'amont compile lui aussi v2.5.1 depuis git, y compris dans son propre
+# Dockerfile.debiantrixie. Détail complet dans plugins/_compute_runtime/Dockerfile.
+ARG LIBFABRIC_REF=v2.5.1
+RUN git clone --depth 1 --branch "${LIBFABRIC_REF}" https://github.com/ofiwg/libfabric.git /src/libfabric \
+ && cd /src/libfabric \
+ && ./autogen.sh \
+ && ./configure --prefix=/opt/libfabric \
+      --disable-kdreg2 --disable-memhooks-monitor --disable-uffd-monitor \
+ && make -j"$(nproc)" install \
+ && rm -rf /src/libfabric
+
+# Garde-fou : le provider VERBS (RoCEv2) doit être RÉELLEMENT embarqué. On interroge la lib
+# construite, on n'infère pas.
+RUN LD_LIBRARY_PATH=/opt/libfabric/lib /opt/libfabric/bin/fi_info -l > /tmp/fi_providers.txt 2>&1 \
+ && grep -qw verbs /tmp/fi_providers.txt \
+ || { echo "ERREUR: provider VERBS absent de libfabric — RoCEv2/RDMA serait mort en silence."; \
+      echo "--- providers réellement embarqués ---"; cat /tmp/fi_providers.txt; false; }
+ENV PKG_CONFIG_PATH=/opt/libfabric/lib/pkgconfig
 RUN git clone https://github.com/microsoft/vcpkg.git "$VCPKG_ROOT" \
  && "$VCPKG_ROOT/bootstrap-vcpkg.sh" -disableMetrics
 RUN git clone --depth 1 --branch "${MXL_REF}" https://github.com/dmf-mxl/mxl.git /src/mxl
@@ -71,7 +92,7 @@ ENV PKG_CONFIG_PATH=/usr/local/lib/x86_64-linux-gnu/pkgconfig:/usr/local/lib/pkg
 RUN apt-get update && apt-get install -y --no-install-recommends \
       git build-essential meson ninja-build pkg-config python3-pyelftools \
       libnuma-dev libssl-dev libjson-c-dev libpcap-dev rdma-core libibverbs-dev \
-      libfabric1 \
+      librdmacm1 \
       libcap-ng-dev m4 sudo unzip cmake systemtap-sdt-dev libgtest-dev libgmock-dev \
       libxdp-dev libbpf-dev libelf-dev clang llvm gcc-multilib \
       ca-certificates iproute2 ethtool wget curl \
@@ -210,10 +231,22 @@ RUN cd /src/MTL/manager \
  && cp -f /usr/local/lib/bpf/mtl.xdp.o /usr/lib/x86_64-linux-gnu/bpf/ 2>/dev/null || true
 
 # 3b) libmxl (depuis l'étage builder) : libs + headers (pour compiler mtl_rx) + outil mxl-info.
+# libfabric = celle qu'on a COMPILÉE (v2.5.1), surtout pas `libfabric1` d'apt (2.1.0, même soname
+# `libfabric.so.1` → chargerait l'ancienne au runtime). `librdmacm1` est explicite plus haut :
+# c'est `libfabric1` qui le tirait transitivement (cf. plugins/_compute_runtime/Dockerfile).
 COPY --from=mxl-builder /opt/mxl-install/lib/     /usr/local/lib/
 COPY --from=mxl-builder /opt/mxl-install/bin/     /usr/local/bin/
 COPY --from=mxl-builder /opt/mxl-install/include/ /usr/local/include/
+COPY --from=mxl-builder /opt/libfabric/lib/libfabric.so* /usr/local/lib/
 RUN ldconfig
+
+# Garde-fou de l'étage RUNTIME : toutes les dépendances dynamiques du chemin RDMA doivent être
+# résolues DANS L'IMAGE (l'étage builder ne prouve rien sur ce qui est livré).
+RUN if ldd /usr/local/lib/libmxl-fabrics.so 2>&1 | grep -q "not found"; then \
+      echo "ERREUR: dépendance dynamique NON RÉSOLUE dans l'image runtime (chemin RDMA) :"; \
+      ldd /usr/local/lib/libmxl-fabrics.so 2>&1 | grep "not found"; \
+      false; \
+    fi
 
 # 4) Notre binaire de réception/émission ST 2110 → FLOWS MXL. Lie libmxl (grains/samples) et
 #    libcrypto (SHA-1 pour l'UUIDv5 déterministe des flux, cohérent avec bobimxl.flow_id).
