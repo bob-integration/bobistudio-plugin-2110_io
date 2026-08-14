@@ -72,8 +72,14 @@ RUN cmake -S . -B build -G Ninja \
              echo "--- $f ---"; tail -n 60 "$f"; done; false; }
 COPY plugins/_compute_runtime/patches/mxl-planar-type.patch /tmp/mxl-planar-type.patch
 COPY plugins/_compute_runtime/patches/mxl-planar-slices.patch /tmp/mxl-planar-slices.patch
+# Curseur de tranche non réinitialisé au changement de grain dans l'initiateur fabrics : c'est LA
+# cause des bandes venant d'une autre trame sur une réplique de flux TRANCHÉ (cf. le patch, et
+# docs/chantiers/MXL_FABRICS_SLICE_CORRUPTION.md). À remonter en amont ; en attendant, on corrige
+# ici — on construit MXL depuis les sources, autant que ce soit avec le correctif.
+COPY plugins/_compute_runtime/patches/mxl-fabrics-slice-reset.patch /tmp/mxl-fabrics-slice-reset.patch
 RUN git apply --verbose /tmp/mxl-planar-type.patch \
  && git apply --verbose /tmp/mxl-planar-slices.patch \
+ && git apply --verbose /tmp/mxl-fabrics-slice-reset.patch \
  && cmake --build build -j"$(nproc)" \
  && cmake --install build
 
