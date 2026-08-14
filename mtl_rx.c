@@ -1726,6 +1726,25 @@ static void tx_reopen_if_stale(struct target* t, uint64_t idx, uint64_t tnow) {
                                         * laissant 15 ms des 20 ms de budget de trame. */
 #define TX_CATCHUP_MAX    3            /* au-delà, on saute à la tête plutôt que rejouer l'histoire */
 
+/* ─── Un grain n'est ÉMISSIBLE que COMPLET ────────────────────────────────────────────────────
+ * `mxlFlowReaderGetGrain*` rend MXL_STATUS_OK dès que le grain est LISIBLE. Sur un flux TRANCHÉ
+ * c'est vrai dès les premières tranches commitées : les bandes pas encore écrites portent alors
+ * encore la trame PRÉCÉDENTE. Un TX qui accepte ce grain émet une image DÉCHIRÉE, avec une
+ * frontière qui se DÉPLACE lentement — la phase entre l'horloge de commit du producteur et le
+ * tour d'émission libmtl dérivant (cf. le pavé de reader_latest ci-dessus). C'est le « trait qui
+ * balaye l'écran » signalé en exploitation le 2026-08-13/14.
+ *
+ * Le défaut était latent : il ne se voit que si le producteur commite SOUVENT par trame. Le
+ * réglage `mxl_sync_batch=2` (target RDMA commitant toutes les 2 tranches, soit 15 fois par
+ * trame) l'a rendu permanent ; le repasser au défaut du SDK l'a masqué sans le corriger.
+ *
+ * Sur un flux NON tranché `totalSlices == 1` → la garde est un no-op : aucun changement de
+ * comportement, aucune latence ajoutée. */
+static inline int grain_complet(const mxlGrainInfo* gi) {
+  uint16_t total = gi->totalSlices ? gi->totalSlices : 1;
+  return gi->validSlices >= total;
+}
+
 static int reader_latest(struct target* t, mxlGrainInfo* gi, uint8_t** payload) {
   mxlFlowRuntimeInfo rt;
   mxlStatus st = mxlFlowReaderGetRuntimeInfo(t->reader, &rt);
@@ -1738,12 +1757,21 @@ static int reader_latest(struct target* t, mxlGrainInfo* gi, uint8_t** payload) 
       int64_t ecart = (int64_t)rt.headIndex - (int64_t)suivant;
       if (ecart >= -1 && ecart <= TX_CATCHUP_MAX) cible = suivant;
     }
-    st = mxlFlowReaderGetGrain(t->reader, cible, TX_WAIT_GRAIN_NS, gi, payload);
-    if (st == MXL_STATUS_OK) return 0;
-    /* Budget épuisé : REPLI sur l'ancien comportement (cf. propriété 2 ci-dessus). */
-    if (cible != rt.headIndex) {
-      st = mxlFlowReaderGetGrainNonBlocking(t->reader, rt.headIndex, gi, payload);
-      if (st == MXL_STATUS_OK) return 0;
+    /* GetGrainSlice(…, VALID_SLICES_ALL) = attendre le grain COMPLET, pas seulement lisible.
+     * Sur un flux non tranché c'est strictement l'ancien GetGrain (1 tranche = tout). */
+    st = mxlFlowReaderGetGrainSlice(t->reader, cible, MXL_GRAIN_VALID_SLICES_ALL,
+                                    TX_WAIT_GRAIN_NS, gi, payload);
+    if (st == MXL_STATUS_OK && grain_complet(gi)) return 0;
+    /* Budget épuisé : REPLI (cf. propriété 2 ci-dessus — ne JAMAIS renvoyer -1 sur une simple
+     * attente expirée, l'appelant émettrait un memset, donc une trame NOIRE). Le repli doit être
+     * COMPLET lui aussi : rejouer une trame entière vaut mieux qu'en émettre une déchirée. On
+     * tente la tête, puis la trame d'avant. */
+    for (int _r = 0; _r < 2; _r++) {
+      uint64_t _c = rt.headIndex - (uint64_t)_r;
+      if (_r && rt.headIndex == 0) break;
+      if (_r == 0 && cible == rt.headIndex) continue;   /* déjà tenté à l'instant */
+      st = mxlFlowReaderGetGrainNonBlocking(t->reader, _c, gi, payload);
+      if (st == MXL_STATUS_OK && grain_complet(gi)) return 0;
     }
   }
   if (st == MXL_ERR_FLOW_NOT_FOUND || st == MXL_ERR_FLOW_INVALID) {
@@ -1775,7 +1803,13 @@ static int reader_field(struct target* t, int field, int tff, mxlGrainInfo* gi, 
       target = tff ? (t->field_base + 1) : (t->field_base - 1);   /* 2e champ, MÊME trame */
     }
     st = mxlFlowReaderGetGrainNonBlocking(t->reader, target, gi, payload);
-    if (st == MXL_STATUS_OK) return 0;
+    if (st == MXL_STATUS_OK && grain_complet(gi)) return 0;
+    /* Champ incomplet (producteur tranché en cours de commit) : reculer d'UNE TRAME (même
+     * parité, donc target − 2) plutôt que d'émettre un demi-champ neuf collé sur l'ancien. */
+    if (st == MXL_STATUS_OK && target >= 2) {
+      st = mxlFlowReaderGetGrainNonBlocking(t->reader, target - 2, gi, payload);
+      if (st == MXL_STATUS_OK && grain_complet(gi)) return 0;
+    }
   }
   if (st == MXL_ERR_FLOW_NOT_FOUND || st == MXL_ERR_FLOW_INVALID) {
     mxlReleaseFlowReader(g_mxl, t->reader); t->reader = NULL;
@@ -2565,7 +2599,12 @@ static void* video_tx_slice_thread(void* arg) {
        * churn du watchdog anneau toutes les 2 s, sortie à ~1,5 fps — banc 2026-07-11). La
        * détection stale standard (tête figée) continue de tenter GC + réouverture par nom. */
       stx = mxlFlowReaderGetGrainNonBlocking(t->reader, rt.headIndex, &gi, &pay);
-      if (stx != MXL_STATUS_OK) {               /* pas même un grain complet : publier répli/témoin */
+      /* Le commentaire ci-dessus promettait « le dernier grain COMPLET » — le code ne le
+       * vérifiait pas (2026-08-14). Sur une source tranchée la tête est le plus souvent EN COURS
+       * d'écriture : on la refusait donc à tort comme complète. */
+      if (stx == MXL_STATUS_OK && !grain_complet(&gi) && rt.headIndex > 0)
+        stx = mxlFlowReaderGetGrainNonBlocking(t->reader, rt.headIndex - 1, &gi, &pay);
+      if (stx != MXL_STATUS_OK || !grain_complet(&gi)) {   /* aucun grain complet : répli/témoin */
         tx_reopen_if_stale(t, rt.headIndex, tnow);
         sl_publish_repeat_or_witness(s, t, idx, fb, morte, now_lf);
         continue;
