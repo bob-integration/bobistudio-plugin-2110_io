@@ -77,9 +77,14 @@ COPY plugins/_compute_runtime/patches/mxl-planar-slices.patch /tmp/mxl-planar-sl
 # docs/chantiers/MXL_FABRICS_SLICE_CORRUPTION.md). À remonter en amont ; en attendant, on corrige
 # ici — on construit MXL depuis les sources, autant que ce soit avec le correctif.
 COPY plugins/_compute_runtime/patches/mxl-fabrics-slice-reset.patch /tmp/mxl-fabrics-slice-reset.patch
+# Notification (donnée immédiate) clôturée derrière la charge utile qu'elle annonce :
+# sans FI_FENCE rien n'ordonne les écritures RMA d'un lot multi-plans, la cible publie des
+# tranches dont les octets sont encore en vol. SECONDE cause des bandes déchirées.
+COPY plugins/_compute_runtime/patches/mxl-fabrics-fence-notification.patch /tmp/mxl-fabrics-fence-notification.patch
 RUN git apply --verbose /tmp/mxl-planar-type.patch \
  && git apply --verbose /tmp/mxl-planar-slices.patch \
  && git apply --verbose /tmp/mxl-fabrics-slice-reset.patch \
+ && git apply --verbose /tmp/mxl-fabrics-fence-notification.patch \
  && cmake --build build -j"$(nproc)" \
  && cmake --install build
 
