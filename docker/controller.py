@@ -842,8 +842,12 @@ def _fill_grain_planes(view, lay, y, cb, cr):
 # Résolution courante par slot (pour la simu + la taille IDENT), suit le SDP live.
 _slot_res = [[WIDTH, HEIGHT] for _ in range(N_VIDEO)]
 
-metrics = [{"idx": i, "essence": "video", "fps": 0.0, "frame_index": 0, "mode": "init"}
-           for i in range(N_VIDEO)]
+# `numero` = le numéro que voit l'OPÉRATEUR (1-based), publié À CÔTÉ de `idx` qui reste
+# l'indice de tableau (et la clé machine de /nmos/subscribe). Sans lui, chaque lecteur — l'UI,
+# un diagnostic, un humain qui lit ce JSON — doit se souvenir d'ajouter 1 : 26 sites le font
+# dans le dépôt, et l'oublier a coûté une matinée sur « Tx1 » (l'UI disait 1, le SDP disait 0).
+metrics = [{"idx": i, "numero": _num(i), "essence": "video", "fps": 0.0, "frame_index": 0,
+            "mode": "init"} for i in range(N_VIDEO)]
 metrics_lock = threading.Lock()
 
 # ─── Plan de contrôle par slot (:8082 /gen, /ident) — identique receiver_2110 ──────
@@ -1519,7 +1523,7 @@ class MetricsHandler(BaseHTTPRequestHandler):
             d = _read_stats_raw("/tmp/mtl_anc{}.json".format(idx))
             if d is None:
                 continue
-            rec = {"idx": idx, "essence": "anc", "fps": float(d.get("fps", 0.0)),
+            rec = {"idx": idx, "numero": _num(idx), "essence": "anc", "fps": float(d.get("fps", 0.0)),
                    "frame_index": int(d.get("frame_index", 0)),
                    "mode": "mtl" if float(d.get("fps", 0.0)) > 0 else "idle"}
             if d.get("timecode"):
@@ -1541,7 +1545,7 @@ class MetricsHandler(BaseHTTPRequestHandler):
             d = _read_stats_raw("/tmp/mtl_a{}.json".format(idx))
             if d is None:
                 continue
-            recs.append({"idx": idx, "essence": "audio", "fps": float(d.get("fps", 0.0)),
+            recs.append({"idx": idx, "numero": _num(idx), "essence": "audio", "fps": float(d.get("fps", 0.0)),
                          "frame_index": int(d.get("frame_index", 0)),
                          "late": int(d.get("late", 0) or 0),
                          "rx_latency_ms": d.get("rx_latency_ms"),
@@ -1561,7 +1565,7 @@ class MetricsHandler(BaseHTTPRequestHandler):
                     tx_fps, tx_late, tx_fps_source, tx_repeats = _read_tx_stats(i)
                     with _tx_gen_lock:
                         _id_on, _id_sz = _tx_gen[i]["ident"], _tx_gen[i]["ident_size"]
-                    entry = {"tx_idx": i, "idx": i, "essence": "video",
+                    entry = {"tx_idx": i, "idx": i, "numero": _num(i), "essence": "video",
                              "fps": tx_fps, "fps_nominal": float(t.get("fps") or 0),
                              "late": tx_late, "sdp": _tx_sdp(i, t),
                              "ident": _id_on, "ident_size": _id_sz,
@@ -1578,14 +1582,15 @@ class MetricsHandler(BaseHTTPRequestHandler):
                 # Senders AUDIO (2110-30) : un SDP par flux audio configuré (dest mcast+port).
                 for ai, acfg in enumerate(t.get("audios") or []):
                     if acfg.get("mcast") and acfg.get("port"):
-                        senders.append({"tx_idx": i, "idx": i, "essence": "audio", "audio_idx": ai,
+                        senders.append({"tx_idx": i, "idx": i, "numero": _num(i),
+                                        "essence": "audio", "audio_idx": ai, "audio_numero": _num(ai),
                                         "sdp": _aud_sdp(i, ai, acfg),
                                         # ptime effectif de CETTE sortie (par-sortie ou défaut) — l'UI
                                         # peut l'offrir par-sortie ; ptime_default reste le repli global.
                                         "ptime": _tx_ptime(acfg), "ptime_default": A_PTIME_DEF,
                                         "inputs_latency_ms": inputs_lat})
                 if t.get("anc_mcast") and t.get("anc_port"):
-                    senders.append({"tx_idx": i, "idx": i, "essence": "anc",
+                    senders.append({"tx_idx": i, "idx": i, "numero": _num(i), "essence": "anc",
                                     "sdp": _anc_sdp(i, t),
                                     "inputs_latency_ms": inputs_lat})
         model_label, aggregate_gbps = _nic_model(IFACE)
