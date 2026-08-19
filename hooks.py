@@ -197,7 +197,16 @@ def topology_ports(hostname, params, ctx):
     # et ses audios/ANC ; un flux indépendant a son propre groupe.
     rx_flows = _iof.active_flows(params, "rx")
     _fmt = {"video": video_fmt, "audio": audio_fmt, "anc": {"type": "smpte291"}}
-    _shmf = {"video": f"{hostname}_{{}}", "audio": f"{hostname}_audio_{{}}", "anc": f"{hostname}_anc_{{}}"}
+    # ⚠ NOM DE FLUX = `app.numerotation`, jamais un gabarit local (2026-08-19). Ces gabarits
+    # étaient formatés avec l'indice BRUT, donc restés 0-based après la migration du 2026-08-13.
+    # Ce n'est pas un détail d'affichage : c'est le nom que la page Câbles propose, et donc celui
+    # qui part s'ÉCRIRE dans la config d'un consommateur. Constaté à Horace : un mur pointait sur
+    # `<hn>_0`, un flux qui ne peut plus exister — le câblage se refabriquait en 0-based bien
+    # après que les données, elles, aient été migrées.
+    from app.numerotation import flux_video as _fv, flux_audio as _fa, flux_anc as _fd
+    def _shm_de(ess, idx):
+        return (_fv(hostname, idx) if ess == "video" else
+                _fa(hostname, idx) if ess == "audio" else _fd(hostname, idx))
     _kindf = {"video": "video", "audio": "audio", "anc": "data"}
     # Format PAR-FLUX : un moteur RX multi-entrées peut mélanger progressif/entrelacé. Le scan/dims
     # réels de chaque entrée sont posés dans `params['rx_fmt'][idx]` au moment de l'abonnement
@@ -239,7 +248,7 @@ def topology_ports(hostname, params, ctx):
                 for k in ("width", "height", "fps", "scan", "field_order"):
                     if sf.get(k) not in (None, ""):
                         pfmt[k] = sf[k]
-        produces.append({"shm": _shmf[ess].format(f["idx"]), "kind": _kindf[ess],
+        produces.append({"shm": _shm_de(ess, f["idx"]), "kind": _kindf[ess],
                          "format": pfmt, "label": _rx_label(f),
                          "group": f["id"] if ess == "video" else (f.get("attached_to") or f["id"])})
     # Slots TX (émetteurs) = ports d'ENTRÉE câblables → destinations MXL à droite sur la page Câbles.
@@ -333,8 +342,17 @@ def produced_flow_count(params, ctx):
 
 def produced_shms(hostname, params, ctx):
     from app import io2110_flows as _iof
-    _shmf = {"video": f"{hostname}_{{}}", "audio": f"{hostname}_audio_{{}}", "anc": f"{hostname}_anc_{{}}"}
-    return [_shmf[f["essence"]].format(f["idx"]) for f in _iof.active_flows(params, "rx")]
+    # ⚠ NOM DE FLUX = `app.numerotation`, jamais un gabarit local (2026-08-19). Ces gabarits
+    # étaient formatés avec l'indice BRUT, donc restés 0-based après la migration du 2026-08-13.
+    # Ce n'est pas un détail d'affichage : c'est le nom que la page Câbles propose, et donc celui
+    # qui part s'ÉCRIRE dans la config d'un consommateur. Constaté à Horace : un mur pointait sur
+    # `<hn>_0`, un flux qui ne peut plus exister — le câblage se refabriquait en 0-based bien
+    # après que les données, elles, aient été migrées.
+    from app.numerotation import flux_video as _fv, flux_audio as _fa, flux_anc as _fd
+    def _shm_de(ess, idx):
+        return (_fv(hostname, idx) if ess == "video" else
+                _fa(hostname, idx) if ess == "audio" else _fd(hostname, idx))
+    return [_shm_de(f["essence"], f["idx"]) for f in _iof.active_flows(params, "rx")]
 
 
 def control_action(action, body, params, ctx):
