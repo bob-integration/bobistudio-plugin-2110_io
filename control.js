@@ -15,6 +15,13 @@ window.MXLPlugins["2110_io"] = {
     const body = el.querySelector('.rx-body') || el;
     const toast = (ctx && ctx.toast) || (()=>{});
 
+    // i18n (catalogue plugin.2110_io.*). `window.t` rend la CLÉ BRUTE si elle manque : on teste,
+    // et on retombe alors sur le français passé en 2e argument — jamais un code à l'écran.
+    const T = (k, repli) => {
+      const v = window.t ? window.t(k) : k;
+      return (v && v !== k) ? v : (repli !== undefined ? repli : k);
+    };
+
     // Toute action moteur DISRUPTIVE (relance mtl_init / recréation → coupure de TOUS les flux) est
     // bloquée par le serveur (HTTP 409 + needs_confirm + reason). On confirme explicitement puis on
     // ré-émet avec confirm:true. Les ops à chaud passent normalement (jamais de 409). Retourne la
@@ -26,7 +33,7 @@ window.MXLPlugins["2110_io"] = {
       if (r.status === 409) {
         const j = await r.json().catch(()=>({}));
         if (j && j.needs_confirm) {
-          if (!confirm((j.reason || 'Cette opération coupera brièvement TOUS les flux du moteur.')
+          if (!confirm((j.reason || T('plugin.2110_io.disruptive_confirm', 'Cette opération coupera brièvement TOUS les flux du moteur.'))
                        + '\n\nContinuer ?')) return null;
           r = await fetch(url, {method:'POST', headers:{'Content-Type':'application/json'},
                                 body: JSON.stringify(Object.assign({}, payload, {confirm:true}))});
@@ -111,14 +118,17 @@ window.MXLPlugins["2110_io"] = {
     function stateBadge(r){
       const F = FLUX();
       const estVideo = r.essence !== 'audio' && r.essence !== 'anc';
-      if (!r.active) return F.badge('inactif', 'inactif', "Aucun abonnement sur ce flux : rien n'est demandé à la source.");
+      if (!r.active) return F.badge('inactif', T('plugin.2110_io.st_inactive', 'inactif'),
+        T('plugin.2110_io.st_inactive_tip', "Aucun abonnement sur ce flux : rien n'est demandé à la source."));
       if (estVideo && r.rx_stalled)
-        return F.badge('alerte', '⚠ sans flux',
-          'Abonné (IS-05) mais aucun flux ne remonte : création RX échouée (budget lcores du nœud) ou pas de trafic réseau (source/switch).');
-      if (F.circule(r)) return F.badge('ok', 'reçoit', 'Abonné, et les données arrivent.');
-      return F.badge('attente', estVideo ? 'abonné' : 'muet',
-        estVideo ? 'Abonné, mais aucune image ne remonte encore.'
-                 : "Abonné, mais aucun échantillon n'arrive : la source est silencieuse ou absente.");
+        return F.badge('alerte', T('plugin.2110_io.st_noflux', '⚠ sans flux'),
+          T('plugin.2110_io.st_noflux_tip', 'Abonné (IS-05) mais aucun flux ne remonte : création RX échouée (budget lcores du nœud) ou pas de trafic réseau (source/switch).'));
+      if (F.circule(r)) return F.badge('ok', T('plugin.2110_io.st_receiving', 'reçoit'),
+        T('plugin.2110_io.st_receiving_tip', 'Abonné, et les données arrivent.'));
+      return F.badge('attente', estVideo ? T('plugin.2110_io.st_subscribed', 'abonné')
+                                         : T('plugin.2110_io.st_mute', 'muet'),
+        estVideo ? T('plugin.2110_io.st_subscribed_tip', 'Abonné, mais aucune image ne remonte encore.')
+                 : T('plugin.2110_io.st_mute_tip', "Abonné, mais aucun échantillon n'arrive : la source est silencieuse ou absente."));
     }
     function genTooltip(r, isAudio, genOn){
       const g = r.gen || {};
@@ -275,7 +285,7 @@ window.MXLPlugins["2110_io"] = {
                 data-idx="${r.idx}" data-min="${IDENT_MIN}" data-max="${IDENT_MAX}" data-step="2"
                 data-val="${identSz}" data-def="${identDef}" data-unit="px">
                 <button type="button" class="ctl-knob-hit" role="slider"
-                  aria-label="Taille du texte IDENT" aria-valuemin="${IDENT_MIN}" aria-valuemax="${IDENT_MAX}"
+                  aria-label="${esc(T('js.io2110.ident_size_aria', 'Taille du texte IDENT'))}" aria-valuemin="${IDENT_MIN}" aria-valuemax="${IDENT_MAX}"
                   aria-valuenow="${identSz}" aria-valuetext="${identSz}px"
                   title="Taille du texte IDENT — glisser ↕, molette, flèches (Maj = pas large). Entrée = taille automatique.">${
                   _identSvg(identSz, identDef)}</button>
@@ -325,7 +335,7 @@ window.MXLPlugins["2110_io"] = {
             // VIDÉO : ni abonné (IS-05) ni générateur actif → pas de signal. On n'affiche PAS un
             // format par défaut trompeur (le moteur ne génère plus rien par défaut, cf. _simu_loop).
             if (!r.active && !r.generating) {
-              return `<span style="color:var(--status-stopped-fg)" title="Slot non abonné — aucun flux ni générateur (sortie vide)">non abonnée</span>`;
+              return `<span style="color:var(--status-stopped-fg)" title="${esc(T('plugin.2110_io.not_subscribed_tip', 'Slot non abonné — aucun flux ni générateur (sortie vide)'))}">${esc(T('plugin.2110_io.not_subscribed', 'non abonnée'))}</span>`;
             }
             return `<span title="format vidéo${r.generating ? ' (mire générée)' : ''}">${fmtVideoFormat(r)}</span>`;
           })();
@@ -679,7 +689,7 @@ window.MXLPlugins["2110_io"] = {
     function _renderBody() {
       const ens = _cachedEnsembles;
       const inner = ens.length === 0
-        ? `<div class="meta" style="padding:8px 0">Aucun receiver actif</div>`
+        ? `<div class="meta" style="padding:8px 0">${esc(T('plugin.2110_io.no_receiver', 'Aucun receiver actif'))}</div>`
         : ens.map((g, i) => {
             const rows = [];
             if (g.video) rows.push(rowReceiver(g.video));
@@ -729,7 +739,7 @@ window.MXLPlugins["2110_io"] = {
         ? `<button class="io-addrow">+ Ajouter une source</button>`
         : '';
       const delBtn = ensVideoCount > 0
-        ? `<button class="io-addrow io2110-del-rx">− Retirer la dernière source</button>`
+        ? `<button class="io-addrow io2110-del-rx">${esc(T('plugin.2110_io.del_last_source', '− Retirer la dernière source'))}</button>`
         : '';
       // Remède famine : ≥1 source abonnée mais sans flux (rx_stalled) → bouton de réalignement des
       // files (redéploiement du moteur). Disruptif → passe par mtlMutate (confirmation serveur).
@@ -754,8 +764,8 @@ window.MXLPlugins["2110_io"] = {
           realignEl.disabled = true;
           try {
             const r = await mtlMutate(`/api/mtl/${vmid}/realign`, {});
-            if (r && !r.ok) { const j = await r.json().catch(()=>({})); toast(j.error || 'Erreur réalignement', 'error'); }
-          } catch(e) { toast('Erreur réseau', 'error'); }
+            if (r && !r.ok) { const j = await r.json().catch(()=>({})); toast(j.error || T('plugin.2110_io.err_realign', 'Erreur réalignement'), 'error'); }
+          } catch(e) { toast(T('plugin.2110_io.err_network', 'Erreur réseau'), 'error'); }
           await refresh();
         };
       }
@@ -765,8 +775,8 @@ window.MXLPlugins["2110_io"] = {
         try {
           const r = await mtlMutate(`/api/mtl/${vmid}/flows/add`,
             {role: 'rx', essence: b.dataset.ess, attached_to: b.dataset.att || null});
-          if (r && !r.ok) { const j = await r.json().catch(()=>({})); toast(j.error || 'Erreur ajout flux', 'error'); }
-        } catch(e) { toast('Erreur réseau', 'error'); }
+          if (r && !r.ok) { const j = await r.json().catch(()=>({})); toast(j.error || T('plugin.2110_io.err_add_flow', 'Erreur ajout flux'), 'error'); }
+        } catch(e) { toast(T('plugin.2110_io.err_network', 'Erreur réseau'), 'error'); }
         await refresh();
       });
       // Retrait granulaire d'un flux (par id ; une vidéo retire aussi ses audios/ANC attachés).
@@ -778,9 +788,9 @@ window.MXLPlugins["2110_io"] = {
             body: JSON.stringify({id: b.dataset.fid}),
           });
           const j = await r.json().catch(()=>({}));
-          if (!r.ok) toast(j.error || 'Erreur retrait flux', 'error');
+          if (!r.ok) toast(j.error || T('plugin.2110_io.err_del_flow', 'Erreur retrait flux'), 'error');
           else if (j.note) toast(j.note, 'info');
-        } catch(e) { toast('Erreur réseau', 'error'); }
+        } catch(e) { toast(T('plugin.2110_io.err_network', 'Erreur réseau'), 'error'); }
         await refresh();
       });
       const moreEl = body.querySelector('.io-addrow:not(.io2110-del-rx):not(.io2110-realign)');
@@ -789,8 +799,8 @@ window.MXLPlugins["2110_io"] = {
           moreEl.disabled = true;
           try {
             const r = await mtlMutate(`/api/mtl/${vmid}/activate`, {kind: 'rx'});
-            if (r && !r.ok) { const j = await r.json().catch(()=>({})); toast(j.error || 'Erreur activation RX', 'error'); }
-          } catch(e) { toast('Erreur réseau', 'error'); }
+            if (r && !r.ok) { const j = await r.json().catch(()=>({})); toast(j.error || T('plugin.2110_io.err_rx_enable', 'Erreur activation RX'), 'error'); }
+          } catch(e) { toast(T('plugin.2110_io.err_network', 'Erreur réseau'), 'error'); }
           await refresh();
         };
       }
@@ -803,8 +813,8 @@ window.MXLPlugins["2110_io"] = {
               method: 'POST', headers: {'Content-Type': 'application/json'},
               body: JSON.stringify({kind: 'rx'}),
             });
-            if (!r.ok) { const j = await r.json().catch(()=>({})); toast(j.error || 'Erreur retrait RX', 'error'); }
-          } catch(e) { toast('Erreur réseau', 'error'); }
+            if (!r.ok) { const j = await r.json().catch(()=>({})); toast(j.error || T('plugin.2110_io.err_rx_remove', 'Erreur retrait RX'), 'error'); }
+          } catch(e) { toast(T('plugin.2110_io.err_network', 'Erreur réseau'), 'error'); }
           await refresh();
         };
       }
@@ -813,7 +823,7 @@ window.MXLPlugins["2110_io"] = {
     async function refresh(){
       let c, cs;
       try { c = await (await fetch(`/api/nmos/receivers/${vmid}/detail`)).json(); }
-      catch(e){ body.innerHTML = '<div class="meta">Détail NMOS indisponible.</div>'; return; }
+      catch(e){ body.innerHTML = '<div class="meta">' + esc(T('plugin.2110_io.nmos_detail_na', 'Détail NMOS indisponible.')) + '</div>'; return; }
       try { const cd = await (await fetch(`/api/nmos/senders/${vmid}/detail`)).json();
             cs = (cd && cd.length) ? cd[0] : null; }
       catch(e){ cs = null; }
@@ -874,7 +884,9 @@ window.MXLPlugins["2110_io"] = {
         </div>`;
       }
       _lastNicPorts = (c && c.nic_ports) || [];   // mémorisé pour reconstruire la bande au toggle (sans refetch)
-      _cachedMeta = `<div class="meta rx-meta">IP : ${esc((c && c.ip) || '—')} — ${recvs.length} / ${_cachedVideoCount} sources · ${activeCount} abonné${activeCount > 1 ? 's' : ''}</div>${_nicH}${_nicRxBar}${_nicXdpBar}`;
+      _cachedMeta = `<div class="meta rx-meta">${esc(T('plugin.2110_io.meta_ip', 'IP :'))} ${esc((c && c.ip) || '—')} — `
+        + `${esc(T('plugin.2110_io.meta_sources', '{n} / {total} sources').replace('{n}', recvs.length).replace('{total}', _cachedVideoCount))} · `
+        + `${esc(T('plugin.2110_io.meta_subscribed', '{n} abonné(s)').replace('{n}', activeCount))}</div>${_nicH}${_nicRxBar}${_nicXdpBar}`;
       _cachedTxHtml    = renderTXSection(cs && cs.senders);
       _renderBody();
     }
