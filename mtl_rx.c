@@ -641,6 +641,24 @@ struct sess {
   double   tp_cinst_sum, tp_vrx_sum; /* Σ des moyennes/trame (÷ tp_cnt = moyenne de fenêtre) */
   int32_t  tp_fpt, tp_latency; /* dernières valeurs (ns) de la fenêtre */
   uint32_t tp_cnt;             /* nb de trames échantillonnées dans la fenêtre */
+  /* ── TRANSPORT PAR SESSION (2026-08-27) — le trou que la sonde du scope documentait ──────
+   * Jusqu'ici les seuls compteurs de paquets publiés étaient ceux du PORT (`mtl_stats`),
+   * agrégés sur TOUTES les sessions : « 9 478 paquets jetés » ne désignait aucun flux, et un
+   * afficheur qui l'attribuait à un flux mentait par confusion de granularité.
+   * ★ LA DONNÉE ÉTAIT DÉJÀ SOUS LA MAIN. `st_frame` / `st20_rx_frame_meta` portent, PAR TRAME
+   * ET PAR SESSION : `pkts_total` (paquets attendus, redondants exclus), `pkts_recv[port]`
+   * (reçus sur chaque patte) et `status`. L'en-tête libmtl le dit lui-même : comparer
+   * `pkts_recv[s_port]` à `pkts_total` EST l'indicateur de qualité du signal. Il n'y avait
+   * donc rien à mesurer, seulement à ACCUMULER et à publier — même modèle lockless que le
+   * bloc `tp` juste au-dessus (accum côté thread RX, lecture+reset côté write_stats).
+   * `px_manque` = Σ(pkts_total − pkts_recv[P]) : les paquets qui ne sont PAS arrivés sur la
+   * patte primaire. Avec le 2022-7 armé, la patte de secours les rattraperait — d'où le
+   * compteur séparé `px_recv_r`, qui reste à zéro tant que `num_leg == 1`. */
+  uint64_t px_pkts;            /* Σ pkts_total sur la fenêtre */
+  uint64_t px_recv_p, px_recv_r; /* Σ pkts_recv[P] et [R] */
+  uint32_t px_incomplete;      /* trames au statut != COMPLETE */
+  uint32_t px_frames;          /* trames comptées */
+  uint32_t px_pire;            /* pire manque sur UNE trame (paquets) */
   /* ── MODE TRANCHE (SLICE_MODE=1, vidéo PROGRESSIVE uniquement) — latence sous-trame ──
    * RX : API raw st20 (ST20_TYPE_SLICE_LEVEL) → conversion RFC4175→planar PAR BANDE + commit MXL
    * progressif (validSlices=1..N, cf. patch mxl-planar-slices) au fil des tranches reçues.
@@ -1163,6 +1181,22 @@ static void accum_tp(struct sess* s, const struct st20_rx_tp_meta* tp) {
   s->tp_cnt++;
 }
 
+/* Accumulateur de transport par session. Même contrat que `accum_tp` : appelé UNIQUEMENT
+ * depuis le thread RX de la session, lu et remis à zéro par write_stats. */
+static void accum_px(struct sess* s, uint32_t pkts_total, uint32_t recv_p, uint32_t recv_r,
+                     int complete) {
+  s->px_pkts   += pkts_total;
+  s->px_recv_p += recv_p;
+  s->px_recv_r += recv_r;
+  if (!complete) s->px_incomplete++;
+  /* ⚠ SIGNÉ AVANT DE SOUSTRAIRE. `pkts_recv` peut dépasser `pkts_total` (paquets redondants
+   * comptés côté patte) ; en arithmétique non signée la différence deviendrait un nombre
+   * astronomique et le compteur de pertes afficherait des milliards. */
+  int64_t manque = (int64_t)pkts_total - (int64_t)recv_p;
+  if (manque > 0 && (uint32_t)manque > s->px_pire) s->px_pire = (uint32_t)manque;
+  s->px_frames++;
+}
+
 static void* video_rx_thread(void* arg) {
   struct sess* s = arg;
   rt_thread_priority("video_rx_thread");
@@ -1172,6 +1206,13 @@ static void* video_rx_thread(void* arg) {
     if (!frame) { usleep(1000); continue; }
     if (!frame->addr[0]) { st20p_rx_put_frame(s->vh, frame); continue; }
     if (s->tp_enabled) accum_tp(s, st_frame_tp_meta(frame, MTL_SESSION_PORT_P));
+    /* ⚠ SANS GARDE `tp_enabled` : ces compteurs-là ne coûtent rien et ne demandent pas de
+     * timestamp matériel, contrairement au parser de timing. Les gater sur la même condition
+     * priverait de la mesure de transport tous les moteurs qui tournent sans TIMING_PARSER. */
+    accum_px(s, frame->pkts_total, frame->pkts_recv[MTL_SESSION_PORT_P],
+             frame->pkts_recv[MTL_SESSION_PORT_R],
+             frame->status == ST_FRAME_STATUS_COMPLETE ||
+             frame->status == ST_FRAME_STATUS_RECONSTRUCTED);
     /* Timestamp MÉDIA (capture) de la frame, en TAI ns — commun audio/vidéo via PTP (ST 2110-10).
      * st10_get_tai normalise TAI ou media-clk → ns (sampling 90 kHz vidéo). */
     uint64_t mts = media_ts_to_tai(s->st, frame->tfmt, frame->timestamp, MEDIA_CLK_VIDEO);
@@ -1257,6 +1298,10 @@ static int rx_sl_slice_ready(void* priv, void* frame, struct st20_rx_slice_meta*
 static int rx_sl_frame_ready(void* priv, void* frame, struct st20_rx_frame_meta* meta) {
   struct sess* s = priv;
   if (s->tp_enabled) accum_tp(s, meta->tp[MTL_SESSION_PORT_P]);
+  accum_px(s, meta->pkts_total, meta->pkts_recv[MTL_SESSION_PORT_P],
+           meta->pkts_recv[MTL_SESSION_PORT_R],
+           meta->status == ST_FRAME_STATUS_COMPLETE ||
+           meta->status == ST_FRAME_STATUS_RECONSTRUCTED);
   pthread_mutex_lock(&s->sl_mx);
   struct sl_inflight* e = sl_find(s, frame, 1);
   if (!e) { s->sl_drop++; pthread_mutex_unlock(&s->sl_mx); return -EIO; }   /* lib re-put le frame */
@@ -3534,6 +3579,24 @@ static void write_stats(struct sess* reg, uint64_t last[][MAX_TG], uint64_t last
                s->tp_vrx_max, s->tp_vrx_min, s->tp_vrx_sum / s->tp_cnt, s->tp_vrx_span_max,
                s->tp_fpt, s->tp_latency);
     }
+    /* TRANSPORT PAR SESSION : lecture + reset de la fenêtre, même modèle que le bloc tp.
+     * ⚠ PUBLIÉ MÊME À ZÉRO quand des trames ont été comptées. Un compteur de pertes ABSENT et
+     * un compteur de pertes À ZÉRO ne disent pas la même chose : le premier veut dire « on ne
+     * mesure pas », le second « on mesure, et il n'y a rien ». C'est exactement la distinction
+     * que la tuile d'ingénierie du scope affiche, et elle serait perdue si on omettait le
+     * fragment quand tout va bien. */
+    char pxbuf[220]; pxbuf[0] = '\0';
+    if (s->px_frames > 0) {
+      int64_t manque = (int64_t)s->px_pkts - (int64_t)s->px_recv_p;
+      if (manque < 0) manque = 0;
+      snprintf(pxbuf, sizeof(pxbuf),
+               ", \"pkts\": %llu, \"pkts_perdus\": %lld, \"pkts_secours\": %llu, "
+               "\"trames_incompletes\": %u, \"pire_manque\": %u, \"trames_mesurees\": %u",
+               (unsigned long long)s->px_pkts, (long long)manque,
+               (unsigned long long)s->px_recv_r, s->px_incomplete, s->px_pire, s->px_frames);
+      s->px_pkts = s->px_recv_p = s->px_recv_r = 0;
+      s->px_incomplete = s->px_frames = s->px_pire = 0;
+    }
     for (int ti = 0; ti < s->ntg; ti++) {
       struct target* t = &s->tg[ti];
       if (!t->stats_path[0]) continue;
@@ -3696,11 +3759,11 @@ static void write_stats(struct sess* reg, uint64_t last[][MAX_TG], uint64_t last
         if (rx_lat >= 0.0) snprintf(latbuf, sizeof(latbuf), "%.1f", rx_lat);
         else               snprintf(latbuf, sizeof(latbuf), "null");
         if (s->kind == K_DATA && t->tc_valid)
-          fprintf(sf, "{\"fps\": %.1f, \"frame_index\": %llu, \"timecode\": \"%s\", \"df\": %s, \"rx_latency_ms\": %s%s%s%s}\n",
-                  rate, (unsigned long long)t->index, t->tc, t->tc_df ? "true" : "false", latbuf, tpbuf, repbuf, livebuf);
+          fprintf(sf, "{\"fps\": %.1f, \"frame_index\": %llu, \"timecode\": \"%s\", \"df\": %s, \"rx_latency_ms\": %s%s%s%s%s}\n",
+                  rate, (unsigned long long)t->index, t->tc, t->tc_df ? "true" : "false", latbuf, tpbuf, pxbuf, repbuf, livebuf);
         else
-          fprintf(sf, "{\"fps\": %.1f, \"frame_index\": %llu, \"late\": %llu, \"rx_latency_ms\": %s%s%s%s}\n",
-                  rate, (unsigned long long)t->index, (unsigned long long)t->late, latbuf, tpbuf, repbuf, livebuf);
+          fprintf(sf, "{\"fps\": %.1f, \"frame_index\": %llu, \"late\": %llu, \"rx_latency_ms\": %s%s%s%s%s}\n",
+                  rate, (unsigned long long)t->index, (unsigned long long)t->late, latbuf, tpbuf, pxbuf, repbuf, livebuf);
         fclose(sf);
       }
     }
@@ -3893,6 +3956,16 @@ int main(int argc, char** argv) {
         snprintf(p.port[idx], MTL_PORT_MAX_LEN, "%s", g_ports[idx].portname);
         const char* psip = jstr(pj,"sip","");
         if (psip[0]) inet_pton(AF_INET, psip, p.sip_addr[idx]);
+        /* MASQUE + PASSERELLE PAR PORT (2026-08-22). Un port bindé vfio-pci n'a plus de netdev
+         * kernel : c'est libmtl qui porte TOUTE la couche 3, et jusqu'ici on ne lui donnait que
+         * l'adresse. Sans masque elle ne sait pas ce qui est sur le lien, sans passerelle elle ne
+         * peut joindre aucun unicast hors sous-réseau. Un plant ST 2110 micro-segmenté en /30 avec
+         * une passerelle PAR fabric (A/B) — le cas Radio France IPMEDIA — l'exige. Optionnels :
+         * absents → comportement strictement inchangé. */
+        const char* pmask = jstr(pj,"netmask","");
+        if (pmask[0]) inet_pton(AF_INET, pmask, p.netmask[idx]);
+        const char* pgw = jstr(pj,"gateway","");
+        if (pgw[0]) inet_pton(AF_INET, pgw, p.gateway[idx]);
         p.pmd[idx] = mtl_pmd_by_port_name(g_ports[idx].portname);
         int prxq = jint(pj,"rx_queues", 8), ptxq = jint(pj,"tx_queues", 1);
         p.rx_queues_cnt[idx] = prxq > 0 ? prxq : 1;
