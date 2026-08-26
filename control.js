@@ -53,15 +53,18 @@ window.MXLPlugins["2110_io"] = {
      * repli discret qui ferait croire à un affichage normal) et le reste de la ligne survit. */
     const FLUX = () => window.IOFlux || {
       circule: o => Number(o && o.fps) > 0,
-      cadence: () => '<span style="color:var(--status-warning-fg)" title="Lecteur de flux non chargé (io_flux.js) : cette valeur est indisponible, pas nulle.">?</span>',
-      badge: (t, l) => '<span class="badge" title="Lecteur de flux non chargé (io_flux.js).">' + l + '</span>',
+      cadence: () => '<span style="color:var(--status-warning-fg)" title="'
+                     + esc(T('plugin.2110_io.flux_reader_missing_tip', 'Lecteur de flux non chargé (io_flux.js) : cette valeur est indisponible, pas nulle.'))
+                     + '">?</span>',
+      badge: (t, l) => '<span class="badge" title="'
+                     + esc(T('plugin.2110_io.flux_reader_missing', 'Lecteur de flux non chargé (io_flux.js).')) + '">' + l + '</span>',
     };
 
         const VIDEO_PATTERNS = {
       bars:     'Barres SMPTE',
-      gradient: 'Dégradé gris',
+      gradient: T('plugin.2110_io.gen_gradient', 'Dégradé gris'),
       black:    'Fond noir',
-      moving:   'Barre animée',
+      moving:   T('plugin.2110_io.gen_moving', 'Barre animée'),
     };
 
     // SDP actif courant par index de flux vidéo (rempli au rendu, lu par la modale).
@@ -105,7 +108,8 @@ window.MXLPlugins["2110_io"] = {
           (o.tcs && String(o.tcs).toUpperCase() !== 'SDR') ? 'HDR(' + o.tcs + ')' : '',
           (o.range && String(o.range).toUpperCase() === 'FULL') ? 'full' : '',
         ].filter(Boolean).join(' · ');
-        const tip = `Format vidéo (SDP) : ${o.width}×${o.height}${sc}${fpsTxt}${extra ? ' · ' + extra.replace(/<[^>]+>/g,'') : ''}`;
+        const tip = T('plugin.2110_io.fmt_video_sdp', 'Format vidéo (SDP) : {fmt}')
+          .replace('{fmt}', `${o.width}×${o.height}${sc}${fpsTxt}${extra ? ' · ' + extra.replace(/<[^>]+>/g,'') : ''}`);
         return `<span style="color:var(--text-muted)" title="${esc(tip)}">${res}${extra ? ' · ' + extra : ''}</span>`;
       }
       return `${fmtFps(o.fps)} fps`;
@@ -135,7 +139,9 @@ window.MXLPlugins["2110_io"] = {
       const on = (genOn != null) ? genOn : (isAudio ? r.simulated : r.generating);
       const hint = `<div style="margin-top:7px; padding-top:6px; border-top:1px solid var(--border-soft);
           color:${on ? '#e8a33d' : 'var(--text-muted)'}; font-size:0.92em">
-          👆 Cliquer pour ${on ? 'désactiver' : 'activer'} le générateur</div>`;
+          ${esc(T('plugin.2110_io.gen_click_hint', '👆 Cliquer pour {action} le générateur')
+              .replace('{action}', on ? T('plugin.2110_io.gen_click_off', 'désactiver')
+                                      : T('plugin.2110_io.gen_click_on', 'activer')))}</div>`;
       if (isAudio) {
         const freq  = (g.freq != null) ? `${g.freq} Hz` : '—';
         const level = (g.level_db != null) ? `${g.level_db} dBFS` : '—';
@@ -150,10 +156,10 @@ window.MXLPlugins["2110_io"] = {
         }
         const nOn = active.filter(Boolean).length;
         return `<div class="gen-tip"><div class="gen-tip-inner">
-          <h5>⚙ Générateur sine local</h5>
-          <div class="gt-row"><span>Fréquence</span><span>${esc(freq)}</span></div>
-          <div class="gt-row"><span>Niveau</span><span>${esc(level)}</span></div>
-          <div class="gt-row"><span>Canaux actifs</span><span>${nOn} / ${nChans}</span></div>
+          <h5>${esc(T('plugin.2110_io.gen_title', '⚙ Générateur sine local'))}</h5>
+          <div class="gt-row"><span>${esc(T('plugin.2110_io.gen_freq', 'Fréquence'))}</span><span>${esc(freq)}</span></div>
+          <div class="gt-row"><span>${esc(T('plugin.2110_io.gen_level', 'Niveau'))}</span><span>${esc(level)}</span></div>
+          <div class="gt-row"><span>${esc(T('plugin.2110_io.gen_chans', 'Canaux actifs'))}</span><span>${nOn} / ${nChans}</span></div>
           <div class="gt-chans">${chans.join('')}</div>
           <div style="margin-top:6px; color:var(--text-muted); font-size:0.92em">
             Vert = actif · Rouge = ruptures · Grisé = muet</div>
@@ -206,7 +212,7 @@ window.MXLPlugins["2110_io"] = {
         ? ((r.video_idx != null && r.audio_sub_idx != null)
             ? `AUD ${r.audio_sub_idx + 1}`
             : `AUD #${r.idx + 1}`)
-        : 'VIDÉO';
+        : T('plugin.2110_io.tag_video', 'VIDÉO');
       // LIBELLÉ DE LA SOURCE, sous le tag : le nom que l'exploitant reconnaît (UMD reçu par TSL,
       // nom d'antenne…). Le NIVEAU affiché est celui choisi dans la barre de navigation — on
       // n'en impose aucun, un même flux porte plusieurs noms selon le métier. La règle de repli
@@ -225,11 +231,11 @@ window.MXLPlugins["2110_io"] = {
       }
       let _labTip = '';
       if (_lab.value && window.SourceLabels) {
-        _labTip = 'Libellé « ' + window.SourceLabels.levelName(_lab.level) + ' »'
+        _labTip = T('plugin.2110_io.label_level', 'Libellé « {niveau} »').replace('{niveau}', window.SourceLabels.levelName(_lab.level))
                 + (_lab.level !== window.SourceLabels.level
-                     ? ' — le niveau demandé est vide pour cette source' : '')
-                + (_lab.inherited ? ' — hérité de la vidéo du même Rx' : '')
-                + ' · niveau réglable en haut de page';
+                     ? T('plugin.2110_io.label_empty', ' — le niveau demandé est vide pour cette source') : '')
+                + (_lab.inherited ? T('plugin.2110_io.label_inherited', ' — hérité de la vidéo du même Rx') : '')
+                + T('plugin.2110_io.label_settable', ' · niveau réglable en haut de page');
       }
       // Le libellé est un ÉLÉMENT DE GRILLE À PART (2ᵉ rangée, colonnes 1→4) et non un enfant du
       // tag : la colonne du tag fait 64 px, un nom d'antenne y était tronqué dès quelques
@@ -256,7 +262,7 @@ window.MXLPlugins["2110_io"] = {
           <button type="button" class="ctl-push ctl-push--led io-gen" role="switch"
                 aria-pressed="${_genOn}"
                 data-essence="${ess}" data-idx="${r.idx}" data-enable="${_genOn ? '0' : '1'}"><span
-                class="ctl-led"></span>GÉN</button>
+                class="ctl-led"></span>${esc(T('plugin.2110_io.gen_btn', 'GÉN'))}</button>
           ${(!isAudio && _genOn) ? `<span class="gen-pat-wrap"><select class="ctl-select io-patsel" data-essence="video" data-idx="${r.idx}">${_patOpts}</select></span>` : ''}
           ${genTooltip(r, isAudio, _genOn)}
         </span>`;
@@ -279,7 +285,7 @@ window.MXLPlugins["2110_io"] = {
       const identCtl = (isAudio || isAnc) ? '<span class="io-flow-ident ident-wrap"></span>' : `<span class="io-flow-ident ident-wrap">
           <button type="button" class="ctl-push ctl-push--led io-ident" role="switch"
                 aria-pressed="${!!r.ident}" data-idx="${r.idx}" data-enable="${r.ident ? '0' : '1'}"
-                title="Incrustation 3 lignes (nom · source/multicast · format), fond noir, haut-droite"><span
+                title="${esc(T('plugin.2110_io.ident_overlay_tip', 'Incrustation 3 lignes (nom · source/multicast · format), fond noir, haut-droite'))}"><span
                 class="ctl-led"></span>IDENT</button>
           ${r.ident ? `<span class="ctl-knob ctl-knob--arc io-identknob"
                 data-idx="${r.idx}" data-min="${IDENT_MIN}" data-max="${IDENT_MAX}" data-step="2"
@@ -287,7 +293,7 @@ window.MXLPlugins["2110_io"] = {
                 <button type="button" class="ctl-knob-hit" role="slider"
                   aria-label="${esc(T('js.io2110.ident_size_aria', 'Taille du texte IDENT'))}" aria-valuemin="${IDENT_MIN}" aria-valuemax="${IDENT_MAX}"
                   aria-valuenow="${identSz}" aria-valuetext="${identSz}px"
-                  title="Taille du texte IDENT — glisser ↕, molette, flèches (Maj = pas large). Entrée = taille automatique.">${
+                  title="${esc(T('plugin.2110_io.ident_size_tip', 'Taille du texte IDENT — glisser ↕, molette, flèches (Maj = pas large). Entrée = taille automatique.'))}">${
                   _identSvg(identSz, identDef)}</button>
                 <span class="ctl-knob-val">${identSz}px</span></span>` : ''}
         </span>`;
@@ -308,7 +314,9 @@ window.MXLPlugins["2110_io"] = {
       const sdpCtl = `<span class="io-flow-sdp sdp-wrap">
           <button type="button" class="btn btn-sm io-sdp" aria-haspopup="dialog"
                 data-essence="${sdpEss}" data-idx="${r.idx}"
-                title="${r.sdp ? 'Un SDP est posé sur ce slot' : 'Aucun SDP sur ce slot'} — afficher / coller (abonnement NMOS manuel)"><span
+                title="${esc((r.sdp ? T('plugin.2110_io.sdp_present', 'Un SDP est posé sur ce slot')
+                             : T('plugin.2110_io.sdp_absent', 'Aucun SDP sur ce slot'))
+                      + T('plugin.2110_io.sdp_suffix', ' — afficher / coller (abonnement NMOS manuel)'))}"><span
                 class="ctl-led${r.sdp ? ' on' : ''}" style="--ctl-led-col:var(--status-running-fg)"></span>SDP…</button>
         </span>`;
       const rateCell = isAnc
@@ -320,7 +328,7 @@ window.MXLPlugins["2110_io"] = {
             // l'arrivée par la couleur.
             if (!r.sdp) return '<span style="color:var(--text-muted)">—</span>';
             const type = r.timecode ? 'timecode (SMPTE ST 12M)' : 'SMPTE ST 291';
-            return `<span title="Métadonnées ANC 2110-40 : ${esc(type)}">${esc(type)}</span>`;
+            return `<span title="${esc(T('plugin.2110_io.anc_meta_tip', 'Métadonnées ANC 2110-40 : {type}').replace('{type}', type))}">${esc(type)}</span>`;
           })()
         : isAudio
         ? (() => {
@@ -329,7 +337,7 @@ window.MXLPlugins["2110_io"] = {
             if (!(r.sdp && r.sample_rate)) return '<span style="color:var(--text-muted)">— / —</span>';
             const khz = (r.sample_rate / 1000).toString().replace(/\.0$/, '');
             const txt = `${khz}kHz / L${r.bit_depth || 24} / ${r.channels || 1}ch`;
-            return `<span title="Format audio annoncé par le SDP reçu">${esc(txt)}</span>`;
+            return `<span title="${esc(T('plugin.2110_io.audio_fmt_tip', 'Format audio annoncé par le SDP reçu'))}">${esc(txt)}</span>`;
           })()
         : (() => {
             // VIDÉO : ni abonné (IS-05) ni générateur actif → pas de signal. On n'affiche PAS un
@@ -337,7 +345,8 @@ window.MXLPlugins["2110_io"] = {
             if (!r.active && !r.generating) {
               return `<span style="color:var(--status-stopped-fg)" title="${esc(T('plugin.2110_io.not_subscribed_tip', 'Slot non abonné — aucun flux ni générateur (sortie vide)'))}">${esc(T('plugin.2110_io.not_subscribed', 'non abonnée'))}</span>`;
             }
-            return `<span title="format vidéo${r.generating ? ' (mire générée)' : ''}">${fmtVideoFormat(r)}</span>`;
+            return `<span title="${esc(r.generating ? T('plugin.2110_io.video_fmt_gen_tip', 'format vidéo (mire générée)')
+                                              : T('plugin.2110_io.video_fmt_tip', 'format vidéo'))}">${fmtVideoFormat(r)}</span>`;
           })();
       // Cadence MESURÉE, face au format qui, lui, est déclaré. Rendue par le socle partagé — et
       // seulement pour la vidéo : sur une session audio, le compteur du moteur totalise des
@@ -356,8 +365,8 @@ window.MXLPlugins["2110_io"] = {
         <span class="io-flow-state">${stateBadge(r)}</span>
         <span class="io-flow-fmt">${rateCell}</span>
         <span class="io-flow-fps">${fpsCell}</span>
-        <span class="io-flow-net" title="adresses 2110 reçues">${net}</span>
-        <span class="io-flow-mxl${r.shm_path ? '' : ' vide'}" title="nom du flux sur le bus MXL">${mxl}</span>
+        <span class="io-flow-net" title="${esc(T('plugin.2110_io.addr_received', 'adresses 2110 reçues'))}">${net}</span>
+        <span class="io-flow-mxl${r.shm_path ? '' : ' vide'}" title="${esc(T('js.io2110.mxl_name_tip', 'nom du flux sur le bus MXL'))}">${mxl}</span>
       </div>`;
     }
     function groupEnsembles(receivers){
@@ -398,7 +407,7 @@ window.MXLPlugins["2110_io"] = {
         const auds = sl.filter(s => s.essence === 'audio').sort((a,b) => (a.audio_idx||0) - (b.audio_idx||0));
         const anc  = sl.find(s => s.essence === 'anc');
         const fmtDest = (s) => {
-          if (!s) return '<span style="color:var(--text-muted)">non configuré</span>';
+          if (!s) return '<span style="color:var(--text-muted)">' + esc(T('plugin.2110_io.not_configured', 'non configuré')) + '</span>';
           const fp = fmtFps(s.fps);
           const dest = s.multicast_ip ? `${s.multicast_ip}:${s.destination_port ?? '?'}` : '—';
           return `<span style="color:var(--text-muted)">${esc(dest)}</span> ${fp} fps`;
@@ -471,7 +480,7 @@ window.MXLPlugins["2110_io"] = {
       if (!model) return '';
       // Agrégat = somme des vitesses de lien réelles des ports de la carte (ex. 4×10 = 40G).
       const agg = (aggregateGbps > 0)
-        ? ` · <span class="nic-shared">agrégé ${aggregateGbps}G</span>` : '';
+        ? ` · <span class="nic-shared">${esc(T('plugin.2110_io.nic_shared', 'agrégé {n}G').replace('{n}', aggregateGbps))}</span>` : '';
       return `<div class="nic-model-lbl">${esc(model)}${agg}</div>`;
     }
 
@@ -503,7 +512,7 @@ window.MXLPlugins["2110_io"] = {
           val != null ? (isEst ? '~' : '') + val.toFixed(1) + ' / ' + cap + ' G' : '—'}</span>
           ${_gauge(pct, etat, val != null
               ? `${p.iface} : ${val.toFixed(1)} sur ${cap} Gbps`
-              : `${p.iface} : débit non mesuré`)}</div>
+              : T('plugin.2110_io.port_no_rate', '{iface} : débit non mesuré').replace('{iface}', p.iface))}</div>
         <div class="pc-meta">${p.rx_flow_count != null ? p.rx_flow_count + ' flux' : ''}${
           p.rx_queues != null ? ' · ' + p.rx_queues + ' files' : ''}</div>
       </div>`;
@@ -517,7 +526,7 @@ window.MXLPlugins["2110_io"] = {
         UNCALIBRATED:['UNCAL','#e8a33d'], FAULTY:['FAULTY','var(--status-stopped-fg,#f87171)'],
         DISABLED:['DISABLED','var(--text-muted)'], INITIALIZING:['INIT','var(--text-muted)']};
       const [lbl,c] = M[state] || [state, 'var(--text-muted)'];
-      return `<span class="pc-ptp" style="color:${c};border-color:${c}" title="État PTP du port : ${esc(state)}">⏱ ${lbl}</span>`;
+      return `<span class="pc-ptp" style="color:${c};border-color:${c}" title="${esc(T('plugin.2110_io.ptp_state_tip', 'État PTP du port : {state}').replace('{state}', state))}">⏱ ${lbl}</span>`;
     }
     // Bande de ports + bouton « Par NIC ». Mono-port (<2 ports) → '' (UI agrégée inchangée). Le détail
     // déplié montre PAR PORT, en barres PLEINE LARGEUR : débit RX + Queues XDP multi-segments
@@ -556,7 +565,7 @@ window.MXLPlugins["2110_io"] = {
         }).join('')}</div>` : '';
       return `<div class="io2110-nicbar"><div class="io2110-portstrip">${strip}</div>
         <button type="button" class="btn btn-sm io-nictoggle" aria-expanded="${_nicOpen}"
-          title="Afficher / masquer le détail par port physique">${_nicOpen ? '▾' : '▸'} Par NIC</button>
+          title="${esc(T('plugin.2110_io.per_nic_tip', 'Afficher / masquer le détail par port physique'))}">${_nicOpen ? '▾' : '▸'} ${esc(T('plugin.2110_io.per_nic_toggle', 'Par NIC'))}</button>
         </div>${detail}`;
     }
 
@@ -608,13 +617,14 @@ window.MXLPlugins["2110_io"] = {
       }
       return `<span class="port-wrap"><select class="ctl-select io-portsel" data-role="${role}" data-idx="${idx}"
                 data-idxs="${esc((idxs && idxs.length ? idxs : [idx]).join(','))}"
-                title="${_pairs227.length ? 'Paire 2022-7 (les deux legs) ou port de cet ensemble' : 'Port (NIC) de cet ensemble — Auto = répartition automatique entre les ports du réseau'}">${opts.join('')}</select></span>`;
+                title="${esc(_pairs227.length ? T('plugin.2110_io.port_pair_tip', 'Paire 2022-7 (les deux legs) ou port de cet ensemble')
+                       : T('plugin.2110_io.port_auto_tip', 'Port (NIC) de cet ensemble — Auto = répartition automatique entre les ports du réseau'))}">${opts.join('')}</select></span>`;
     }
 
     // Ligne de flux audio/ANC avec bouton de retrait granulaire (« Option A »).
     function _rmWrap(html, fid){
       return `<div class="io2110-flowrow">${html}`
-           + (fid ? `<button type="button" class="btn btn-sm io2110-flowrm" data-fid="${esc(fid)}" title="Retirer ce flux">✕</button>` : '')
+           + (fid ? `<button type="button" class="btn btn-sm io2110-flowrm" data-fid="${esc(fid)}" title="${esc(T('plugin.2110_io.rm_flow_tip', 'Retirer ce flux'))}">✕</button>` : '')
            + `</div>`;
     }
 
@@ -638,8 +648,10 @@ window.MXLPlugins["2110_io"] = {
       const freeL = pct(Math.min(Math.max(active, planned), reserved));
       const freeW = Math.max(0, rPct - freeL);
       const txt = (overQ
-        ? `${active} live · +${pend} planifié dont ${overQ} > réservé (${reserved}) → redéploiement`
-        : `${active} live · +${pend} planifié · ${freeQ} libre / ${hw} files`) + (scope || '');
+        ? T('plugin.2110_io.q_over', '{active} live · +{pend} planifié dont {over} > réservé ({reserved}) → redéploiement')
+            .replace('{active}', active).replace('{pend}', pend).replace('{over}', overQ).replace('{reserved}', reserved)
+        : T('plugin.2110_io.q_ok', '{active} live · +{pend} planifié · {free} libre / {hw} files')
+            .replace('{active}', active).replace('{pend}', pend).replace('{free}', freeQ).replace('{hw}', hw)) + (scope || '');
       return `<div class="nic-bar-wrap">
         <span class="nic-bar-lbl">Queues XDP</span>
         <span class="nic-bar-val" style="color:${overQ ? '#e8a33d' : col}">${txt}</span>
@@ -648,7 +660,7 @@ window.MXLPlugins["2110_io"] = {
           <div class="nic-xdp-pending" style="left:${hotL}%;width:${hotW}%;background-color:${col}"></div>
           <div class="nic-xdp-over"    style="left:${ovrL}%;width:${ovrW}%"></div>
           <div class="nic-xdp-active"  style="width:${aPct}%;background:${col}"></div>
-          <div class="nic-xdp-mark"    style="left:${rPct}%" title="Plafond à chaud : ${reserved} files réservées à mtl_init — au-delà, redéploiement requis"></div>
+          <div class="nic-xdp-mark"    style="left:${rPct}%" title="${esc(T('plugin.2110_io.q_cap_tip', 'Plafond à chaud : {reserved} files réservées à mtl_init — au-delà, redéploiement requis').replace('{reserved}', reserved))}"></div>
         </div>
       </div>`;
     }
@@ -702,12 +714,12 @@ window.MXLPlugins["2110_io"] = {
               return `<div class="ens ens-indep ctl-dense">
                 <div class="ens-title">Flux indépendants${
                   g.audios.concat(g.ancs || []).map(x =>
-                    `<span class="io-indepport" title="Port du flux ${esc(String(x.shm_path || '').replace(/^\/dev\/shm\//, '') || ('#' + x.idx))}">${
+                    `<span class="io-indepport" title="${esc(T('plugin.2110_io.port_of_flow', 'Port du flux {nom}').replace('{nom}', String(x.shm_path || '').replace(/^\/dev\/shm\//, '') || ('#' + x.idx)))}">${
                       esc((x.essence || '').toUpperCase())} ${portSelector('rx', x.idx, x.port)}</span>`).join('')}</div>
                 ${rows.join('')}
               </div>`;
             }
-            const titleParts = ['1 vidéo'];
+            const titleParts = [T('plugin.2110_io.grp_video', '1 vidéo')];
             if (g.audios.length) titleParts.push(`${g.audios.length} audio`);
             if ((g.ancs || []).length) titleParts.push(`${g.ancs.length} ANC`);
             const vfid = g.video ? (g.video.flow_id || '') : '';
@@ -715,7 +727,7 @@ window.MXLPlugins["2110_io"] = {
             const ctrls = vfid ? `<div class="io2110-flowctrls">
               <button type="button" class="btn btn-sm io2110-addflow" data-ess="audio" data-att="${esc(vfid)}">+ Audio</button>
               <button type="button" class="btn btn-sm io2110-addflow" data-ess="anc" data-att="${esc(vfid)}">+ ANC</button>
-              <button type="button" class="btn btn-sm io2110-flowrm io2110-rmgrp" data-fid="${esc(vfid)}" title="Retirer cette source">✕ source</button>
+              <button type="button" class="btn btn-sm io2110-flowrm io2110-rmgrp" data-fid="${esc(vfid)}" title="${esc(T('plugin.2110_io.rm_source_tip', 'Retirer cette source'))}">${esc(T('plugin.2110_io.rm_source', '✕ source'))}</button>
             </div>` : '';
             // `ctl-dense` : contexte du catalogue. Une carte porte N lignes de trois contrôles ;
             // aux métriques de pupitre (poussoir 38 px), seize slots repoussent la carte hors de
@@ -736,7 +748,7 @@ window.MXLPlugins["2110_io"] = {
       const ensVideoCount = ens.filter(g => g.video).length;
       // Headroom = pool pré-provisionné (video_count). Au-delà → augmenter le pool (redéploiement).
       const moreBtn = ensVideoCount < _cachedVideoCount
-        ? `<button class="io-addrow">+ Ajouter une source</button>`
+        ? `<button class="io-addrow">${esc(T('plugin.2110_io.add_source', '+ Ajouter une source'))}</button>`
         : '';
       const delBtn = ensVideoCount > 0
         ? `<button class="io-addrow io2110-del-rx">${esc(T('plugin.2110_io.del_last_source', '− Retirer la dernière source'))}</button>`
@@ -745,11 +757,11 @@ window.MXLPlugins["2110_io"] = {
       // files (redéploiement du moteur). Disruptif → passe par mtlMutate (confirmation serveur).
       const _anyStalled = _cachedRecvs.some(r => r.rx_stalled);
       const realignBtn = _anyStalled
-        ? `<button class="io-addrow io2110-realign" title="Une ou plusieurs sources sont abonnées mais ne reçoivent aucun flux. Redéployer le moteur réaligne les files (coupure brève de TOUS les flux).">⟳ Redéployer pour réaligner les files</button>`
+        ? `<button class="io-addrow io2110-realign" title="${esc(T('plugin.2110_io.realign_tip', 'Une ou plusieurs sources sont abonnées mais ne reçoivent aucun flux. Redéployer le moteur réaligne les files (coupure brève de TOUS les flux).'))}">${esc(T('plugin.2110_io.realign', '⟳ Redéployer pour réaligner les files'))}</button>`
         : '';
       // Création d'un flux INDÉPENDANT (audio/ANC sans vidéo d'attache).
       const indepAdd = `<div class="io2110-flowctrls io2110-indepadd">
-        <span class="meta">Indépendant :</span>
+        <span class="meta">${esc(T('plugin.2110_io.independent', 'Indépendant :'))}</span>
         <button type="button" class="btn btn-sm io2110-addflow" data-ess="audio" data-att="">+ Audio</button>
         <button type="button" class="btn btn-sm io2110-addflow" data-ess="anc" data-att="">+ ANC</button>
       </div>`;
@@ -757,7 +769,7 @@ window.MXLPlugins["2110_io"] = {
       // Le bouton de remise au défaut des rotatifs est posé par le CATALOGUE, pas écrit ici : c'est
       // ce qui garantit qu'on ne l'oublie pas, et l'appel est idempotent (rien n'est doublé à
       // chaque rendu). Il n'appelle rien du plugin, il émet `ctl-knob-reset` (cf. onKnobReset).
-      if (window.MXLControls) window.MXLControls.attachKnobGestures(body, 'Remettre à la taille automatique');
+      if (window.MXLControls) window.MXLControls.attachKnobGestures(body, T('plugin.2110_io.knob_reset', 'Remettre à la taille automatique'));
       const realignEl = body.querySelector('.io2110-realign');
       if (realignEl) {
         realignEl.onclick = async () => {
@@ -872,7 +884,8 @@ window.MXLPlugins["2110_io"] = {
         // Seuil propre à ce repli : l'alerte est à 85 % des files, pas à 60 % comme un débit.
         const _xdpEtat = (_xdpOver || _xdpUsedPct >= 100) ? 'over' : _xdpUsedPct > 85 ? 'warn' : '';
         const _xdpTxt  = (_xdpHwMax != null)
-          ? (_xdpOver ? `${_xdpAlloc} / ${_xdpHwMax} files — SUR-CAPACITÉ (${_xdpAct} actives)`
+          ? (_xdpOver ? T('plugin.2110_io.xdp_over', '{alloc} / {max} files — SUR-CAPACITÉ ({act} actives)')
+                            .replace('{alloc}', _xdpAlloc).replace('{max}', _xdpHwMax).replace('{act}', _xdpAct)
                       : `${_xdpAlloc} / ${_xdpHwMax} files (${_xdpUsedPct}%)`)
           : `${_xdpAct} / ${_xdpAlloc} sessions`;
         _nicXdpBar = `<div class="nic-bar-wrap">
@@ -909,7 +922,7 @@ window.MXLPlugins["2110_io"] = {
         if (!resp.ok) { const j = await resp.json().catch(()=>({})); throw new Error(j.error || ('HTTP ' + resp.status)); }
         setTimeout(refresh, 600);
       } catch(err) {
-        toast('Échec du basculement IDENT : ' + err.message, 'error');
+        toast(T('plugin.2110_io.err_ident_toggle', 'Échec du basculement IDENT : ') + err.message, 'error');
       } finally {
         badge.disabled = false; badge.removeAttribute('aria-busy');
       }
@@ -923,7 +936,7 @@ window.MXLPlugins["2110_io"] = {
           method: 'POST', headers: {'Content-Type': 'application/json'},
           body: JSON.stringify({idx, size}),
         });
-      } catch(err) { toast('Échec taille IDENT : ' + err.message, 'error'); }
+      } catch(err) { toast(T('plugin.2110_io.err_ident_size', 'Échec taille IDENT : ') + err.message, 'error'); }
     }
     function _schedIdent(idx, val){
       clearTimeout(_identThrottle[idx]);
@@ -957,7 +970,7 @@ window.MXLPlugins["2110_io"] = {
         badge.dataset.enable = enable ? '0' : '1';
         setTimeout(refresh, 2500);   // le redéploiement côté container est asynchrone
       } catch(err) {
-        toast('Échec du basculement du générateur : ' + err.message, 'error');
+        toast(T('plugin.2110_io.err_gen_toggle', 'Échec du basculement du générateur : ') + err.message, 'error');
       } finally {
         badge.disabled = false; badge.removeAttribute('aria-busy');
       }
@@ -976,7 +989,7 @@ window.MXLPlugins["2110_io"] = {
         });
         if (!resp.ok) { const j = await resp.json().catch(()=>({})); throw new Error(j.error || ('HTTP ' + resp.status)); }
       } catch(err) {
-        toast('Échec du changement de mire : ' + err.message, 'error');
+        toast(T('plugin.2110_io.err_pattern', 'Échec du changement de mire : ') + err.message, 'error');
       }
     }
     // Délégation : toggle « Par NIC » — déplie/replie le détail des ports (sans refetch).
@@ -1008,7 +1021,7 @@ window.MXLPlugins["2110_io"] = {
         if (!resp.ok) { const j = await resp.json().catch(()=>({})); throw new Error(j.error || ('HTTP ' + resp.status)); }
         setTimeout(refresh, 700);   // laisse reconcile déplacer la session
       } catch(err) {
-        toast('Échec de l\'épinglage de port : ' + err.message, 'error');
+        toast(T('plugin.2110_io.err_port_pin', 'Échec de l\'épinglage de port : ') + err.message, 'error');
       } finally {
         sel.disabled = false;
       }
@@ -1032,10 +1045,11 @@ window.MXLPlugins["2110_io"] = {
             const j = await resp.json().catch(()=>({}));
             if (st) {
                 if (j.ok) {
-                    st.textContent = j.already_active ? 'Sender distant déjà actif' : 'Sender distant activé (IS-05)';
+                    st.textContent = j.already_active ? T('plugin.2110_io.sender_already', 'Sender distant déjà actif')
+                                                   : T('plugin.2110_io.sender_activated', 'Sender distant activé (IS-05)');
                     st.style.color = 'var(--status-running-fg)';
                 } else {
-                    st.textContent = '✕ ' + (j.error || 'échec');
+                    st.textContent = '✕ ' + (j.error || T('plugin.2110_io.failed', 'échec'));
                     st.style.color = 'var(--status-stopped-fg)';
                 }
             }
@@ -1050,7 +1064,8 @@ window.MXLPlugins["2110_io"] = {
         const st  = document.getElementById('rx-sdp-status');
         const sdp = ta ? ta.value.trim() : '';
         if (enable && !sdp){ if (st){ st.textContent = 'SDP vide'; st.style.color = 'var(--status-stopped-fg)'; } return; }
-        if (st){ st.textContent = enable ? 'abonnement…' : 'désabonnement…'; st.style.color = 'var(--text-muted)'; }
+        if (st){ st.textContent = enable ? T('plugin.2110_io.subscribing', 'abonnement…')
+                                                : T('plugin.2110_io.unsubscribing', 'désabonnement…'); st.style.color = 'var(--text-muted)'; }
         try {
             const resp = await fetch(`/api/nmos/receivers/${vmid}/${idx}/sdp`, {
                 method: 'POST', headers: {'Content-Type': 'application/json'},
@@ -1059,7 +1074,8 @@ window.MXLPlugins["2110_io"] = {
             const j = await resp.json().catch(()=>({}));
             if (!resp.ok) throw new Error(j.error || ('HTTP ' + resp.status));
             _closeSdpModal();
-            toast(enable ? 'Abonnement SDP appliqué' : 'Désabonné', 'info');
+            toast(enable ? T('plugin.2110_io.sdp_applied', 'Abonnement SDP appliqué')
+                     : T('plugin.2110_io.unsubscribed', 'Désabonné'), 'info');
             setTimeout(refresh, 1500);   // l'agent redéploie ffmpeg de façon asynchrone
         } catch(err){
             if (st){ st.textContent = '✕ ' + err.message; st.style.color = 'var(--status-stopped-fg)'; }
@@ -1068,7 +1084,7 @@ window.MXLPlugins["2110_io"] = {
     function _openSdpModal(essence, idx){
         _closeSdpModal();
         const cur = _sdpByIdx[essence + ':' + idx] || '';
-        const essLabel = essence === 'anc' ? 'ANC' : essence === 'audio' ? 'Audio' : 'Vidéo';
+        const essLabel = essence === 'anc' ? 'ANC' : essence === 'audio' ? 'Audio' : T('plugin.2110_io.ess_video', 'Vidéo');
         const modal = document.createElement('div');
         modal.id = 'rx-sdp-modal';
         modal.style.cssText = 'position:fixed; inset:0; background:rgba(0,0,0,.55); z-index:9999;'
@@ -1078,8 +1094,7 @@ window.MXLPlugins["2110_io"] = {
                         padding:16px; width:640px; max-width:95vw">
                 <div style="font-weight:600; margin-bottom:8px">SDP — ${essLabel} ${idx + 1} (#${vmid})</div>
                 <div style="color:var(--text-muted); font-size:0.82em; margin-bottom:8px">
-                    SDP actif reçu via NMOS. Coller/éditer puis « Appliquer » pour un abonnement
-                    manuel immédiat (sans contrôleur externe). « Se désabonner » coupe le flux.
+                    ${esc(T('plugin.2110_io.sdp_modal_hint', 'SDP actif reçu via NMOS. Coller/éditer puis « Appliquer » pour un abonnement manuel immédiat (sans contrôleur externe). « Se désabonner » coupe le flux.'))}
                 </div>
                 <textarea id="rx-sdp-ta" rows="12" spellcheck="false"
                     style="width:100%; box-sizing:border-box; font-family:var(--font-mono);
@@ -1088,10 +1103,10 @@ window.MXLPlugins["2110_io"] = {
                            border-radius:4px; padding:8px; resize:vertical">${esc(cur)}</textarea>
                 <div style="display:flex; gap:8px; align-items:center; margin-top:12px; justify-content:flex-end">
                     <span id="rx-sdp-status" style="margin-right:auto; font-size:0.85em"></span>
-                    <button class="btn" id="rx-sdp-close">Fermer</button>
-                    <button class="btn" id="rx-sdp-activate" title="Force le PATCH master_enable:true sur le sender NMOS distant correspondant à ce SDP (matériel qui ne s'active pas tout seul)">Activer IS-05 (sender distant)</button>
-                    <button class="btn btn-red" id="rx-sdp-unsub">Se désabonner</button>
-                    <button class="btn btn-green" id="rx-sdp-apply">Appliquer</button>
+                    <button class="btn" id="rx-sdp-close">${esc(T('plugin.2110_io.close', 'Fermer'))}</button>
+                    <button class="btn" id="rx-sdp-activate" title="${esc(T('plugin.2110_io.sdp_activate_tip', "Force le PATCH master_enable:true sur le sender NMOS distant correspondant à ce SDP (matériel qui ne s'active pas tout seul)"))}">${esc(T('plugin.2110_io.sdp_activate', 'Activer IS-05 (sender distant)'))}</button>
+                    <button class="btn btn-red" id="rx-sdp-unsub">${esc(T('plugin.2110_io.unsubscribe', 'Se désabonner'))}</button>
+                    <button class="btn btn-green" id="rx-sdp-apply">${esc(T('plugin.2110_io.apply', 'Appliquer'))}</button>
                 </div>
             </div>`;
         document.body.appendChild(modal);
