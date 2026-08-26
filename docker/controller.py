@@ -393,6 +393,16 @@ for _i, _if in enumerate(IFACES):
 if SIPS:
     SIPS[0] = SIP or SIPS[0]
 
+# ── MASQUE + PASSERELLE PAR NIC (CSV `NETMASKS` / `GATEWAYS`, alignés sur IFACES) ──────────────
+# Un port bindé vfio-pci n'a plus de netdev kernel : libmtl porte TOUTE sa couche 3 et ne recevait
+# jusqu'ici que l'adresse. Sans masque elle ignore ce qui est sur le lien ; sans passerelle elle ne
+# peut joindre aucun unicast hors sous-réseau. Un plant micro-segmenté en /30 avec une passerelle
+# PAR fabric (A/B) l'exige. Vides → rien n'est émis, comportement strictement inchangé.
+_masks_env = [s.strip() for s in (os.environ.get("NETMASKS") or "").split(",")]
+_gws_env   = [s.strip() for s in (os.environ.get("GATEWAYS") or "").split(",")]
+NETMASKS = [(_masks_env[_i] if _i < len(_masks_env) else "") for _i in range(len(IFACES))]
+GATEWAYS = [(_gws_env[_i] if _i < len(_gws_env) else "") for _i in range(len(IFACES))]
+
 # ── PMD PAR PORT (chantier DPDK, cf. docs/chantiers/DPDK_NARROW.md) ── `PORT_PMDS`/`PORT_BDFS` = CSV alignés
 # sur IFACES, émis par l'orchestrateur SEULEMENT si ≥1 port est en vfio-pci (node_interfaces.pmd
 # ='dpdk', BDF dans PORT_BDFS). Absents → tous les ports en af_xdp → STRICTEMENT iso-comportement
@@ -1108,7 +1118,50 @@ def _gamut_arme(st):
     return True if pr is None else bool(pr.get("gamut", True))
 
 
-def _gamut_illegal_pct(y, u, v, bd):
+# ⚠ LA MATRICE NE DOIT PAS ÊTRE CODÉE EN DUR, ET ELLE L'ÉTAIT. `_gamut_illegal_pct` calculait
+# le RVB avec les coefficients BT.709 en littéral (1.5748 / 0.1873 / 0.4681 / 1.8556) et ne
+# lisait JAMAIS la colorimétrie déclarée par la source. Sur un flux BT.601 ou BT.2020, le
+# pourcentage publié était donc faux — et faux EN SILENCE, sans qu'aucun garde-fou ne bronche,
+# alors que `gamut_pct` est montré à l'exploitant et sert à régler un seuil.
+# C'est une règle explicite du projet (« AUCUNE constante de format vidéo codée en dur ») que
+# le reste du produit respecte : le scope dérive ses coefficients de (Kr,Kb) et REFUSE de
+# tracer quand la colorimétrie manque.
+KRKB_SIG = {"601": (0.299, 0.114), "bt601": (0.299, 0.114), "smpte170m": (0.299, 0.114),
+            "709": (0.2126, 0.0722), "bt709": (0.2126, 0.0722),
+            "2020": (0.2627, 0.0593), "bt2020": (0.2627, 0.0593),
+            "bt2100": (0.2627, 0.0593)}
+
+
+def _colorimetrie_declaree(idx):
+    """Colorimétrie DÉCLARÉE par la source pour le récepteur `idx`, ou None.
+
+    Lue dans le SDP que NMOS a déposé — c'est la seule source d'autorité disponible ici. Rendre
+    None est un REFUS : mieux vaut ne pas publier de pourcentage que d'en publier un calculé
+    avec la mauvaise matrice, parce que le second a exactement l'aplomb du premier."""
+    path = os.path.join(SDP_DIR, "nmos_recv_v_{}.sdp".format(idx))
+    try:
+        mt = os.path.getmtime(path)
+    except OSError:
+        return None
+    ent = _COLOR_CACHE.get(idx)
+    if ent and ent[0] == mt:
+        return ent[1]
+    val = None
+    try:
+        with open(path) as f:
+            m = re.search(r"colorimetry=([A-Za-z0-9]+)", f.read())
+        if m:
+            val = m.group(1)
+    except OSError:
+        val = None
+    _COLOR_CACHE[idx] = (mt, val)
+    return val
+
+
+_COLOR_CACHE = {}
+
+
+def _gamut_illegal_pct(y, u, v, bd, colorimetrie=None):
     """Fraction (%) de pixels hors-gamut RGB legal sur des lignes Y/Cb/Cr échantillonnées (10-bit
     limited, matrice BT.709 HD). Couvre AUSSI les niveaux illégaux (super-noir/super-blanc → RGB<0
     ou >1). `u`/`v` = plans chroma 4:2:2 (demi-largeur) suréchantillonnés ×2 pour matcher Y. Coût
@@ -1120,9 +1173,18 @@ def _gamut_illegal_pct(y, u, v, bd):
     yn = (y.astype(np.float32) - yb) / s
     cb = (u.astype(np.float32) - cmid) / crange
     cr = (v.astype(np.float32) - cmid) / crange
-    r = yn + 1.5748 * cr
-    g = yn - 0.1873 * cb - 0.4681 * cr
-    b = yn + 1.8556 * cb
+    # Coefficients DÉRIVÉS de (Kr,Kb), jamais tabulés. `2·(1−Kr)` etc. : c'est la définition,
+    # et elle vaut pour les trois colorimétries au lieu d'une seule.
+    kk = KRKB_SIG.get(str(colorimetrie or "").strip().lower())
+    if not kk:
+        return None                                    # REFUS, pas un défaut silencieux
+    kr, kb = kk
+    kg = 1.0 - kr - kb
+    if kg <= 0:
+        return None
+    r = yn + (2 * (1 - kr)) * cr
+    g = yn - (2 * (1 - kb) * kb / kg) * cb - (2 * (1 - kr) * kr / kg) * cr
+    b = yn + (2 * (1 - kb)) * cb
     tol = SIGNAL_GAMUT_TOL
     bad = ((r < -tol) | (r > 1 + tol) | (g < -tol) | (g > 1 + tol) |
            (b < -tol) | (b > 1 + tol))
@@ -1174,12 +1236,14 @@ def _loudness_lufs(block):
     return -0.691 + 10.0 * float(np.log10(z))
 
 
-def _sig_video_probe(st, name, now):
+def _sig_video_probe(st, name, now, idx=None):
     """Sonde noir/gel/gamut du flux MXL vidéo `name` → dict {black,frozen,gamut,gamut_pct} ou None
     si illisible OU si
     aucun grain neuf depuis le dernier passage (transport figé = déjà couvert par rx/tx_stalled,
     on ne double pas l'alarme). Reader rouvert sur exception (flux recréé par le producteur —
     motif multiview) ; garbage_collect pour se rattacher à la génération vivante."""
+    if idx is not None:
+        st["sig_idx"] = idx           # pour retrouver le SDP, donc la colorimétrie déclarée
     try:
         r = st.get("vr")
         if r is None:
@@ -1254,7 +1318,14 @@ def _sig_video_probe(st, name, now):
             ur = np.repeat(u[coff::cstep], hx, axis=1)[:, :w]      # chroma suréchantillonné → largeur w
             vr = np.repeat(v[coff::cstep], hx, axis=1)[:, :w]
             n = min(yr.shape[0], ur.shape[0], vr.shape[0])
-            gam_pct = _gamut_illegal_pct(yr[:n], ur[:n], vr[:n], bd)
+            gam_pct = _gamut_illegal_pct(yr[:n], ur[:n], vr[:n], bd,
+                                         _colorimetrie_declaree(st.get("sig_idx")))
+            if gam_pct is None:
+                # Colorimétrie non déclarée ou inconnue : on n'a pas de matrice, donc pas de
+                # mesure. On sort SANS rien publier plutôt que de lisser un chiffre calculé
+                # avec la mauvaise matrice — c'est ce que faisait la version précédente, en
+                # BT.709 quoi qu'annonce la source.
+                raise _SkipGamut()
             # LISSAGE, conséquence directe de l'origine tournante : d'un relevé à l'autre on ne
             # regarde plus les mêmes lignes, donc la mesure oscille (sur un synthé : 5,88 % à
             # 12,50 % d'un relevé au suivant). Seuiller là-dessus recréerait l'alarme qui bat qu'on
@@ -1444,7 +1515,7 @@ def _signal_loop():
                 # Vidéo : un tick sur n_video. Le résultat précédent est CONSERVÉ entre deux
                 # calculs (il décrit un état, pas un événement) — sinon les drapeaux image
                 # clignoteraient au rythme de la cadence audio.
-                vres = _sig_video_probe(st, "{}_{}".format(HOSTNAME, _num(idx)), now) \
+                vres = _sig_video_probe(st, "{}_{}".format(HOSTNAME, _num(idx)), now, idx) \
                     if (faire_video and v_on) else st.get("vres_last")
                 if faire_video and v_on and vres is not None:
                     st["vres_last"] = vres
@@ -1493,7 +1564,7 @@ def _signal_loop():
                     _sig_close(st)
                     st = {"name": name}
                     _sig_state[key] = st
-                vres = _sig_video_probe(st, name, now)
+                vres = _sig_video_probe(st, name, now, idx)
                 with _sig_lock:
                     if vres is not None:
                         _signal_tx[i] = dict(vres)     # black/frozen/gamut(+pct)
@@ -2963,6 +3034,12 @@ def _write_config(sessions):
         # (Le config d'un nœud af_xdp n'est plus octet-identique à avant : c'est l'objet du
         # correctif, et la valeur écrite est celle qui part dans le SDP.)
         _pe["profile"] = _port_profile_effectif(nic)
+        # Masque/passerelle du port : émis SEULEMENT s'ils sont déclarés (une clé absente laisse
+        # mtl_rx sur son comportement historique, adresse seule).
+        if i < len(NETMASKS) and NETMASKS[i]:
+            _pe["netmask"] = NETMASKS[i]
+        if i < len(GATEWAYS) and GATEWAYS[i]:
+            _pe["gateway"] = GATEWAYS[i]
         # PMD par port (chantier DPDK) : clés émises SEULEMENT si ≥1 port dpdk sur le nœud.
         if _HAS_DPDK:
             _pe["pmd"] = _port_pmd(nic)
