@@ -1,7 +1,12 @@
 {
-  "version": "0.101.0",
+  "version": "0.102.0",
   "date": "2026-08-23",
   "changes": {
+    "Les compteurs par session atteignent enfin le relevé (0.102.0)": [
+      "⚠ LA LISTE DE CLÉS DE `controller.py` EST UN FILTRE, ET C'EST UN PIÈGE. `mtl_rx` peut écrire une clé dans son fichier de stats sans qu'elle atteigne jamais `:8080` : la boucle `for _tk in (...)` recopie une liste FERMÉE, tout le reste disparaît en silence entre le producteur et le consommateur, et rien ne le signale.",
+      "Les compteurs de transport par session ajoutés en 0.101.0 étaient bien dans le fichier — 436 320 paquets, zéro perdu, zéro trame incomplète sur 101 trames — et absents du relevé publié. De l'extérieur, cela donnait exactement l'impression que le moteur ne les mesurait pas. Constaté en comparant le fichier BRUT au relevé, pas en relisant le code : j'ai d'abord cru que `accum_px` n'était jamais appelé.",
+      "TOUTE NOUVELLE CLÉ DE `write_stats` DOIT ÊTRE AJOUTÉE À CETTE LISTE — la consigne est maintenant écrite sur place, à l'endroit où on l'oublie."
+    ],
     "★★★ Le port 2110 répond au ping — et le banc était au mauvais endroit (0.101.0)": [
       "MESURÉ depuis une SVI du leaf, DANS le même domaine L2 que le port : 192.0.2.201 et .202 répondent, 11/12 paquets à ~0,45 ms (le seul perdu est la résolution ARP). Témoins moteur : `arp_receive_request(0), send to …` (code amont) et `cni_icmp_echo_reply(0), echo reply to …` (notre patch). L'exigence IPMEDIA § 4 est tenue.",
       "SEUL `patch_icmp_echo` est nécessaire : MTL implémente ARP/IGMP/DHCP dans son plan de contrôle (design.md §5) mais PAS ICMP. `patch_cni_arp_icmp_flow` est RETIRÉ — prouvé inutile en A/B au même point d'observation : 0.99.0 (avec les règles rte_flow d'admission) et 0.97.0 (sans) répondent à l'identique. Le chemin natif fonctionne, RSS étant désactivé sur E810 le trafic non classé tombe sur la file 0 qui est la file CNI ; c'est pourquoi `mt_dev.c` saute volontairement la création de règle pour les SYS_QUEUE.",

@@ -3696,9 +3696,21 @@ def _simu_loop(idx):
                             # un moteur 2110_io normal (parser off) ne les a pas → receiver inchangé.
                             # Verdict `compliant` ABSOLU fiable seulement avec PTP ; sans grandmaster,
                             # lire Cinst + vrx_span (invariants à la dérive, cf. docs/reference/PROBE_2110.md).
+                            # ⚠ CETTE LISTE EST UN FILTRE, ET C'EST UN PIÈGE. `mtl_rx` peut
+                            # écrire une clé dans son fichier de stats sans qu'elle atteigne
+                            # jamais `:8080` : rien ne le signale, la clé disparaît en silence
+                            # entre le producteur et le consommateur. Les compteurs de
+                            # transport par session étaient dans le fichier — 436 320 paquets,
+                            # zéro perdu — et absents du relevé, ce qui donnait l'impression
+                            # que le moteur ne les mesurait pas.
+                            # TOUTE NOUVELLE CLÉ DE `write_stats` DOIT ÊTRE AJOUTÉE ICI.
                             for _tk in ("compliant", "failed_cause", "cinst_max", "cinst_avg",
                                         "vrx_max", "vrx_min", "vrx_avg", "vrx_span",
-                                        "fpt", "latency", "late"):
+                                        "fpt", "latency", "late",
+                                        # Transport PAR SESSION (0.101.0) : ce que le port ne
+                                        # peut pas dire, parce qu'il agrège toutes ses sessions.
+                                        "pkts", "pkts_perdus", "pkts_secours",
+                                        "trames_incompletes", "pire_manque", "trames_mesurees"):
                                 if _tk in d:
                                     metrics[idx][_tk] = d[_tk]
                                 else:
