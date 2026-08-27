@@ -175,6 +175,10 @@ COPY patch_tx_frame_inflight_reclaim.py /tmp/patch_tx_frame_inflight_reclaim.py
 COPY patch_tx_reset_no_drop.py /tmp/patch_tx_reset_no_drop.py
 COPY patch_tm_hierarchy.py /tmp/patch_tm_hierarchy.py
 COPY patch_igmp_router_alert.py /tmp/patch_igmp_router_alert.py
+# Patch bobi.studio ICMP ECHO : un port en vfio-pci n'a plus de netdev noyau, donc plus
+# personne pour répondre au ping — et libmtl ne connaît que l'ARP. L'intégration sur un
+# plant ST 2110 se valide interface par interface AU PING depuis le routeur d'accès.
+COPY patch_icmp_echo.py /tmp/patch_icmp_echo.py
 COPY patch_ptp_mcast_flow.py /tmp/patch_ptp_mcast_flow.py
 COPY patch_ptp_stable_getter.py /tmp/patch_ptp_stable_getter.py
 COPY patch_ptp_gm_export.py /tmp/patch_ptp_gm_export.py
@@ -216,6 +220,7 @@ RUN mkdir -p /src/MTL && cd /src/MTL \
  && python3 /tmp/patch_tx_reset_no_drop.py \
  && python3 /tmp/patch_tm_hierarchy.py \
  && python3 /tmp/patch_igmp_router_alert.py \
+ && python3 /tmp/patch_icmp_echo.py \
  && python3 /tmp/patch_ptp_mcast_flow.py \
  && python3 /tmp/patch_ptp_stable_getter.py \
  && python3 /tmp/patch_ptp_gm_export.py \
