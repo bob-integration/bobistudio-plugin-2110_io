@@ -32,7 +32,7 @@ DPDK narrow RL le « mur des 8 » est levé (0.39.6, jusqu'à 63 senders/port) �
 (même sur Ctrl-C).
 
 Exemple (dl360-1, rampe 1→40 senders 1080p50 10-bit narrow) :
-  tx_scale_bench.py --engine 192.0.2.251 --max 40 --format 1920x1080x50 \\
+  tx_scale_bench.py --engine x.x.x.x --max 40 --format 1920x1080x50 \\
     --base-mcast 239.100.1.1 --base-port 20000 --settle 8 --stagger 2
 
 Sortie : une ligne par palier (n senders → tx Gb/s, late) + verdict final. Code retour 0 = plafond
