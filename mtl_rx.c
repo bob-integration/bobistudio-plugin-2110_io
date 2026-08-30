@@ -3839,10 +3839,12 @@ static void write_port_stats(mtl_handle st) {
     long long lastd = 0;
     int have_last = mt_bobi_ptp_last_delta(st, 0, &lastd) ? 1 : 0;   /* offset from master, signe */
     int have_pd   = mt_bobi_ptp_path_delay(st, 0, &pd) ? 1 : 0;      /* mean path delay */
-    /* locked = lock servo STRICT de libmtl (delta brut < 100 ns en continu) ; sur E810 DPDK il ne
-     * se déclenche jamais (delta brut ~1,3 µs) même quand la synchro est bonne, à conserver comme
-     * signal technique. synced = synchro RÉELLE au GM = GM connu + offset corrigé disponible (le
-     * servo suit le maître, timestamps média justes) → c'est CE flag qui pilote le badge de l'onglet. */
+    /* locked = lock servo STRICT de libmtl (delta brut < 100 ns en continu). ⚠ Il ne se déclenchait
+     * JAMAIS tant que l'asservissement en FRÉQUENCE du PHC n'était pas compilé — on l'a longtemps
+     * écrit ici comme une fatalité de l'E810, c'était un défaut : cf. patch_ptp_adjust_freq, depuis
+     * lequel le verrou s'arme en permanence et le delta brut tient sous 100 ns. synced = synchro
+     * RÉELLE au GM (GM connu + offset dispo) : il reste le flag qui pilote le badge, parce qu'un
+     * moteur sur image ANTÉRIEURE au correctif ne verrouille toujours pas. */
     int locked = (have_gm && mt_bobi_ptp_stable(st, 0)) ? 1 : 0;
     int synced = (have_gm && have_corr) ? 1 : 0;
     fprintf(f, ", \"ptp\": {\"engine\": true, \"locked\": %s, \"synced\": %s, \"domain\": %d, \"utc_offset\": %d",
