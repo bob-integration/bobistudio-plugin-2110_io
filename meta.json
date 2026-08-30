@@ -1,7 +1,11 @@
 {
-  "version": "0.104.0",
+  "version": "0.105.0",
   "date": "2026-08-30",
   "changes": {
+    "Plus de repli sur l'offset corrigé, et `synced` change de source (0.105.0)": [
+      "Le parc passant intégralement à l'image corrigée, le repli sur l'offset corrigé en logiciel n'a plus d'objet : il rendait des valeurs absurdes (±7e16 ns) dès que le PHC est asservi en fréquence, et publier une valeur fausse est pire que n'en publier aucune. offset_ns vaut désormais le delta signé, ou null. Le champ de comparaison offset_soft_ns, ajouté le temps de la transition, disparaît.",
+      "synced se calcule sur la disponibilité d'une mesure de delta (have_last) et non plus sur celle de l'offset corrigé, qui n'est plus lu. Les deux flags gardent des rôles distincts, désormais écrits noir sur blanc : synced = il Y A une référence de temps (disponibilité, critère d'alarme) ; locked = le servo est CONVERGÉ sous 100 ns (qualité). Alarmer sur locked crierait à chaque déploiement, le servo mettant une à deux minutes à converger."
+    ],
     "L'offset affiché suit le régime : delta PHC↔GM signé quand le PHC est asservi (0.104.0)": [
       "Mesuré juste après l'activation de l'asservissement en fréquence (0.103.0) : le verrou servo strict s'arme enfin et le delta brut tombe de 1700-2500 ns à 9-99 ns — mais l'offset corrigé EN LOGICIEL, lui, sort des valeurs absurdes (±7e16 ns sur 64 relevés sur 70). Normal : il n'existait que pour compenser l'ABSENCE de discipline matérielle, et son ancre last_sync_ts n'est plus rafraîchie dans ce régime.",
       " publie donc désormais le dernier delta PHC↔GM SIGNÉ (nouveau getter mt_bobi_ptp_last_delta, capté là où le servo applique la correction), avec repli sur l'offset corrigé pour une image bâtie sans le patch de fréquence. L'ancienne valeur reste visible sous  pour comparaison. raw_delta_ns reste le MAX de la fenêtre : un diagnostic, pas un offset."

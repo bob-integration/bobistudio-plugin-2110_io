@@ -242,7 +242,6 @@ extern bool mt_bobi_ptp_gm(void* impl, int port, unsigned char* out_id8, int* ou
  * discipline HW non convergente), offset CORRIGÉ (correct_delta ~31 ns = « offset from master » à
  * afficher) et mean path delay (~168 ns, le champ qui manquait). true SSI mesuré. */
 extern bool mt_bobi_ptp_offset(void* impl, int port, long long* out_ns);
-extern bool mt_bobi_ptp_correct_offset(void* impl, int port, long long* out_ns);
 extern bool mt_bobi_ptp_path_delay(void* impl, int port, long long* out_ns);
 /* Dernier delta PHC<->GM SIGNE : « offset from master » une fois le PHC asservi en frequence
  * (cf. patch_ptp_adjust_freq). L'offset corrige en LOGICIEL n'a plus d'objet dans ce regime. */
@@ -3832,35 +3831,38 @@ static void write_port_stats(mtl_handle st) {
    * MÊME avant le lock. gm_identity au format SDP (XX-XX-…-XX), "" si Announce pas encore reçu. */
   if (g_engine_ptp) {
     unsigned char gm[8]; int dom = 0, utc = 0;
-    long long raw = 0, corr = 0, pd = 0;
+    long long raw = 0, pd = 0;
     int have_gm   = mt_bobi_ptp_gm(st, 0, gm, &dom, &utc) ? 1 : 0;
     int have_raw  = mt_bobi_ptp_offset(st, 0, &raw) ? 1 : 0;         /* delta brut (diag, pilote locked) */
-    int have_corr = mt_bobi_ptp_correct_offset(st, 0, &corr) ? 1 : 0;/* offset corrigé (regime logiciel) */
     long long lastd = 0;
     int have_last = mt_bobi_ptp_last_delta(st, 0, &lastd) ? 1 : 0;   /* offset from master, signe */
     int have_pd   = mt_bobi_ptp_path_delay(st, 0, &pd) ? 1 : 0;      /* mean path delay */
-    /* locked = lock servo STRICT de libmtl (delta brut < 100 ns en continu). ⚠ Il ne se déclenchait
-     * JAMAIS tant que l'asservissement en FRÉQUENCE du PHC n'était pas compilé — on l'a longtemps
-     * écrit ici comme une fatalité de l'E810, c'était un défaut : cf. patch_ptp_adjust_freq, depuis
-     * lequel le verrou s'arme en permanence et le delta brut tient sous 100 ns. synced = synchro
-     * RÉELLE au GM (GM connu + offset dispo) : il reste le flag qui pilote le badge, parce qu'un
-     * moteur sur image ANTÉRIEURE au correctif ne verrouille toujours pas. */
+    /* DEUX niveaux, et ils répondent à deux questions différentes :
+     *  · locked = lock servo STRICT (delta brut < 100 ns en continu) = « le servo est CONVERGÉ ».
+     *    ⚠ Il ne se déclenchait jamais tant que l'asservissement en FRÉQUENCE du PHC n'était pas
+     *    compilé — on l'écrivait ici comme une fatalité de l'E810, c'était un défaut (cf.
+     *    patch_ptp_adjust_freq). Il s'arme désormais en permanence.
+     *  · synced = GM connu + une mesure de delta disponible = « il Y A une référence de temps ».
+     *    C'est une question de DISPONIBILITÉ, pas de qualité — d'où son rôle de critère d'alarme :
+     *    au démarrage le servo met une minute ou deux à converger, et alarmer sur `locked`
+     *    crierait à chaque déploiement. */
     int locked = (have_gm && mt_bobi_ptp_stable(st, 0)) ? 1 : 0;
-    int synced = (have_gm && have_corr) ? 1 : 0;
+    int synced = (have_gm && have_last) ? 1 : 0;
     fprintf(f, ", \"ptp\": {\"engine\": true, \"locked\": %s, \"synced\": %s, \"domain\": %d, \"utc_offset\": %d",
             locked ? "true" : "false", synced ? "true" : "false", dom, utc);
     /* offset_ns = « offset from master » À AFFICHER. ⚠ SA SOURCE DÉPEND DU RÉGIME, et c'est mesuré :
      * depuis que le PHC est asservi en FRÉQUENCE (patch_ptp_adjust_freq), l'offset corrigé en
      * logiciel sort des valeurs absurdes — ±7e16 ns sur 64 relevés sur 70 au banc du 2026-08-30 —
      * parce qu'il compensait précisément l'absence de discipline matérielle et que son ancre
-     * `last_sync_ts` n'est plus rafraîchie dans ce régime. Le delta PHC↔GM SIGNÉ devient alors la
-     * mesure juste (9 à 99 ns verrou armé). On préfère donc le delta signé dès qu'il est
-     * disponible, et on garde le corrigé en repli pour une image bâtie SANS le patch de fréquence.
+     * `last_sync_ts` n'est plus rafraîchie dans ce régime. Le delta PHC↔GM SIGNÉ est la mesure
+     * juste (moyenne |v| 30 ns, verrou armé — mesuré le 2026-08-30).
+     * PAS DE REPLI sur l'offset corrigé : il rendait des valeurs absurdes (±7e16 ns) dans ce
+     * régime, et publier une valeur fausse est pire que n'en publier aucune. `null` si le getter
+     * n'est pas là — ce qui ne peut arriver que sur une image bâtie sans le patch de fréquence,
+     * cas qui n'existe plus dans le parc.
      * raw_delta_ns reste le MAX de la fenêtre — un diagnostic, pas un offset. */
-    if      (have_last) fprintf(f, ", \"offset_ns\": %lld", lastd);
-    else if (have_corr) fprintf(f, ", \"offset_ns\": %lld", corr);
-    else                fprintf(f, ", \"offset_ns\": null");
-    if (have_corr) fprintf(f, ", \"offset_soft_ns\": %lld", corr);
+    if (have_last) fprintf(f, ", \"offset_ns\": %lld", lastd);
+    else           fprintf(f, ", \"offset_ns\": null");
     if (have_raw)  fprintf(f, ", \"raw_delta_ns\": %lld", raw);
     else           fprintf(f, ", \"raw_delta_ns\": null");
     if (have_pd)   fprintf(f, ", \"path_delay_ns\": %lld", pd);
