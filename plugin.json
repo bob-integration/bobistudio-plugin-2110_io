@@ -18,11 +18,7 @@
   "adapts_input": true,
   "aggregate_fps": false,
   "description": "Receiver ST 2110 via Media Transport Library (MTL/DPDK, kernel-bypass). Réception st20p/st30p écrite en zéro-copie dans le ring shared memory par un binaire C natif (libmtl), exposé en NMOS IS-04/05. Variante haute performance de receiver_2110 (mêmes shm produits). Mode simulation par slot tant que la source n'est pas activée.",
-  "nav": {
-    "section": "sources",
-    "label": "Sources",
-    "order": 11
-  },
+  "nav": { "section": "sources", "label": "Sources", "route": "/sources", "order": 10, "group": "entrees" },
   "script_template": "script.py",
   "control": {
     "endpoints": {
