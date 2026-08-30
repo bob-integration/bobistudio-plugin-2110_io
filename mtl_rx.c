@@ -244,6 +244,9 @@ extern bool mt_bobi_ptp_gm(void* impl, int port, unsigned char* out_id8, int* ou
 extern bool mt_bobi_ptp_offset(void* impl, int port, long long* out_ns);
 extern bool mt_bobi_ptp_correct_offset(void* impl, int port, long long* out_ns);
 extern bool mt_bobi_ptp_path_delay(void* impl, int port, long long* out_ns);
+/* Dernier delta PHC<->GM SIGNE : « offset from master » une fois le PHC asservi en frequence
+ * (cf. patch_ptp_adjust_freq). L'offset corrige en LOGICIEL n'a plus d'objet dans ce regime. */
+extern bool mt_bobi_ptp_last_delta(void* impl, int port, long long* out_ns);
 static int g_engine_ptp = 0;             /* 1 = ENGINE_PTP=libmtl actif (PTP interne sur port DPDK) */
 
 static uint64_t now_ns(void) {
@@ -3832,7 +3835,9 @@ static void write_port_stats(mtl_handle st) {
     long long raw = 0, corr = 0, pd = 0;
     int have_gm   = mt_bobi_ptp_gm(st, 0, gm, &dom, &utc) ? 1 : 0;
     int have_raw  = mt_bobi_ptp_offset(st, 0, &raw) ? 1 : 0;         /* delta brut (diag, pilote locked) */
-    int have_corr = mt_bobi_ptp_correct_offset(st, 0, &corr) ? 1 : 0;/* offset corrigé = « offset from master » */
+    int have_corr = mt_bobi_ptp_correct_offset(st, 0, &corr) ? 1 : 0;/* offset corrigé (regime logiciel) */
+    long long lastd = 0;
+    int have_last = mt_bobi_ptp_last_delta(st, 0, &lastd) ? 1 : 0;   /* offset from master, signe */
     int have_pd   = mt_bobi_ptp_path_delay(st, 0, &pd) ? 1 : 0;      /* mean path delay */
     /* locked = lock servo STRICT de libmtl (delta brut < 100 ns en continu) ; sur E810 DPDK il ne
      * se déclenche jamais (delta brut ~1,3 µs) même quand la synchro est bonne, à conserver comme
@@ -3842,9 +3847,18 @@ static void write_port_stats(mtl_handle st) {
     int synced = (have_gm && have_corr) ? 1 : 0;
     fprintf(f, ", \"ptp\": {\"engine\": true, \"locked\": %s, \"synced\": %s, \"domain\": %d, \"utc_offset\": %d",
             locked ? "true" : "false", synced ? "true" : "false", dom, utc);
-    /* offset_ns = offset CORRIGÉ (à afficher) ; raw_delta_ns = delta brut (diagnostic du non-lock strict) */
-    if (have_corr) fprintf(f, ", \"offset_ns\": %lld", corr);
-    else           fprintf(f, ", \"offset_ns\": null");
+    /* offset_ns = « offset from master » À AFFICHER. ⚠ SA SOURCE DÉPEND DU RÉGIME, et c'est mesuré :
+     * depuis que le PHC est asservi en FRÉQUENCE (patch_ptp_adjust_freq), l'offset corrigé en
+     * logiciel sort des valeurs absurdes — ±7e16 ns sur 64 relevés sur 70 au banc du 2026-08-30 —
+     * parce qu'il compensait précisément l'absence de discipline matérielle et que son ancre
+     * `last_sync_ts` n'est plus rafraîchie dans ce régime. Le delta PHC↔GM SIGNÉ devient alors la
+     * mesure juste (9 à 99 ns verrou armé). On préfère donc le delta signé dès qu'il est
+     * disponible, et on garde le corrigé en repli pour une image bâtie SANS le patch de fréquence.
+     * raw_delta_ns reste le MAX de la fenêtre — un diagnostic, pas un offset. */
+    if      (have_last) fprintf(f, ", \"offset_ns\": %lld", lastd);
+    else if (have_corr) fprintf(f, ", \"offset_ns\": %lld", corr);
+    else                fprintf(f, ", \"offset_ns\": null");
+    if (have_corr) fprintf(f, ", \"offset_soft_ns\": %lld", corr);
     if (have_raw)  fprintf(f, ", \"raw_delta_ns\": %lld", raw);
     else           fprintf(f, ", \"raw_delta_ns\": null");
     if (have_pd)   fprintf(f, ", \"path_delay_ns\": %lld", pd);

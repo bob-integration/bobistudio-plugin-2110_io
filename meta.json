@@ -1,7 +1,16 @@
 {
-  "version": "0.102.0",
-  "date": "2026-08-23",
+  "version": "0.104.0",
+  "date": "2026-08-30",
   "changes": {
+    "L'offset affiché suit le régime : delta PHC↔GM signé quand le PHC est asservi (0.104.0)": [
+      "Mesuré juste après l'activation de l'asservissement en fréquence (0.103.0) : le verrou servo strict s'arme enfin et le delta brut tombe de 1700-2500 ns à 9-99 ns — mais l'offset corrigé EN LOGICIEL, lui, sort des valeurs absurdes (±7e16 ns sur 64 relevés sur 70). Normal : il n'existait que pour compenser l'ABSENCE de discipline matérielle, et son ancre last_sync_ts n'est plus rafraîchie dans ce régime.",
+      " publie donc désormais le dernier delta PHC↔GM SIGNÉ (nouveau getter mt_bobi_ptp_last_delta, capté là où le servo applique la correction), avec repli sur l'offset corrigé pour une image bâtie sans le patch de fréquence. L'ancienne valeur reste visible sous  pour comparaison. raw_delta_ns reste le MAX de la fenêtre : un diagnostic, pas un offset."
+    ],
+    "Asservissement en FRÉQUENCE du PHC activé — la branche n'était jamais compilée (0.103.0)": [
+      "L'offset au grandmaster oscillait à 726 ns de moyenne et 1,26 µs de pic, là où le commentaire de libmtl annonce « ~±30 ns ». Cause : mt_ptp.c sait asservir la FRÉQUENCE du PHC, mais tout ce code est derrière #ifdef MTL_HAS_DPDK_TIMESYNC_ADJUST_FREQ, un macro défini NULLE PART en amont — vérifié aussi sur l'image construite, libmtl.so ne contenait aucun symbole timesync_adjust_freq. La branche compilée ne faisait que SAUTER LA PHASE à chaque Sync, sans jamais corriger le rythme.",
+      "Le modèle prédit la mesure : 7 ppm × 125 ms (logSync −3) = 875 ns, contre 726 ns relevés. Et ces 7 ppm sont exactement la dérive de fpt mesurée le 2026-08-27 sur tous les récepteurs, y compris notre propre TX relu en boucle interne — deux mesures indépendantes du même défaut. Corollaire : le verrou servo strict (< 100 ns continu) ne POUVAIT pas s'armer ; on mettait ce non-verrouillage sur le compte de l'E810.",
+      "Activable sans conversion : le PMD ice implémente timesync_adjust_freq, et les unités concordent des deux côtés (scaled ppm — libmtl passe ppb×65.536, ice divise par 1000000<<16). Le helper vit dans le même #ifdef, donc aucun symbole ne manque, et un repli intégré retombe sur le saut de phase si l'ajustement échoue : le pire cas est le comportement d'avant."
+    ],
     "Les compteurs par session atteignent enfin le relevé (0.102.0)": [
       "⚠ LA LISTE DE CLÉS DE `controller.py` EST UN FILTRE, ET C'EST UN PIÈGE. `mtl_rx` peut écrire une clé dans son fichier de stats sans qu'elle atteigne jamais `:8080` : la boucle `for _tk in (...)` recopie une liste FERMÉE, tout le reste disparaît en silence entre le producteur et le consommateur, et rien ne le signale.",
       "Les compteurs de transport par session ajoutés en 0.101.0 étaient bien dans le fichier — 436 320 paquets, zéro perdu, zéro trame incomplète sur 101 trames — et absents du relevé publié. De l'extérieur, cela donnait exactement l'impression que le moteur ne les mesurait pas. Constaté en comparant le fichier BRUT au relevé, pas en relisant le code : j'ai d'abord cru que `accum_px` n'était jamais appelé.",

@@ -57,6 +57,57 @@ if "rte_eth_timesync_adjust_freq" not in c:
     print("patch PTP adjust_freq : ERREUR — appel rte_eth_timesync_adjust_freq absent")
     sys.exit(1)
 
+# ── L'OFFSET À AFFICHER CHANGE DE NATURE ────────────────────────────────────────────────────────
+# `mt_bobi_ptp_correct_offset` rend `correct_delta`, l'offset corrigé EN LOGICIEL — il n'existait que
+# pour compenser l'ABSENCE de discipline matérielle. Une fois le PHC asservi en fréquence, il perd
+# son objet : mesuré au banc juste après activation, il sort des valeurs absurdes (±7e16 ns sur
+# 64 relevés sur 70) parce que son ancre `last_sync_ts` n'est plus rafraîchie dans le même régime.
+# La valeur JUSTE devient le delta PHC↔GM lui-même — 9 à 99 ns une fois le verrou armé.
+# On capte donc le dernier `delta` SIGNÉ là où le servo l'applique, exactement comme le patch
+# offset_getter capte `correct_delta`. `stat_delta_max` (un MAX de fenêtre) ne convient pas pour un
+# graphe d'offset : un maximum n'est pas une mesure instantanée.
+FH2 = "lib/src/mt_main.h"
+h2 = open(FH2).read()
+# ⚠ ANCRE À VÉRIFIER UNIQUE, pas seulement présente. Premier essai fait avec
+# `int64_t stat_delta_max;` : ce champ existe DEUX fois (mt_phc2sys_impl ligne 192 ET mt_ptp_impl
+# ligne 287), le remplacement a donc posé les champs dans la MAUVAISE structure et le build a
+# échoué en 2m29s sur `ptp->bobi_last_delta` inconnu. `stat_correct_delta_sum` est unique et
+# appartient bien à mt_ptp_impl — c'est déjà l'ancre du patch offset_getter.
+ANCRE_H = "int64_t stat_correct_delta_sum;"
+if "bobi_last_delta" not in h2:
+    n = h2.count(ANCRE_H)
+    if n != 1:
+        print("patch PTP adjust_freq : ERREUR — ancre '%s' vue %d fois dans mt_main.h "
+              "(il en faut EXACTEMENT une : une ancre ambiguë poserait le champ dans une autre "
+              "structure, et l'erreur ne se voit qu'à la compilation)" % (ANCRE_H, n))
+        sys.exit(1)
+    h2 = h2.replace(
+        ANCRE_H,
+        ANCRE_H + "\n"
+        "  int64_t bobi_last_delta;     /* bobi.studio: dernier delta PHC<->GM SIGNE (offset from master, ns) */\n"
+        "  bool bobi_has_last_delta;    /* bobi.studio: true des la 1re mesure (garde-fou du getter) */",
+        1)
+    open(FH2, "w").write(h2)
+
+ANCRE_DELTA = "  ptp->stat_delta_min = RTE_MIN(delta, ptp->stat_delta_min);"
+if ANCRE_DELTA not in c:
+    print("patch PTP adjust_freq : ERREUR — ancre des stats delta introuvable")
+    sys.exit(1)
+c = c.replace(ANCRE_DELTA,
+              "  ptp->bobi_last_delta = delta; /* bobi.studio: offset from master signe, instantane */\n"
+              "  ptp->bobi_has_last_delta = true;\n" + ANCRE_DELTA, 1)
+
+c += """
+/* bobi.studio : dernier delta PHC<->GM SIGNE (ns). C'est « l'offset from master » une fois le PHC
+ * asservi en frequence — l'offset corrige en logiciel n'a plus d'objet dans ce regime. */
+bool mt_bobi_ptp_last_delta(struct mtl_main_impl* impl, enum mtl_port port, int64_t* out_ns) {
+  struct mt_ptp_impl* ptp = mt_get_ptp(impl, port);
+  if (!ptp || !ptp->active || !ptp->bobi_has_last_delta) return false;
+  if (out_ns) *out_ns = ptp->bobi_last_delta;
+  return true;
+}
+"""
+
 # Défini AVANT la première occurrence, donc avant les trois usages (helper, servo, garde phc2sys).
 c = c.replace(ANCRE,
               "/* %s : la branche freq existe mais son macro n'est defini nulle part en amont.\n"
