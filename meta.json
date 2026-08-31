@@ -1,7 +1,12 @@
 {
-  "version": "0.105.0",
-  "date": "2026-08-30",
+  "version": "0.106.0",
+  "date": "2026-08-31",
   "changes": {
+    "Surface NMOS du moteur (plan 2) (0.106.0)": [
+      "★ Le contrôleur sert désormais /x-nmos/ : le moteur expose SON Node NMOS, alimenté par un document que l'orchestrateur lui pousse (POST /nmos, écriture atomique). Il était le seul conteneur du parc à ne pas parler le protocole — alors que c'est lui qui fait réellement du ST 2110.",
+      "Décalque de script_templates/agent.py, que le moteur n'embarque pas (il a son propre :8081). Un banc DIFFÉRENTIEL (tools/verif_nmos_plan2_moteur.py) compare les deux implémentations sur 30 chemins : une divergence ne se verrait pas autrement, chacune répondant 200 à sa façon.",
+      "⚠ POST /nmos est distinct de POST /nmos/subscribe : l'un DÉCRIT, l'autre COMMANDE (bascule SDP + redémarrage de flux). Les confondre ferait redémarrer de la production à chaque description poussée."
+    ],
     "Plus de repli sur l'offset corrigé, et `synced` change de source (0.105.0)": [
       "Le parc passant intégralement à l'image corrigée, le repli sur l'offset corrigé en logiciel n'a plus d'objet : il rendait des valeurs absurdes (±7e16 ns) dès que le PHC est asservi en fréquence, et publier une valeur fausse est pire que n'en publier aucune. offset_ns vaut désormais le delta signé, ou null. Le champ de comparaison offset_soft_ns, ajouté le temps de la transition, disparaît.",
       "synced se calcule sur la disponibilité d'une mesure de delta (have_last) et non plus sur celle de l'offset corrigé, qui n'est plus lu. Les deux flags gardent des rôles distincts, désormais écrits noir sur blanc : synced = il Y A une référence de temps (disponibilité, critère d'alarme) ; locked = le servo est CONVERGÉ sous 100 ns (qualité). Alarmer sur locked crierait à chaque déploiement, le servo mettant une à deux minutes à converger."

@@ -1758,6 +1758,108 @@ class MetricsHandler(BaseHTTPRequestHandler):
 
 
 # ─── :8081 contrat agent : /nmos/subscribe (SDP IS-05) + /status ─────
+# ── Surface NMOS du conteneur (« plan 2 » : le moteur est un Node) ───────────────────────────
+# DÉCALQUE de `script_templates/agent.py`, volontairement. Le moteur 2110 n'embarque PAS l'agent
+# générique — il a son propre :8081 (ce fichier), hérité de son rôle particulier. Il était donc le
+# seul conteneur du parc à ne pas servir sa description NMOS, c'est-à-dire le seul à ne pas parler
+# le protocole… alors que c'est lui qui fait réellement du ST 2110.
+#
+# Le moteur NE CALCULE RIEN : l'orchestrateur lui POUSSE un document (POST /nmos) et on le sert
+# découpé sur /x-nmos/. Toute la dérivation — identités, contraintes, groupes — reste côté
+# orchestrateur, où elle est écrite et éprouvée. Deux implémentations finiraient par diverger, et
+# c'est le genre de divergence qu'on ne voit qu'au moment où un tiers s'y fie.
+#
+# ⚠ Pourquoi un POST /nmos et pas une réutilisation de /nmos/subscribe : celui-ci PILOTE le moteur
+# (bascule SDP d'un slot RX, redémarrage). Y faire passer une description confondrait décrire et
+# commander — et une description poussée redémarrerait des flux en production.
+
+def _nmos_fichier():
+    """Chemin du document poussé. `/opt/script` s'il existe (comme les autres conteneurs), sinon
+    `/tmp` — le moteur n'a pas forcément ce répertoire selon l'image."""
+    for d in ("/opt/script", "/tmp"):
+        if os.path.isdir(d) and os.access(d, os.W_OK):
+            return os.path.join(d, "nmos.json")
+    return "/tmp/nmos.json"
+
+
+NMOS_IS04 = "v1.3"
+NMOS_IS05 = "v1.1"
+NMOS_COLLECTIONS = ("devices", "sources", "flows", "senders", "receivers")
+
+
+def _nmos_doc():
+    """Document poussé par l'orchestrateur, ou None. Relu à CHAQUE requête : il est réécrit au
+    redéploiement, et servir une version en cache ferait annoncer des ressources disparues."""
+    try:
+        with open(_nmos_fichier()) as f:
+            d = json.load(f)
+        return d if isinstance(d, dict) else None
+    except Exception:
+        return None
+
+
+def _nmos_get(chemin):
+    """(status, payload) pour un GET sous /x-nmos/. 404 si inconnu, 503 si rien n'a été poussé."""
+    d = _nmos_doc()
+    if d is None:
+        # 503 et pas 404 : la surface EXISTE, elle n'est simplement pas alimentée. Un 404 ferait
+        # conclure à un moteur qui ne sait pas faire de NMOS — et donc à un défaut d'image.
+        return 503, {"error": "aucune description NMOS poussée par l'orchestrateur"}
+    p = [x for x in chemin.split("?")[0].strip("/").split("/") if x][1:]
+    if not p:
+        return 200, ["node/", "connection/"]
+
+    if p[0] == "node":
+        if len(p) == 1:
+            return 200, [NMOS_IS04 + "/"]
+        if p[1] != NMOS_IS04:
+            return 404, {"error": "version IS-04 non servie"}
+        if len(p) == 2:
+            return 200, ["self/"] + [c + "/" for c in NMOS_COLLECTIONS]
+        if p[2] == "self" and len(p) == 3:
+            return 200, d.get("node") or {}
+        if p[2] in NMOS_COLLECTIONS:
+            items = d.get(p[2]) or []
+            if len(p) == 3:
+                return 200, items
+            if len(p) == 4:
+                un = next((x for x in items if x.get("id") == p[3]), None)
+                return (200, un) if un else (404, {"error": "ressource inconnue"})
+        return 404, {"error": "not found"}
+
+    if p[0] == "connection":
+        if len(p) == 1:
+            return 200, [NMOS_IS05 + "/"]
+        if p[1] != NMOS_IS05:
+            return 404, {"error": "version IS-05 non servie"}
+        if len(p) == 2:
+            return 200, ["single/"]
+        if p[2] != "single":
+            return 404, {"error": "not found"}
+        if len(p) == 3:
+            return 200, ["senders/", "receivers/"]
+        genre = p[3]
+        if genre not in ("senders", "receivers"):
+            return 404, {"error": "not found"}
+        conn = (d.get("connection") or {}).get(genre) or {}
+        if len(p) == 4:
+            return 200, [i + "/" for i in conn]
+        etat = conn.get(p[4])
+        if etat is None:
+            return 404, {"error": "ressource inconnue"}
+        if len(p) == 5:
+            return 200, ["constraints/", "staged/", "active/", "transportfile/"]
+        if p[5] == "transportfile":
+            # BCP-007-03 : MXL n'a pas de fichier de transport. L'endpoint doit EXISTER et rendre
+            # 404 — c'est le pendant de `manifest_href: null` côté IS-04.
+            return 404, {"error": "pas de transport file en MXL"}
+        if p[5] in ("constraints", "staged", "active"):
+            return 200, etat.get(p[5])
+        return 404, {"error": "not found"}
+
+    return 404, {"error": "not found"}
+
+
 class AgentHandler(BaseHTTPRequestHandler):
     def _json(self, code, obj):
         self.send_response(code)
@@ -1786,6 +1888,10 @@ class AgentHandler(BaseHTTPRequestHandler):
                 _cpu_last_time = now
             return self._json(200, {"cpu_pct": cpu_pct, "mem_used": mem_used,
                                     "mem_limit": mem_limit, "cpu_count": n_cpus})
+        chemin = self.path.split("?")[0]
+        if chemin.startswith("/x-nmos/") or chemin.rstrip("/") == "/x-nmos":
+            code, payload = _nmos_get(self.path)
+            return self._json(code, payload)
         return self._json(404, {"error": "not found"})
 
     def do_POST(self):
@@ -1795,6 +1901,20 @@ class AgentHandler(BaseHTTPRequestHandler):
             body = json.loads(self.rfile.read(n) or b"{}")
         except Exception as e:
             return self._json(400, {"error": str(e)})
+
+        if route == "/nmos":                     # ── description NMOS poussée par l'orchestrateur
+            # Remplace intégralement la description servie. Écriture ATOMIQUE (fichier temporaire
+            # puis rename) : un GET concurrent doit voir l'ancienne version ou la nouvelle, jamais
+            # un fichier tronqué qu'il prendrait pour une absence de surface.
+            try:
+                cible = _nmos_fichier()
+                tmp = cible + ".tmp"
+                with open(tmp, "w") as f:
+                    json.dump(body, f)
+                os.replace(tmp, cible)
+                return self._json(200, {"status": "ok"})
+            except Exception as e:
+                return self._json(500, {"error": str(e)})
 
         if route == "/nmos/subscribe":           # ── RX : activation IS-05 (SDP) d'un slot receiver
             essence = body.get("essence", "video")
