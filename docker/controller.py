@@ -2029,7 +2029,7 @@ class ControlHandler(BaseHTTPRequestHandler):
             return self._json(200, {"ok": True})
 
         if path == "/fieldtest":    # DIAGNOSTIC : mire de TEST DE CHAMP entrelacée sur un slot TX
-            # Bascule le slot en mire GÉNÉRÉE 1080i (sans le Newt) → isole entrée vs sortie : si la
+            # Bascule le slot en mire GÉNÉRÉE 1080i (sans le récepteur tiers) → isole entrée vs sortie : si la
             # mire combe à l'écran = défaut d'ÉMISSION TX ; si propre = défaut d'ENTRÉE (RX). On
             # mémorise le câblage réel pour le restaurer à l'extinction (enabled=false).
             try: slot = int(body.get("idx", 0))
