@@ -32,21 +32,14 @@ laquelle il ait tourné.
 
 ## Les correctifs à libmtl
 
-`docker/` contient **dix-neuf correctifs** appliqués à la Media Transport Library au moment de
-construire l'image. Ce ne sont pas des ajustements de confort : chacun corrige un comportement
-qui, en production broadcast, se voit à l'antenne. Quelques-uns, pour donner le ton :
+L'image applique à la Media Transport Library un jeu de correctifs, au moment du build. Ils
+portent sur des comportements qui, en production broadcast, se voient à l'antenne : discipline
+en fréquence du PHC, coupure d'émission au bon moment pour un vrai *hitless* 2022-7,
+réinitialisation TX sans perte de trame, option Router Alert pour l'IGMP.
 
-| Correctif | Ce qu'il répare |
-|---|---|
-| `tx_reset_no_drop` | une réinitialisation TX ne doit pas jeter de trame |
-| `afxdp_tx_link_drop` | vrai *hitless* 2022-7 : couper l'émission quand le lien tombe, pas après |
-| `tx_builder_famine_recovery` | le constructeur de trames se relève d'une famine au lieu de rester bloqué |
-| `ptp_adjust_freq` | asservissement en **fréquence** du PHC — le servo n'était jamais compilé |
-| `ptp_gm_export` | exposer le delta PHC↔GM signé, seule mesure qui vaille une fois le PHC asservi |
-| `rx_resetting_guard` / `tx_hang_resetting_guard` | ne pas confondre « en cours de reset » et « mort » |
-| `igmp_router_alert` | l'option Router Alert, exigée par certains commutateurs pour l'IGMP |
-
-Ils sont lisibles : chacun est un script Python qui décrit ce qu'il insère et pourquoi.
+Ils vivent dans `docker/`, un script par correctif, et chacun décrit ce qu'il insère et
+pourquoi. À savoir si vous comparez des versions : l'image n'embarque pas une `libmtl`
+d'origine.
 
 ---
 

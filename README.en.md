@@ -32,21 +32,13 @@ ever run on.
 
 ## The libmtl patches
 
-`docker/` carries **nineteen patches** applied to the Media Transport Library when the image is
-built. These are not conveniences: each one fixes behaviour that, in broadcast production,
-shows on air. A few, to give the flavour:
+The image applies a set of patches to the Media Transport Library at build time. They address
+behaviour that, in broadcast production, shows on air: frequency discipline of the PHC,
+stopping transmission at the right moment for true 2022-7 hitless, TX reset without dropping a
+frame, the Router Alert option for IGMP.
 
-| Patch | What it fixes |
-|---|---|
-| `tx_reset_no_drop` | a TX reset must not drop a frame |
-| `afxdp_tx_link_drop` | true 2022-7 hitless: stop sending when the link drops, not after |
-| `tx_builder_famine_recovery` | the frame builder recovers from starvation instead of wedging |
-| `ptp_adjust_freq` | **frequency** discipline of the PHC — the servo was never compiled in |
-| `ptp_gm_export` | expose the signed PHC↔GM delta, the only figure that means anything once the PHC is disciplined |
-| `rx_resetting_guard` / `tx_hang_resetting_guard` | do not mistake "resetting" for "dead" |
-| `igmp_router_alert` | the Router Alert option some switches require for IGMP |
-
-They are readable: each is a Python script that states what it inserts and why.
+They live in `docker/`, one script per patch, each stating what it inserts and why. Worth
+knowing if you are comparing versions: the image does not carry a stock `libmtl`.
 
 ---
 
