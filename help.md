@@ -2,15 +2,14 @@
 
 Moteur ST 2110 **bi-rôle** (réception **et** émission) basé sur la **Media Transport Library**
 (MTL/DPDK, kernel-bypass). Un binaire C natif (libmtl) écrit/lit les flux `st20p`/`st30p` en
-**zéro-copie** dans le ring shared memory (MXL, `/dev/shm`). C'est la variante **haute performance**
-de `receiver_2110`/`sender_2110` : mêmes shm produits, mais une seule instance fait RX + TX sur la
+**zéro-copie** dans le ring shared memory (MXL, `/dev/shm`). Une seule instance fait RX **et** TX sur la
 même NIC E810. Exposé en NMOS IS-04/05 (rôles receiver **et** sender).
 
 ## Déployer
 
 `2110_io` est **Docker-only** : il se déploie sur un **nœud** (jamais en LXC), via
 **Réglages → Nœuds & Matériel → Déploiement → Nœuds**. Le nœud doit être compatible MTL
-(NIC **Intel E810** en PF, DPDK/AF-XDP) et avoir le pool SR-IOV initialisé (voir l'article *SR-IOV*).
+(NIC **Intel E810** en PF, DPDK/AF-XDP).
 
 1. Sélectionner le nœud et créer le conteneur `2110_io` (une seule instance par nœud suffit : elle
    porte tous les slots RX et TX).
@@ -109,7 +108,7 @@ Ces actions sont **instantanées** (pas de redéploiement).
 - **Repli TX sans signal** : ce qu'émet un slot TX quand sa source est absente — *Coupé*,
   *Noir + silence* (défaut) ou *Mire + 1000 Hz*.
 - **Slots actifs** : `active_rx_count` / `active_tx_count` bornent le nombre de sessions simultanées
-  (budget de files AF_XDP de la NIC — voir l'article *SR-IOV*). Sur-souscrire sature le scheduler et
+  (budget de files AF_XDP de la NIC). Sur-souscrire sature le scheduler et
   fait chuter la cadence : garder la somme dans le budget de la carte.
 
 ## PTP & genlock
@@ -120,7 +119,7 @@ l'émission sur la grille PTP (voir les articles *PTP* et *Synchronisation (Genl
 
 ## Prérequis
 
-- Nœud avec NIC **E810** (PF, DPDK/AF-XDP) et pool **SR-IOV** initialisé sur ce nœud.
+- Nœud avec NIC **E810** (PF, DPDK/AF-XDP).
 - **PTP** verrouillé sur le réseau.
 - Réseau 2110 (plan média) séparé, configuré par-nœud (Réglages → Nœuds & Matériel → Réseau hôte).
 
@@ -128,7 +127,7 @@ l'émission sur la grille PTP (voir les articles *PTP* et *Synchronisation (Genl
 
 - Les UUID NMOS sont stables (registre de niveau cluster) : un recreate/restore ne casse pas les
   abonnements des contrôleurs externes.
-- Les shm produits sont identiques à ceux de `receiver_2110` → interchangeables côté consommateurs.
+- Les shm produits suivent le contrat MXL commun → tout consommateur les lit sans adaptation.
 
 ## Diagnostiquer un port en mode DPDK/vfio
 
