@@ -137,7 +137,7 @@ _DEF_RX_HEADROOM = 4
 _DEF_TX_HEADROOM = 2
 # subsystem_device → (label, aggregate_gbps)  — source: Intel product brief + sysfs
 _E810_MODELS = {
-    "0x0002": ("E810-CQDA2", 100),   # E810-C for QSFP 2-port, 1 controller (node-1 confirmé)
+    "0x0002": ("E810-CQDA2", 100),   # E810-C for QSFP 2-port, 1 controller (confirmé sur banc)
     "0x0003": ("E810-2CQDA2", 200),  # E810-C for QSFP 2×2-port, 2 controllers indépendants
     "0x0004": ("E810-CQDA1", 100),   # E810-C for QSFP 1-port
     "0x0005": ("E810-CQDA2", 100),   # variante OEM

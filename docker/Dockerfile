@@ -2,7 +2,7 @@
 # Copyright (C) 2026 BOBI SAS, France
 # Image runtime MTL (Media Transport Library) pour Bobi.Studio — réception/émission ST 2110.
 #
-# Codifie la recette validée manuellement sur node-1 (cf. mémoires mtl-e810-vfio-path /
+# Codifie la recette validée manuellement sur le nœud de banc (cf. mémoires mtl-e810-vfio-path /
 # mtl-pivot-docker-pf-dpdk). Déploiement cible : E810, PF en DPDK (ou AF_XDP en repli IGMP),
 # sous Docker, sur un hôte noyau LTS. Le NIC est préparé SUR L'HÔTE (vfio + DDP) ; ce conteneur
 # ne fait que tourner l'app MTL avec /dev/vfio + hugepages passés par `docker run`.
