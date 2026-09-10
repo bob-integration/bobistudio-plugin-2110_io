@@ -38,7 +38,8 @@ def before_deploy(params, context):
     n_tx = int(params.get("tx_count") or 0)
     nv   = int(params.get("video_count") or 0)
     from app import io2110_flows as _iof
-    from app.allocations import allocate_multicast_for, _egress_iface, port_default_for
+    from app.allocations import (allocate_multicast_for, _egress_iface, port_default_for,
+                                 slot_redondant)
     # active_rx_count / active_tx_count : fenêtre de visibilité NMOS. POSÉS D'ABORD (avant de dériver
     # les flux) car la dérivation legacy s'appuie dessus. setdefault → préservés au re-déploiement.
     params.setdefault("active_rx_count", min(8, nv))
@@ -141,8 +142,15 @@ def before_deploy(params, context):
             if ipd:
                 t["anc_multicast_ip"], t["anc_dest_port"] = ipd, pd
         # SMPTE 2022-7 — leg1 auto-alloué une seule fois (guard explicite : ne pas écraser), sur
-        # l'interface PAIRÉE (red/blue) du leg0 si déclarée, même format que le leg0.
-        if params.get("smpte_2022_7"):
+        # l'interface PAIRÉE (red/blue) du leg0.
+        #
+        # ★ La condition n'est plus un booléen GLOBAL du moteur mais l'appariement RÉEL du port de
+        # sortie de CE slot. Le drapeau `smpte_2022_7` armait la redondance pour tous les flux, y
+        # compris ceux sortant d'un port sans paire : on leur allouait alors une seconde adresse
+        # multicast SUR LE MÊME PORT — deux jambes dans le même câble, aucune protection, le double
+        # de débit, et NMOS qui l'annonçait comme redondant. La redondance est une propriété d'un
+        # CHEMIN, pas d'un équipement.
+        if slot_redondant(node_id, params, i):
             ifn1, netid1 = _egress_iface(node_id, params, i, leg=1)
             if not t.get("multicast_ip_leg1"):
                 ip1, p1 = allocate_multicast_for(node_id, ifn1, media_network_id=netid1, essence="video",

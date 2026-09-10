@@ -14,7 +14,7 @@
   "split_io": true,
   "deploy_order": 0,
   "auto_provision": true,
-  "version": "0.106.0",
+  "version": "0.106.1",
   "adapts_input": true,
   "aggregate_fps": false,
   "description": "Receiver ST 2110 via Media Transport Library (MTL/DPDK, kernel-bypass). Réception st20p/st30p écrite en zéro-copie dans le ring shared memory par un binaire C natif (libmtl), exposé en NMOS IS-04/05. Variante haute performance de receiver_2110 (mêmes shm produits). Mode simulation par slot tant que la source n'est pas activée.",
@@ -73,16 +73,9 @@
     "active_rx_count": 6,
     "active_tx_count": 6,
     "tx_slots": [],
-    "smpte_2022_7": false,
     "tx_fallback": "black"
   },
   "config_schema": [
-    {
-      "key": "smpte_2022_7",
-      "type": "bool",
-      "label": "SMPTE 2022-7 (dual-path redondant)",
-      "default": false
-    },
     {
       "key": "tx_fallback",
       "type": "select",
@@ -156,8 +149,7 @@
       "fps",
       "scan",
       "chroma",
-      "bit_depth",
-      "smpte_2022_7"
+      "bit_depth"
     ]
   }
 }
