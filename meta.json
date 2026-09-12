@@ -1,7 +1,12 @@
 {
-  "version": "0.106.0",
-  "date": "2026-08-31",
+  "version": "0.107.0",
+  "date": "2026-09-12",
   "changes": {
+    "libmxl v1.1.0 finale (0.107.0)": [
+      "★ libmxl passe de `v1.1.0-rc1` à la **v1.1.0 finale** (amont du 2026-09-08). Aucune rupture d'API ; nos patches et les 16 fichiers modifiés amont n'ont aucun fichier en commun, et aucune dépendance croisée hors `mxl.h`, dont le seul changement est un commentaire.",
+      "L'effet mesurable pour un consommateur de GRAINS (vidéo, ANC) : la fenêtre lisible perd exactement un grain, le correctif amont `6d5ac9c6` réservant la case de queue à l'écrivain. Mesuré 9 → 8, stable (banc `script_templates/mxl_fenetre_lisible.py`). ⚠ L'audio n'est pas concerné : flux continu, qui avait déjà ce comportement.",
+      "⚠ Cette image porte l'ANTENNE. La bâtir ne coupe rien ; la redéployer, si. Les deux gestes sont séparés à dessein."
+    ],
     "Surface NMOS du moteur (plan 2) (0.106.0)": [
       "★ Le contrôleur sert désormais /x-nmos/ : le moteur expose SON Node NMOS, alimenté par un document que l'orchestrateur lui pousse (POST /nmos, écriture atomique). Il était le seul conteneur du parc à ne pas parler le protocole — alors que c'est lui qui fait réellement du ST 2110.",
       "Décalque de script_templates/agent.py, que le moteur n'embarque pas (il a son propre :8081). Un banc DIFFÉRENTIEL (tools/verif_nmos_plan2_moteur.py) compare les deux implémentations sur 30 chemins : une divergence ne se verrait pas autrement, chacune répondant 200 à sa façon.",

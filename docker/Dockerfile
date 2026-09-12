@@ -22,7 +22,7 @@
 
 # ---------------------------------------------------------------- étage builder : compiler libmxl
 FROM debian:trixie-slim AS mxl-builder
-ARG MXL_REF=v1.1.0-rc1
+ARG MXL_REF=v1.1.0
 ENV DEBIAN_FRONTEND=noninteractive
 ENV VCPKG_ROOT=/opt/vcpkg
 RUN apt-get update && apt-get install -y --no-install-recommends \
