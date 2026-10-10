@@ -1,7 +1,14 @@
 {
-  "version": "0.107.0",
-  "date": "2026-09-12",
+  "version": "0.108.0",
+  "date": "2026-10-10",
   "changes": {
+    "La sonde audio mesure enfin — et ne noie plus le journal du nœud (0.108.0)": [
+      "★ Erreur d'unité : la sonde comparait le retard de lecture, en ÉCHANTILLONS (48 000 par seconde), à la profondeur du ring, en MILLISECONDES (100). À 20 relevés par seconde le retard vaut ~2 400 échantillons, toujours « > 100 » : chaque relevé se déclarait en trou, repartait du présent et sortait sans rien mesurer. Constaté à Horace le 2026-10-10 : aucune entrée RX ne publiait `silence`, `clip` ni `peak_db`.",
+      "Effet de bord : le message de trou, écrit à chaque relevé et pour chaque flux, faisait 99,5 % du journal du nœud (200 lignes/s). Les 3,9 Go de journald ne couvraient plus que 8 h — l'historique nécessaire à l'enquête sur TX2 avait disparu.",
+      "La profondeur est désormais convertie en échantillons d'après la cadence du flow_def (repli 48 kHz), et un vrai trou n'est signalé qu'une fois par flux et par minute, avec le cumul. Vérifié sur deux flux réels d'Horace : 58 mesures sur 60 (les deux premières amorcent le curseur), aucun trou, ~75 µs par relevé.",
+      "⚠ Conséquence attendue : les alarmes de SILENCE et d'ÉCRÊTAGE audio, muettes depuis leur création, vont se mettre à fonctionner. Une entrée dont l'audio est réellement muet sera signalée — c'est le but, mais ce sera nouveau à l'écran.",
+      "⚠ Cette image porte l'ANTENNE. La bâtir ne coupe rien ; la redéployer, si."
+    ],
     "libmxl v1.1.0 finale (0.107.0)": [
       "★ libmxl passe de `v1.1.0-rc1` à la **v1.1.0 finale** (amont du 2026-09-08). Aucune rupture d'API ; nos patches et les 16 fichiers modifiés amont n'ont aucun fichier en commun, et aucune dépendance croisée hors `mxl.h`, dont le seul changement est un commentaire.",
       "L'effet mesurable pour un consommateur de GRAINS (vidéo, ANC) : la fenêtre lisible perd exactement un grain, le correctif amont `6d5ac9c6` réservant la case de queue à l'écrivain. Mesuré 9 → 8, stable (banc `script_templates/mxl_fenetre_lisible.py`). ⚠ L'audio n'est pas concerné : flux continu, qui avait déjà ce comportement.",

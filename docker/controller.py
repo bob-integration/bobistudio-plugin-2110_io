@@ -1027,8 +1027,27 @@ SIGNAL_CLIP_HOLD_S= float(os.environ.get("SIGNAL_CLIP_HOLD_S") or 30.0) # mainti
 # Cadence de la sonde AUDIO, distincte de la vidéo. Elle doit être < A_RING (100 ms) pour que la
 # lecture séquentielle ne perde jamais d'échantillon : à 20 Hz on lit 50 ms d'avance sur un tampon
 # qui en tient 100, ce qui laisse de la marge pour un ordonnancement irrégulier. Coût mesuré sur le
-# nœud : 46 µs par flux et par relevé, sans copie — 3 % d'un cœur à 64 flux.
+# nœud (dl360, 2026-10-10) : ~75 µs par flux et par relevé (lecture de 2 400 échantillons × 8 canaux
+# + crête) — 4 % d'un cœur à 25 flux, 10 % à 64. Les « 46 µs » notés ici avant cette date mesuraient
+# une sonde qui, par une erreur d'unité, ne lisait RIEN (cf. _sig_audio_probe).
 SIGNAL_AUDIO_S    = float(os.environ.get("SIGNAL_AUDIO_S") or 0.05)
+# Un trou de lecture audio est signalé au plus une fois par flux et par période (cumulé).
+SIGNAL_GAP_LOG_S  = float(os.environ.get("SIGNAL_GAP_LOG_S") or 60.0)
+A_RATE_DEF        = 48000      # repli si le flow_def ne donne pas sa cadence (ST 2110-30 : 48 kHz)
+
+
+def _audio_window_samples(ar):
+    """Profondeur du ring audio EN ÉCHANTILLONS (A_RING est en ms) : la cadence vient du flow_def
+    du flux, repli 48 kHz. Les index MXL audio comptent des échantillons, pas des chunks."""
+    rate = A_RATE_DEF
+    try:
+        sr = (ar.inst.flow_def(fid=ar.fid) or {}).get("sample_rate") or {}
+        num, den = int(sr.get("numerator") or 0), int(sr.get("denominator") or 1)
+        if num > 0 and den > 0:
+            rate = num / den
+    except Exception:
+        pass
+    return max(1, int(A_RING * rate / 1000.0))
 
 _signal_rx = {}      # idx slot RX → {"black","frozen"[,"silence"]} — lu par MetricsHandler
 _signal_tx = {}      # idx slot TX → {"black","frozen"} (contenu du shm d'entrée câblé)
@@ -1382,6 +1401,10 @@ def _sig_audio_probe(st, name, now):
             ar = bobimxl.AudioReader(_sig_instance(st), name)
             st["ar"] = ar
             st.pop("ahead", None); st.pop("sil_since", None); st.pop("ahead_t", None)
+            st.pop("awin", None)
+        win = st.get("awin")
+        if win is None:
+            win = st["awin"] = _audio_window_samples(ar)
         head = int(ar.head_index())
         prev = st.get("ahead")
         st["ahead"] = head
@@ -1408,26 +1431,40 @@ def _sig_audio_probe(st, name, now):
         # par `r is None`, et NI le silence NI le loudness n'ont jamais été publiés — vérifié en
         # prod : 12 sessions audio vivantes à 1000 chunks/s, `silence` absent des 15 slots qui
         # publient un signal. Les 400 ms n'existaient que pour le loudness, retiré des alarmes.
+        #
+        # ⚠ `head` et `acur` sont des index d'ÉCHANTILLON (48 000 par seconde), A_RING des MILLI-
+        # SECONDES. Jusqu'au 2026-10-10 on comparait directement les deux : à 20 Hz le retard vaut
+        # ~2 400 échantillons, toujours « > 100 », donc CHAQUE relevé se déclarait en trou, repartait
+        # du présent et sortait sans rien mesurer. Constaté à Horace : aucune entrée RX ne publiait
+        # `silence`, et le message de trou faisait 99,5 % du journal du nœud (200 lignes/s,
+        # 3,9 Go de journald remplis en 8 h). `win` est la profondeur du ring EN ÉCHANTILLONS.
         nres = head - int(st["acur"]) if st.get("acur") is not None else 0
         cur = st.get("acur")
-        if cur is None or nres <= 0 or nres > A_RING:
+        if cur is None or nres <= 0 or nres > win:
             # Premier passage, ou retard supérieur à la profondeur du ring : les échantillons
             # manquants sont ÉCRASÉS, on ne peut pas les inventer. On le DIT (un trou silencieux
-            # ferait croire à une couverture qu'on n'a pas) et on repart du présent.
-            if cur is not None and nres > A_RING:
+            # ferait croire à une couverture qu'on n'a pas) et on repart du présent — mais au plus
+            # une ligne par flux et par minute, cumulée : un trou qui se répète à chaque relevé ne
+            # doit pas noyer le journal du nœud et effacer tout le reste.
+            if cur is not None and nres > win:
                 st["gap"] = int(st.get("gap", 0)) + 1
-                print("sampler: {} — {} échantillon(s) NON ANALYSÉS (retard > ring de {} ms) : "
-                      "couverture incomplète".format(name, nres - A_RING, A_RING), flush=True)
+                st["gap_lost"] = int(st.get("gap_lost", 0)) + nres - win
+                if now - st.get("gap_logged", -1e9) >= SIGNAL_GAP_LOG_S:
+                    print("sampler: {} — {} trou(s), {} échantillon(s) NON ANALYSÉS (retard > ring "
+                          "de {} ms) : couverture incomplète — signalé au plus toutes les {:.0f} s".format(
+                              name, st["gap"] - st.get("gap_at_log", 0), st["gap_lost"], A_RING,
+                              SIGNAL_GAP_LOG_S), flush=True)
+                    st["gap_logged"], st["gap_at_log"], st["gap_lost"] = now, st["gap"], 0
             st["acur"] = head
             return None
-        r = ar.read_from(cur, min(nres, A_RING))
+        r = ar.read_from(cur, min(nres, win))
         if r is None or not r.size:
             # Échec de lecture : ne JAMAIS sortir en silence — c'est ce qui a masqué le bug
             # ci-dessus pendant toute la vie de cette sonde.
             if not st.get("rd_warn"):
                 st["rd_warn"] = True
                 print("sampler: {} — lecture audio IMPOSSIBLE ({} samples depuis {}) : silence et "
-                      "saturation NE SERONT PAS calculés".format(name, min(nres, A_RING), cur),
+                      "saturation NE SERONT PAS calculés".format(name, min(nres, win), cur),
                       flush=True)
             return None
         st.pop("rd_warn", None)
