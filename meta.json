@@ -1,7 +1,14 @@
 {
-  "version": "0.108.0",
-  "date": "2026-10-10",
+  "version": "0.108.1",
+  "date": "2026-10-17",
   "changes": {
+    "Horloge système d'un nœud DPDK : le servo phc2sys de libmtl ne s'emballe plus (0.108.1)": [
+      "★ L'horloge système d'un nœud 2110 en DPDK (CLOCK_REALTIME, tenue par le phc2sys interne de libmtl, `ENGINE_PHC2SYS=1`) pouvait s'emballer sans retour : mesuré sur dl360-1, +396 s le 16/10 (tick noyau 10122) puis −455 s le 17/10 (tick 9840, −16 ms/s), le journal du moteur répétant « adj system time freq fail » à chaque cycle. Seule une relance du moteur en sortait.",
+      "Cause, lue dans mt_ptp.c : le servo phc2sys n'a ni borne ni anti-windup ni nouveau saut après le démarrage. Quand une excursion du PHC lui fait demander plus de ±10 % de vitesse, le noyau REFUSE le réglage, l'horloge garde la dernière vitesse acceptée, et l'intégrateur continue de diverger : la demande ne revient jamais dans la plage.",
+      "Correctif (patch_phc2sys_servo_bound.py) : la demande est bornée à ce que le noyau accepte ; l'intégration est suspendue tant que la commande est bornée ou refusée ; au-delà de 1 ms d'écart, l'horloge est re-sautée et le servo repart comme au démarrage. Saut, saturation et sortie de saturation sont journalisés (warn, au plus une ligne par 10 s). Le servo du PHC n'est pas touché ; un servo sain se comporte exactement comme avant.",
+      "Prouvé sur le vrai code C contre un noyau simulé (tools/bancs/banc_phc2sys_servo.py) : une excursion du PHC de +12 % pendant 2 s reproduit la signature de dl360-1 sans le patch (tick figé à 10152, refus à chaque cycle, 6,8 s d'écart après 10 min) et converge avec. Garde hors ligne : tests/verif_phc2sys_servo_borne.py.",
+      "⚠ Cette image porte l'ANTENNE. La bâtir ne coupe rien ; la redéployer, si."
+    ],
     "La sonde audio mesure enfin — et ne noie plus le journal du nœud (0.108.0)": [
       "★ Erreur d'unité : la sonde comparait le retard de lecture, en ÉCHANTILLONS (48 000 par seconde), à la profondeur du ring, en MILLISECONDES (100). À 20 relevés par seconde le retard vaut ~2 400 échantillons, toujours « > 100 » : chaque relevé se déclarait en trou, repartait du présent et sortait sans rien mesurer. Constaté à Horace le 2026-10-10 : aucune entrée RX ne publiait `silence`, `clip` ni `peak_db`.",
       "Effet de bord : le message de trou, écrit à chaque relevé et pour chaque flux, faisait 99,5 % du journal du nœud (200 lignes/s). Les 3,9 Go de journald ne couvraient plus que 8 h — l'historique nécessaire à l'enquête sur TX2 avait disparu.",

@@ -184,6 +184,9 @@ COPY patch_ptp_stable_getter.py /tmp/patch_ptp_stable_getter.py
 COPY patch_ptp_gm_export.py /tmp/patch_ptp_gm_export.py
 COPY patch_ptp_offset_getter.py /tmp/patch_ptp_offset_getter.py
 COPY patch_ptp_adjust_freq.py /tmp/patch_ptp_adjust_freq.py
+# Borne le servo phc2sys (CLOCK_REALTIME <- PHC) : plage du noyau, anti-windup, re-saut > 1 ms.
+# APRES patch_ptp_adjust_freq (meme fichier mt_ptp.c ; ancres = son etat de sortie).
+COPY patch_phc2sys_servo_bound.py /tmp/patch_phc2sys_servo_bound.py
 # Patch bobi.studio DEV LINK WAIT : sur E810 100G DPDK le lien met ~60-90s à ré-entraîner autoneg+FEC
 # après passage sous vfio-pci ; dev_detect_link abandonnait à 90s (fail -5 → mtl_init fail → crash-loop
 # bruyant du wrapper). Bumpe MT_DEV_LINK_POLL_COUNT 300->400 (budget strict 90s->120s). Indépendant.
@@ -227,6 +230,7 @@ RUN mkdir -p /src/MTL && cd /src/MTL \
  && python3 /tmp/patch_ptp_gm_export.py \
  && python3 /tmp/patch_ptp_offset_getter.py \
  && python3 /tmp/patch_ptp_adjust_freq.py \
+ && python3 /tmp/patch_phc2sys_servo_bound.py \
  && python3 /tmp/patch_dev_link_wait.py \
  && python3 /tmp/patch_epoch_shift.py \
  && python3 /tmp/patch_ice_tm_move_retry.py \
