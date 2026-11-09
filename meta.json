@@ -1,7 +1,10 @@
 {
-  "version": "0.108.1",
-  "date": "2026-10-17",
+  "version": "0.108.2",
+  "date": "2026-11-09",
   "changes": {
+    "Version minimale du cœur déclarée (0.108.2)": [
+      "Le manifeste déclare `requires.core_min` = 0.9.8 : l'orchestrateur refuse de l'installer sur un cœur plus ancien et le dit. Valeur = le cœur avec lequel la version précédente a été faite. Rien ne change dans le conteneur : rien à redéployer."
+    ],
     "Horloge système d'un nœud DPDK : le servo phc2sys de libmtl ne s'emballe plus (0.108.1)": [
       "★ L'horloge système d'un nœud 2110 en DPDK (CLOCK_REALTIME, tenue par le phc2sys interne de libmtl, `ENGINE_PHC2SYS=1`) pouvait s'emballer sans retour : mesuré sur dl360-1, +396 s le 16/10 (tick noyau 10122) puis −455 s le 17/10 (tick 9840, −16 ms/s), le journal du moteur répétant « adj system time freq fail » à chaque cycle. Seule une relance du moteur en sortait.",
       "Cause, lue dans mt_ptp.c : le servo phc2sys n'a ni borne ni anti-windup ni nouveau saut après le démarrage. Quand une excursion du PHC lui fait demander plus de ±10 % de vitesse, le noyau REFUSE le réglage, l'horloge garde la dernière vitesse acceptée, et l'intégrateur continue de diverger : la demande ne revient jamais dans la plage.",
